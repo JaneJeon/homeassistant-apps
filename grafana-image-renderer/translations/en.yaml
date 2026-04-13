@@ -1,4 +1,16 @@
 configuration:
-  message:
-    name: Message
-    description: The message that will be printed to the log when starting this grafana-image-renderer app.
+  auth_token:
+    name: Auth Token
+    description: Shared secret between Grafana and the renderer. Must match GF_RENDERING_AUTH_TOKEN in your Grafana configuration.
+  port:
+    name: Port
+    description: Port the renderer listens on (default 8081).
+  browser_max_height:
+    name: Browser Max Height
+    description: Maximum viewport height in pixels for rendered images (default 1080).
+  browser_max_width:
+    name: Browser Max Width
+    description: Maximum viewport width in pixels for rendered images (default 1920).
+  browser_flags:
+    name: Browser Flags
+    description: Comma-separated Chromium flags (default "--disable-dev-shm-usage,--no-sandbox,--disable-extensions").

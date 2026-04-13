@@ -2,16 +2,23 @@
 name: Grafana Image Renderer
 version: 0.1.0
 slug: grafana-image-renderer
-description: Grafana Image Renderer service for Grafana add-on
+description: Grafana Image Renderer service for rendering panels and dashboards as images
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana-image-renderer
 arch:
   - aarch64
   - amd64
 init: false
-map:
-  - share:rw
+boot: auto
 options:
-  message: "Hello world..."
+  auth_token: ""
+  port: 8081
+  browser_max_height: 1080
+  browser_max_width: 1920
+  browser_flags: "--disable-dev-shm-usage,--no-sandbox,--disable-extensions"
 schema:
-  message: "str?"
-image: ghcr.io/JaneJeon/grafana-image-renderer
+  auth_token: str
+  port: "port?"
+  browser_max_height: "int?"
+  browser_max_width: "int?"
+  browser_flags: "str?"
+image: ghcr.io/janejeon/grafana-image-renderer

@@ -13,7 +13,7 @@ on:
 jobs:
   prepare:
     name: Prepare
-    if: github.repository == 'home-assistant/apps-example'
+    if: github.repository == 'JaneJeon/homeassistant-apps'
     runs-on: ubuntu-latest
     outputs:
       architectures: ${{ steps.info.outputs.architectures }}

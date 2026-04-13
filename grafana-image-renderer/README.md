@@ -1,6 +1,6 @@
-# Home Assistant App: grafana-image-renderer app
+# Home Assistant App: Grafana Image Renderer
 
-_grafana-image-renderer app to use as a blueprint for new apps._
+_Grafana Image Renderer service for rendering panels and dashboards as images._
 
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]

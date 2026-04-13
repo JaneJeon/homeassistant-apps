@@ -2,56 +2,59 @@
 
 profile grafana-image-renderer flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
+  #include <abstractions/nameservice>
 
   # Capabilities
   file,
+  network,
   signal (send) set=(kill,term,int,hup,cont),
+  signal (receive),
 
-  # S6-Overlay
-  /init ix,
-  /bin/** ix,
-  /usr/bin/** ix,
-  /run/{s6,s6-rc*,service}/** ix,
-  /package/** ix,
-  /command/** ix,
-  /etc/services.d/** rwix,
-  /etc/cont-init.d/** rwix,
-  /etc/cont-finish.d/** rwix,
-  /run/{,**} rwk,
-  /dev/tty rw,
+  # Grafana Image Renderer binary
+  /usr/bin/grafana-image-renderer rix,
 
-  # Bashio
-  /usr/lib/bashio/** ix,
-  /tmp/** rwk,
+  # Tini init
+  /usr/bin/tini rix,
 
-  # Access to options.json and other files within your app
+  # Chromium browser
+  /usr/bin/chromium rix,
+  /usr/lib/chromium/** rix,
+
+  # Shell and utilities
+  /bin/** rix,
+  /usr/bin/** rix,
+  /usr/lib/** rm,
+
+  # Shared libraries
+  /lib/** rm,
+  /lib64/** rm,
+
+  # Config and options
   /data/** rw,
+  /run.sh rix,
 
-  # Start new profile for service
-  /usr/bin/my_program cx -> my_program,
+  # Temporary files (Chromium rendering)
+  /tmp/** rwk,
+  /dev/shm/** rw,
 
-  profile my_program flags=(attach_disconnected,mediate_deleted) {
-    #include <abstractions/base>
+  # Font access
+  /usr/share/fonts/** r,
+  /etc/fonts/** r,
+  /var/cache/fontconfig/** r,
 
-    # Receive signals from S6-Overlay
-    signal (receive) peer=*_grafana-image-renderer,
+  # Locale and SSL
+  /usr/lib/locale/** r,
+  /etc/ssl/** r,
+  /usr/share/ca-certificates/** r,
 
-    # Access to options.json and other files within your app
-    /data/** rw,
+  # Proc filesystem (Chromium needs this)
+  @{PROC}/** r,
 
-    # Access to mapped volumes specified in config.json
-    /share/** rw,
+  # Device access
+  /dev/tty rw,
+  /dev/null rw,
+  /dev/urandom r,
 
-    # Access required for service functionality
-    # Note: List was built by doing the following:
-    # 1. Add what is obviously needed based on what is in the script
-    # 2. Add `complain` as a flag to this profile temporarily and run the app
-    # 3. Review the audit log with `journalctl _TRANSPORT="audit" -g 'apparmor="ALLOWED"'` and add other access as needed
-    # Remember to remove the `complain` flag when you are done
-    /usr/bin/my_program r,
-    /bin/bash rix,
-    /bin/echo ix,
-    /etc/passwd r,
-    /dev/tty rw,
-  }
+  # Home directory for nonroot user
+  /home/nonroot/** rw,
 }
