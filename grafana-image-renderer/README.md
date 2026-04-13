@@ -1,6 +1,6 @@
-# Home Assistant App: Example app
+# Home Assistant App: grafana-image-renderer app
 
-_Example app to use as a blueprint for new apps._
+_grafana-image-renderer app to use as a blueprint for new apps._
 
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]

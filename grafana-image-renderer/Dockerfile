@@ -21,7 +21,7 @@ RUN \
 COPY rootfs /
 
 LABEL \
-    org.opencontainers.image.title="Home Assistant App: Example app" \
-    org.opencontainers.image.description="Example app to use as a blueprint for new apps." \
-    org.opencontainers.image.source="https://github.com/home-assistant/apps-example" \
+    org.opencontainers.image.title="Home Assistant App: grafana-image-renderer app" \
+    org.opencontainers.image.description="grafana-image-renderer app to use as a blueprint for new apps." \
+    org.opencontainers.image.source="https://github.com/home-assistant/apps-grafana-image-renderer" \
     org.opencontainers.image.licenses="Apache License 2.0"

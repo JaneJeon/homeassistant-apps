@@ -1,0 +1,17 @@
+# https://developers.home-assistant.io/docs/apps/configuration#app-configuration
+name: Grafana Image Renderer
+version: 0.1.0
+slug: grafana-image-renderer
+description: Grafana Image Renderer service for Grafana add-on
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana-image-renderer
+arch:
+  - aarch64
+  - amd64
+init: false
+map:
+  - share:rw
+options:
+  message: "Hello world..."
+schema:
+  message: "str?"
+image: ghcr.io/JaneJeon/grafana-image-renderer

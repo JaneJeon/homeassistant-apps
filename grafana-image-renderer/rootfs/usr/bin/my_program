@@ -1,0 +1,3 @@
+#!/bin/bash
+
+echo "All done!" > /share/grafana-image-renderer_app_output.txt

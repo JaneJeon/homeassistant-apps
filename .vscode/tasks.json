@@ -66,9 +66,7 @@
       "id": "appName",
       "type": "pickString",
       "description": "Name of app (to add your app to this list, please edit .vscode/tasks.json)",
-      "options": [
-        "example",
-      ]
+      "options": ["grafana-image-renderer"]
     }
   ]
 }
