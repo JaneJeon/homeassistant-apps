@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/apps/configuration#app-configuration
 name: Grafana Image Renderer
-version: 0.1.1
+version: 0.1.4
 slug: grafana-image-renderer
 description: Grafana Image Renderer service for rendering panels and dashboards as images
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana-image-renderer
@@ -8,16 +8,20 @@ arch:
   - aarch64
   - amd64
 init: false
+ports:
+  8081/tcp: 8081
 options:
-  port: 8081
   auth_token: "-"
   browser_max_width: 1920
   browser_max_height: 1080
   browser_flags: "--disable-dev-shm-usage,--disable-extensions"
+  grafana_service_account_token: ""
+  log_level: info
 schema:
-  port: "port?"
   auth_token: "str?"
   browser_max_width: "int?"
   browser_max_height: "int?"
   browser_flags: "str?"
+  grafana_service_account_token: "str?"
+  log_level: list(debug|info|warning|error)?
 image: "ghcr.io/janejeon/grafana-image-renderer"
