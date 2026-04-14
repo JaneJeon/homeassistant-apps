@@ -1,6 +1,7 @@
 #!/usr/bin/env bashio
 
 ## Grafana
+export GF_PATHS_DATA=/data
 export GF_SERVER_HTTP_PORT=8080
 export GF_SERVER_DOMAIN="$(bashio::config 'domain')"
 
