@@ -12,7 +12,7 @@ RUN apt-get update \
     && mkdir -p /usr/lib/bashio \
     && curl -L -f -s "https://github.com/hassio-addons/bashio/archive/v${BASHIO_VERSION}.tar.gz" \
     | tar -xzf - --strip 1 -C /usr/lib/bashio \
-    && ln -s /usr/lib/bashio/bashio /usr/bin/bashio \
+    && ln -s /usr/lib/bashio/lib/bashio /usr/bin/bashio \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy root filesystem
