@@ -19,7 +19,7 @@ COPY rootfs /
 
 # Switch back to Grafana
 USER grafana
-ENTRYPOINT ["tini", "--", "/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
 
 LABEL \
     org.opencontainers.image.title="Home Assistant App: Grafana" \
