@@ -8,17 +8,15 @@ arch:
   - aarch64
   - amd64
 init: false
-boot: auto
 options:
-  auth_token: ""
   port: 8081
-  browser_max_height: 1080
+  auth_token: "-"
   browser_max_width: 1920
-  browser_flags: "--disable-dev-shm-usage,--no-sandbox,--disable-extensions"
+  browser_max_height: 1080
+  browser_flags: "--disable-dev-shm-usage,--disable-extensions"
 schema:
-  auth_token: str
   port: "port?"
-  browser_max_height: "int?"
+  auth_token: "str?"
   browser_max_width: "int?"
+  browser_max_height: "int?"
   browser_flags: "str?"
-image: ghcr.io/janejeon/grafana-image-renderer
