@@ -20,3 +20,4 @@ schema:
   browser_max_width: "int?"
   browser_max_height: "int?"
   browser_flags: "str?"
+image: ghcr.io/janejeon/homeassistant-apps/{arch}-grafana-image-renderer

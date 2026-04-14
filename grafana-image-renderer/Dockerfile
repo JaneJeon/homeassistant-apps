@@ -8,12 +8,12 @@ USER root
 
 # bashio
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends jq \
-    && rm -rf /var/lib/apt/lists/* \
+    && apt-get install -y --no-install-recommends jq curl \
     && mkdir -p /usr/lib/bashio \
     && curl -L -f -s "https://github.com/hassio-addons/bashio/archive/v${BASHIO_VERSION}.tar.gz" \
-        | tar -xzf - --strip 1 -C /usr/lib/bashio \
-    && ln -s /usr/lib/bashio/bashio /usr/bin/bashio
+    | tar -xzf - --strip 1 -C /usr/lib/bashio \
+    && ln -s /usr/lib/bashio/bashio /usr/bin/bashio \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy root filesystem
 COPY rootfs /
