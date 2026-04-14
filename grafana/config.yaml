@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/apps/configuration#app-configuration
 name: Grafana (Fixed)
-version: v0.1.0
+version: v0.1.1
 slug: grafana
 description: No-bullshit Grafana add-on
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana
@@ -24,4 +24,4 @@ schema:
   log_format: list(json|console)
   log_level: list(debug|info|warning|error)?
   grafana_rendering_server_url: "str?"
-image: "ghcr.io/janejeon/grafana-image-renderer"
+image: "ghcr.io/janejeon/grafana"
