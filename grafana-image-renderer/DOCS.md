@@ -5,13 +5,13 @@ standalone service, enabling your Grafana instance to render panels and dashboar
 
 ## Configuration
 
-| Option               | Required | Default                                                     | Description                                    |
-| -------------------- | -------- | ----------------------------------------------------------- | ---------------------------------------------- |
-| `auth_token`         | Yes      | —                                                           | Shared secret between Grafana and the renderer |
-| `port`               | No       | `8081`                                                      | Port the renderer listens on                   |
-| `browser_max_height` | No       | `1080`                                                      | Maximum viewport height (px)                   |
-| `browser_max_width`  | No       | `1920`                                                      | Maximum viewport width (px)                    |
-| `browser_flags`      | No       | `--disable-dev-shm-usage,--no-sandbox,--disable-extensions` | Chromium flags                                 |
+| Option               | Required | Default                                        | Description                                    |
+| -------------------- | -------- | ---------------------------------------------- | ---------------------------------------------- |
+| `auth_token`         | No       | `"-"`                                          | Shared secret between Grafana and the renderer |
+| `port`               | No       | `8081`                                         | Port the renderer listens on                   |
+| `browser_max_height` | No       | `1080`                                         | Maximum viewport height (px)                   |
+| `browser_max_width`  | No       | `1920`                                         | Maximum viewport width (px)                    |
+| `browser_flags`      | No       | `--disable-dev-shm-usage,--disable-extensions` | Chromium flags                                 |
 
 ## Grafana setup
 

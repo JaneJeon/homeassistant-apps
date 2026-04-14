@@ -13,4 +13,4 @@ configuration:
     description: Maximum viewport width in pixels for rendered images (default 1920).
   browser_flags:
     name: Browser Flags
-    description: Comma-separated Chromium flags (default "--disable-dev-shm-usage,--no-sandbox,--disable-extensions").
+    description: Comma-separated Chromium flags (default "--disable-dev-shm-usage,--disable-extensions").

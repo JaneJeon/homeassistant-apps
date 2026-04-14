@@ -1,4 +1,4 @@
 # https://developers.home-assistant.io/docs/apps/repository#repository-configuration
-name: Home Assistant app repository
+name: Jane's Home Assistant Apps
 url: https://github.com/JaneJeon/homeassistant-apps
 maintainer: Jane Jeon
