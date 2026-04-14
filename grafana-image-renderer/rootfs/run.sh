@@ -2,7 +2,7 @@
 
 export PORT="$(bashio::config 'port')"
 export SERVER_ADDR=":${PORT}"
-export SERVER_AUTH_TOKEN="$(bashio::config 'auth_token')"
+export AUTH_TOKEN="$(bashio::config 'auth_token')"
 export BROWSER_MAX_WIDTH="$(bashio::config 'browser_max_width')"
 export BROWSER_MAX_HEIGHT="$(bashio::config 'browser_max_height')"
 export BROWSER_FLAGS="$(bashio::config 'browser_flags')"
