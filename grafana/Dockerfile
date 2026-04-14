@@ -8,7 +8,7 @@ ARG BASHIO_VERSION=0.17.5
 USER root
 
 # bashio
-RUN apk add --no-cache jq curl \
+RUN apk add --no-cache tini jq curl \
     && mkdir -p /usr/lib/bashio \
     && curl -L -f -s "https://github.com/hassio-addons/bashio/archive/v${BASHIO_VERSION}.tar.gz" \
     | tar -xzf - --strip 1 -C /usr/lib/bashio \
@@ -19,7 +19,7 @@ COPY rootfs /
 
 # Switch back to Grafana
 USER grafana
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
 
 LABEL \
     org.opencontainers.image.title="Home Assistant App: Grafana" \
