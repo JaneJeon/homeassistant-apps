@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/apps/configuration#app-configuration
 name: Grafana (Fixed)
-version: 0.2.1
+version: 13.1.0
 slug: grafana
 description: No-bullshit Grafana add-on
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana
@@ -9,8 +9,8 @@ arch:
   - amd64
 init: false
 ports:
-  8080/tcp: 8080
-  8079/tcp: 8079
+  8080/tcp: 8080 # main port
+  8079/tcp: 8079 # profiler port
 options:
   plugins: ""
   domain: localhost
@@ -25,6 +25,6 @@ schema:
   log_format: list(json|console)
   log_level: list(debug|info|warning|error)?
   grafana_rendering_server_url: "str?"
-  grafana_rendering_renderer_token: "str?"
+  grafana_rendering_renderer_token: "password?"
   enable_profiling: bool
 image: "ghcr.io/janejeon/grafana"
