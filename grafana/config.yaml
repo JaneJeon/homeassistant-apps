@@ -1,7 +1,7 @@
 # https://developers.home-assistant.io/docs/apps/configuration#app-configuration
 name: Grafana (Fixed)
-version: 0.2.0
-slug: grafana-fixed
+version: 0.2.1
+slug: grafana
 description: No-bullshit Grafana add-on
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana
 arch:

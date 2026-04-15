@@ -5,6 +5,7 @@ FROM grafana/grafana:13.1.0-24374455864
 # https://developers.home-assistant.io/docs/apps/configuration#app-dockerfile
 ARG BASHIO_VERSION=0.17.5
 
+# You *have* to use root, not only to install packages but also to write to /data!
 USER root
 
 # bashio
@@ -18,7 +19,6 @@ RUN apk add --no-cache tini jq curl \
 COPY rootfs /
 
 # Switch back to Grafana
-USER grafana
 ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
 
 LABEL \
