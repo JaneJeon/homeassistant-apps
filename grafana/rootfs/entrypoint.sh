@@ -3,6 +3,9 @@
 ## Grafana
 export GF_PATHS_DATA=/data
 export GF_PATHS_PLUGINS=/data/plugins
+
+# /data is mounted by the Supervisor as root — make it writable by grafana
+chown -R grafana:grafana /data
 export GF_SERVER_HTTP_PORT=8080
 export GF_SERVER_DOMAIN="$(bashio::config 'domain')"
 
@@ -19,4 +22,4 @@ export GF_LOG_LEVEL="$(bashio::config 'log_level')"
 
 export GF_PLUGINS_PREINSTALL="$(bashio::config 'plugins')"
 
-exec /run.sh "$@"
+exec su-exec grafana /run.sh "$@"

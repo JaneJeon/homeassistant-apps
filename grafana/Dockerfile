@@ -8,7 +8,7 @@ ARG BASHIO_VERSION=0.17.5
 USER root
 
 # bashio
-RUN apk add --no-cache tini jq curl \
+RUN apk add --no-cache tini jq curl su-exec \
     && mkdir -p /usr/lib/bashio \
     && curl -L -f -s "https://github.com/hassio-addons/bashio/archive/v${BASHIO_VERSION}.tar.gz" \
     | tar -xzf - --strip 1 -C /usr/lib/bashio \
@@ -17,8 +17,7 @@ RUN apk add --no-cache tini jq curl \
 # Copy root filesystem
 COPY rootfs /
 
-# Switch back to Grafana
-USER grafana
+# Entrypoint runs as root to fix /data ownership, then drops to grafana
 ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
 
 LABEL \
