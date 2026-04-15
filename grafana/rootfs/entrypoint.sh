@@ -1,7 +1,11 @@
 #!/usr/bin/env bashio
 
 ## Grafana
-export GF_PATHS_DATA=/data
+HA_DATA_DIR=/data
+export GF_PATHS_DATA=$HA_DATA_DIR/data
+export GF_PATHS_LOGS=$HA_DATA_DIR/logs
+export GF_PATHS_PLUGINS=$HA_DATA_DIR/plugins
+
 export GF_SERVER_HTTP_PORT=8080
 export GF_SERVER_DOMAIN="$(bashio::config 'domain')"
 
