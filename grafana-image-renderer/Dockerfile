@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # https://developers.home-assistant.io/docs/apps/configuration#app-dockerfile
-FROM grafana/grafana-image-renderer:v5.8.8
+FROM grafana/grafana-image-renderer:v5.8.9
 
 ARG BASHIO_VERSION=0.17.5
 
