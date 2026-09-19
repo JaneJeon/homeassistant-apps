@@ -19,9 +19,6 @@ export GF_RENDERING_SERVER_URL="$(bashio::config 'grafana_rendering_server_url')
 export GF_RENDERING_CALLBACK_URL="http://$GF_SERVER_DOMAIN:$GF_SERVER_HTTP_PORT/"
 export GF_RENDERING_RENDERER_TOKEN="$(bashio::config 'grafana_rendering_renderer_token')"
 
-export VICTORIAMETRICS_URL="$(bashio::config 'victoriametrics_url')"
-export VICTORIALOGS_URL="$(bashio::config 'victorialogs_url')"
-
 export GF_ANALYTICS_ENABLED=false
 export GF_ANALYTICS_REPORTING_ENABLED=false
 export GF_ANALYTICS_CHECK_FOR_UPDATES=false
