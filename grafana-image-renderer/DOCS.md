@@ -8,7 +8,6 @@ standalone service, enabling your Grafana instance to render panels and dashboar
 | Option               | Required | Default                                        | Description                                    |
 | -------------------- | -------- | ---------------------------------------------- | ---------------------------------------------- |
 | `auth_token`         | No       | `"-"`                                          | Shared secret between Grafana and the renderer |
-| `port`               | No       | `8081`                                         | Port the renderer listens on                   |
 | `browser_max_height` | No       | `1080`                                         | Maximum viewport height (px)                   |
 | `browser_max_width`  | No       | `1920`                                         | Maximum viewport width (px)                    |
 | `browser_flags`      | No       | `--disable-dev-shm-usage,--disable-extensions` | Chromium flags                                 |
@@ -27,6 +26,10 @@ GF_RENDERING_AUTH_TOKEN=<same token as auth_token above>
 Replace `<addon-hostname>` with the hostname of this addon on your HA network. If both Grafana
 and this renderer are running as HA addons, the hostname is typically the addon slug
 (e.g. `grafana-image-renderer` or with underscores depending on your setup).
+
+The renderer always listens on port `8081` inside the Supervisor add-on network. A host port
+mapping is not required for Grafana-to-renderer traffic and is disabled by default. Enable the
+optional mapping only for deliberate direct access from the LAN.
 
 ## Health check
 
