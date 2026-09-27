@@ -1,0 +1,306 @@
+diff --git a/src/api/PaperlessAPI.ts b/src/api/PaperlessAPI.ts
+index 5f5bd21..627a3a5 100644
+--- a/src/api/PaperlessAPI.ts
++++ b/src/api/PaperlessAPI.ts
+@@ -11,7 +11,7 @@ export class PaperlessAPI {
+     const url = `${this.baseUrl}/api${path}`;
+     const headers = {
+       Authorization: `Token ${this.token}`,
+-      Accept: "application/json; version=5",
++      Accept: "application/json; version=10",
+       "Content-Type": "application/json",
+       "Accept-Language": "en-US,en;q=0.9",
+     };
+@@ -139,6 +139,9 @@ export class PaperlessAPI {
+         },
+       }
+     );
++    if (!response.ok) {
++      throw new Error(`Paperless download failed with HTTP ${response.status}`);
++    }
+     return response;
+   }
+ 
+diff --git a/src/index.ts b/src/index.ts
+index ffbf564..5e05bd6 100755
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,5 +1,4 @@
+ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+ import express from "express";
+@@ -9,156 +8,126 @@ import { registerDocumentTools } from "./tools/documents";
+ import { registerDocumentTypeTools } from "./tools/documentTypes";
+ import { registerTagTools } from "./tools/tags";
+ 
+-// Simple CLI argument parsing
++const READ_TOOLS = new Set([
++  "search_documents",
++  "get_document",
++  "download_document",
++  "list_tags",
++  "list_correspondents",
++  "list_document_types",
++]);
++
++function normalizeResult(name: string, args: any, result: any) {
++  if (name === "download_document" && typeof result?.blob === "string") {
++    const filename = String(result.filename || `document-${args.id}`);
++    const suffix = filename.toLowerCase().split(".").pop();
++    const mimeType =
++      suffix === "pdf" ? "application/pdf" :
++      suffix === "png" ? "image/png" :
++      suffix === "jpg" || suffix === "jpeg" ? "image/jpeg" :
++      "application/octet-stream";
++    return {
++      content: [{
++        type: "resource",
++        resource: {
++          uri: `paperless://documents/${args.id}/${args.original ? "original" : "archive"}`,
++          mimeType,
++          blob: result.blob,
++        },
++      }],
++    };
++  }
++  return { content: [{ type: "text", text: JSON.stringify(result) ?? "null" }] };
++}
++
++// The pinned upstream registers writes alongside reads in each tool module.
++// Intercept registration so writes are neither listed nor callable, and wrap
++// the upstream callbacks in the MCP result envelope required by newer SDKs.
++function createReadOnlyServer(api: PaperlessAPI): McpServer {
++  const server = new McpServer({ name: "paperless-ngx", version: "1.0.0" });
++  const readOnlyRegistration = new Proxy(server, {
++    get(target, property, receiver) {
++      if (property !== "tool") return Reflect.get(target, property, receiver);
++      return (name: string, ...args: any[]) => {
++        if (!READ_TOOLS.has(name)) return undefined;
++        const register = target.tool as (...toolArgs: any[]) => unknown;
++        const callback = args.pop();
++        if (typeof callback !== "function") throw new Error(`Tool ${name} has no callback`);
++        return register.call(target, name, ...args, async (...callArgs: any[]) => {
++          const result = await callback(...callArgs);
++          return normalizeResult(name, callArgs[0], result);
++        });
++      };
++    },
++  });
++
++  registerDocumentTools(readOnlyRegistration, api);
++  registerTagTools(readOnlyRegistration, api);
++  registerCorrespondentTools(readOnlyRegistration, api);
++  registerDocumentTypeTools(readOnlyRegistration, api);
++  return server;
++}
++
+ const args = process.argv.slice(2);
+ const useHttp = args.includes("--http");
+-let port = 3000;
+ const portIndex = args.indexOf("--port");
+-if (portIndex !== -1 && args[portIndex + 1]) {
+-  const parsed = parseInt(args[portIndex + 1], 10);
+-  if (!isNaN(parsed)) port = parsed;
++const port = portIndex !== -1 ? Number(args[portIndex + 1]) : 3000;
++if (!Number.isInteger(port) || port < 1 || port > 65535) {
++  console.error("Invalid --port");
++  process.exit(1);
+ }
+ 
+ async function main() {
+-  let baseUrl: string | undefined;
+-  let token: string | undefined;
+-
+-  if (useHttp) {
+-    baseUrl = process.env.PAPERLESS_URL;
+-    token = process.env.API_KEY;
+-    if (!baseUrl || !token) {
+-      console.error(
+-        "When using --http, PAPERLESS_URL and API_KEY environment variables must be set."
+-      );
+-      process.exit(1);
+-    }
+-  } else {
+-    baseUrl = args[0];
+-    token = args[1];
+-    if (!baseUrl || !token) {
+-      console.error(
+-        "Usage: paperless-mcp <baseUrl> <token> [--http] [--port <port>]"
+-      );
+-      console.error(
+-        "Example: paperless-mcp http://localhost:8000 your-api-token --http --port 3000"
+-      );
+-      console.error(
+-        "When using --http, PAPERLESS_URL and API_KEY environment variables must be set."
+-      );
+-      process.exit(1);
+-    }
++  const baseUrl = process.env.PAPERLESS_URL;
++  const token = process.env.API_KEY;
++  if (!baseUrl || !token) {
++    console.error("PAPERLESS_URL and API_KEY must be set");
++    process.exit(1);
+   }
+ 
+-  // Initialize API client and server once
+   const api = new PaperlessAPI(baseUrl, token);
+-  const server = new McpServer({ name: "paperless-ngx", version: "1.0.0" });
+-  registerDocumentTools(server, api);
+-  registerTagTools(server, api);
+-  registerCorrespondentTools(server, api);
+-  registerDocumentTypeTools(server, api);
+-
+-  if (useHttp) {
+-    const app = express();
+-    app.use(express.json());
+ 
+-    // Store transports for each session
+-    const sseTransports: Record<string, SSEServerTransport> = {};
++  if (!useHttp) {
++    const server = createReadOnlyServer(api);
++    await server.connect(new StdioServerTransport());
++    return;
++  }
+ 
+-    app.post("/mcp", async (req, res) => {
+-      try {
+-        const transport = new StreamableHTTPServerTransport({
+-          sessionIdGenerator: undefined,
+-        });
+-        res.on("close", () => {
+-          transport.close();
+-        });
+-        await server.connect(transport);
+-        await transport.handleRequest(req, res, req.body);
+-      } catch (error) {
+-        console.error("Error handling MCP request:", error);
+-        if (!res.headersSent) {
+-          res.status(500).json({
+-            jsonrpc: "2.0",
+-            error: {
+-              code: -32603,
+-              message: "Internal server error",
+-            },
+-            id: null,
+-          });
+-        }
+-      }
++  const app = express();
++  app.use(express.json({ limit: "1mb" }));
++  app.post("/mcp", async (req, res) => {
++    // A McpServer can only connect to one transport. A stateless HTTP request
++    // therefore gets its own server, while the Paperless API wrapper is shared.
++    const server = createReadOnlyServer(api);
++    const transport = new StreamableHTTPServerTransport({
++      sessionIdGenerator: undefined,
+     });
+-
+-    app.get("/mcp", async (req, res) => {
+-      res.writeHead(405).end(
+-        JSON.stringify({
+-          jsonrpc: "2.0",
+-          error: {
+-            code: -32000,
+-            message: "Method not allowed.",
+-          },
+-          id: null,
+-        })
+-      );
++    res.on("close", () => {
++      void transport.close();
++      void server.close();
+     });
+ 
+-    app.delete("/mcp", async (req, res) => {
+-      res.writeHead(405).end(
+-        JSON.stringify({
++    try {
++      await server.connect(transport);
++      await transport.handleRequest(req, res, req.body);
++    } catch (error) {
++      console.error("Error handling MCP request:", error);
++      if (!res.headersSent) {
++        res.status(500).json({
+           jsonrpc: "2.0",
+-          error: {
+-            code: -32000,
+-            message: "Method not allowed.",
+-          },
++          error: { code: -32603, message: "Internal server error" },
+           id: null,
+-        })
+-      );
+-    });
+-
+-    app.get("/sse", async (req, res) => {
+-      console.log("SSE request received");
+-      try {
+-        const transport = new SSEServerTransport("/messages", res);
+-        sseTransports[transport.sessionId] = transport;
+-        res.on("close", () => {
+-          delete sseTransports[transport.sessionId];
+-          transport.close();
+         });
+-        await server.connect(transport);
+-      } catch (error) {
+-        console.error("Error handling SSE request:", error);
+-        if (!res.headersSent) {
+-          res.status(500).json({
+-            jsonrpc: "2.0",
+-            error: {
+-              code: -32603,
+-              message: "Internal server error",
+-            },
+-            id: null,
+-          });
+-        }
+       }
+-    });
+-
+-    app.post("/messages", async (req, res) => {
+-      const sessionId = req.query.sessionId as string;
+-      const transport = sseTransports[sessionId];
+-      if (transport) {
+-        await transport.handlePostMessage(req, res, req.body);
+-      } else {
+-        res.status(400).send("No transport found for sessionId");
+-      }
+-    });
+-
+-    app.listen(port, () => {
+-      console.log(
+-        `MCP Stateless Streamable HTTP Server listening on port ${port}`
+-      );
+-    });
+-  } else {
+-    const transport = new StdioServerTransport();
+-    await server.connect(transport);
+-  }
++    }
++  });
++  app.route("/mcp").get((_req, res) => res.sendStatus(405)).delete((_req, res) => res.sendStatus(405));
++  app.listen(port, "0.0.0.0", () => {
++    console.log(`Read-only Paperless MCP listening on port ${port}`);
++  });
+ }
+ 
+-main().catch((e) => console.error(e.message));
++main().catch((error) => {
++  console.error(error);
++  process.exitCode = 1;
++});
+diff --git a/src/tools/correspondents.ts b/src/tools/correspondents.ts
+index 87504f0..bf6232c 100644
+--- a/src/tools/correspondents.ts
++++ b/src/tools/correspondents.ts
+@@ -1,7 +1,6 @@
+-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp";
+ import { z } from "zod";
+ 
+-export function registerCorrespondentTools(server: McpServer, api) {
++export function registerCorrespondentTools(server: any, api) {
+   server.tool(
+     "list_correspondents",
+     "Retrieve all available correspondents (people, companies, organizations that send/receive documents). Returns names and automatic matching patterns for document assignment.",

@@ -10,8 +10,9 @@ Home Assistant app repository for services running on HA Green. Add `https://git
 | Grafana MCP            | Grafana tools                 | `http://homeassistant:18080/mcp` |
 | VictoriaMetrics MCP    | Metrics queries               | `http://homeassistant:18081/mcp` |
 | VictoriaLogs MCP       | Log queries                   | `http://homeassistant:18082/mcp` |
+| Paperless-ngx MCP      | Document retrieval            | `http://homeassistant:18083/mcp` |
 
-Each MCP is a separate app and container. The four endpoints use Streamable HTTP. Their Home Assistant app Options hold backend addresses and credentials; desktop client configurations contain only the MCP URL. See each app's `DOCS.md` for its options and pinned upstream version.
+Each MCP is a separate app and container. The five endpoints use Streamable HTTP. Their Home Assistant app Options hold backend addresses and credentials; desktop client configurations contain only the MCP URL. See each app's `DOCS.md` for its options and pinned upstream version. The Paperless-ngx MCP app exposes only retrieval tools.
 
 ## Desktop clients
 
@@ -45,7 +46,7 @@ Repeat with the other URLs in the table. The bridge forwards MCP traffic; Grafan
 
 ## Access boundary
 
-The MCP listeners have no separate caller token. Any device that can reach their ports on the home LAN or tailnet can use the exposed tools with the app's backend permissions. Keep these ports off the public internet. Store the Grafana service account token only in the Grafana MCP app's password option. Home Assistant MCP obtains its backend authorization from Supervisor.
+The MCP listeners have no separate caller token. Any device that can reach their ports on the home LAN or tailnet can use the exposed tools with the app's backend permissions. Keep these ports off the public internet. Store the Grafana service account token and Paperless API token only in their respective MCP apps' password options. Home Assistant MCP obtains its backend authorization from Supervisor.
 
 ## Releasing changes
 
