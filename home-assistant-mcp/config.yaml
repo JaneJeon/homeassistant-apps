@@ -7,10 +7,7 @@ arch:
   - aarch64
   - amd64
 init: false
-startup: application
-boot: auto
 hassio_api: true
-hassio_role: default
 homeassistant_api: true
 ports:
   9583/tcp: 9583

@@ -33,7 +33,8 @@ Claude Desktop reaches that URL from this computer through a local transport bri
         "fastmcp-remote@4.0.7",
         "http://homeassistant:18080/mcp",
         "--auth",
-        "none"
+        "none",
+        "--silent"
       ]
     }
   }
