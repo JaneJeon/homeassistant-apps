@@ -1,42 +1,52 @@
-# Example Home Assistant app repository
+# Jane's Home Assistant apps
 
-This repository can be used as a "blueprint" for app development to help you get started.
+Home Assistant app repository for services running on HA Green. Add `https://github.com/JaneJeon/homeassistant-apps` in **Settings → Apps → Install app → ⋮ → Repositories**.
 
-Apps documentation: <https://developers.home-assistant.io/docs/apps>
+| App                    | Purpose                       | MCP URL                          |
+| ---------------------- | ----------------------------- | -------------------------------- |
+| Grafana (Fixed)        | Grafana service               | —                                |
+| Grafana Image Renderer | Rendering service for Grafana | —                                |
+| Home Assistant MCP     | Home Assistant tools          | `http://homeassistant:9583/mcp`  |
+| Grafana MCP            | Grafana tools                 | `http://homeassistant:18080/mcp` |
+| VictoriaMetrics MCP    | Metrics queries               | `http://homeassistant:18081/mcp` |
+| VictoriaLogs MCP       | Log queries                   | `http://homeassistant:18082/mcp` |
 
-[![Open your Home Assistant instance and show the app store with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fhome-assistant%2Fapps-example)
+Each MCP is a separate app and container. The four endpoints use Streamable HTTP. Their Home Assistant app Options hold backend addresses and credentials; desktop client configurations contain only the MCP URL. See each app's `DOCS.md` for its options and pinned upstream version.
 
-## Apps
+## Desktop clients
 
-This repository contains the following apps
+Use the **same URL** for a given MCP in both clients. Codex supports Streamable HTTP directly:
 
-### [Example app](./example)
+```toml
+[mcp_servers.grafana]
+url = "http://homeassistant:18080/mcp"
+```
 
-![Supports aarch64 Architecture][aarch64-shield]
-![Supports amd64 Architecture][amd64-shield]
+Claude Desktop reaches that URL from this computer through a local transport bridge:
 
-_Example app to use as a blueprint for new apps._
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "uvx",
+      "args": [
+        "fastmcp-remote@4.0.7",
+        "http://homeassistant:18080/mcp",
+        "--auth",
+        "none",
+        "--silent"
+      ]
+    }
+  }
+}
+```
 
-<!--
+Repeat with the other URLs in the table. The bridge forwards MCP traffic; Grafana and its credentials stay on HA Green. Claude's account-level remote connector connects from Anthropic's cloud and cannot reach these private addresses.
 
-Notes to developers after forking or using the github template feature:
-- While developing comment out the 'image' key from 'example/config.yaml' to make the supervisor build the app locally.
-  - Remember to put this back when pushing up your changes.
-- When you merge to the 'main' branch of your repository a new build will be triggered.
-  - Make sure you adjust the 'version' key in 'example/config.yaml' when you do that.
-  - Make sure you update 'example/CHANGELOG.md' when you do that.
-  - The first time this runs you might need to adjust the image configuration on github container registry to make it public.
-  - You may also need to adjust the GitHub Actions configuration (Settings > Actions > General > Workflow > Read & Write).
-- Update the repository check in '.github/workflows/build-app.yaml' to match your repository name
-  (the 'github.repository' condition in the 'prepare' job).
-- Adjust the 'image' key in 'example/config.yaml' so it points to your username instead of 'home-assistant'
-  (e.g., 'ghcr.io/my-username/my-app').
-- Rename the example directory.
-  - The 'slug' key in 'example/config.yaml' should match the directory name.
-- Adjust all keys/urls that point to 'home-assistant' to now point to your user/fork.
-- Share your repository on the forums https://community.home-assistant.io/c/projects/9
-- Do awesome stuff!
- -->
+## Access boundary
 
-[aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
-[amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
+The MCP listeners have no separate caller token. Any device that can reach their ports on the home LAN or tailnet can use the exposed tools with the app's backend permissions. Keep these ports off the public internet. Store the Grafana service account token only in the Grafana MCP app's password option. Home Assistant MCP obtains its backend authorization from Supervisor.
+
+## Releasing changes
+
+The existing GitHub Actions workflows lint each app and build changed app directories for `aarch64` and `amd64`. Pull requests build without publishing; a push to `main` publishes versioned images to GHCR. Keep each app's `config.yaml` version aligned with its published image tag.

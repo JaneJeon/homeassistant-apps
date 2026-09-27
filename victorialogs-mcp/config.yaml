@@ -1,0 +1,18 @@
+name: VictoriaLogs MCP
+version: 1.0.0
+slug: victorialogs-mcp
+description: Streamable HTTP MCP server for VictoriaLogs
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victorialogs-mcp
+arch:
+  - aarch64
+  - amd64
+init: false
+ports:
+  18082/tcp: 18082
+options:
+  backend_url: http://24c4882f-victoria-logs:9428
+  backend_bearer_token: ""
+schema:
+  backend_url: str
+  backend_bearer_token: password?
+image: ghcr.io/janejeon/victorialogs-mcp
