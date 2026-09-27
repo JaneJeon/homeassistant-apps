@@ -1,0 +1,18 @@
+name: Grafana MCP
+version: "1.6.0"
+slug: grafana-mcp
+description: Streamable HTTP MCP server for Grafana
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/grafana-mcp
+arch:
+  - aarch64
+  - amd64
+init: false
+ports:
+  8000/tcp: 18080
+options:
+  grafana_url: http://894a6dc5-grafana:8080
+  service_account_token: "-"
+schema:
+  grafana_url: str
+  service_account_token: password?
+image: ghcr.io/janejeon/grafana-mcp

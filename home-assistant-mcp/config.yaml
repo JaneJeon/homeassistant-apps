@@ -1,0 +1,31 @@
+name: Home Assistant MCP
+version: 7.2.0
+slug: home-assistant-mcp
+description: Home Assistant MCP server over Streamable HTTP
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/home-assistant-mcp
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+ports:
+  9583/tcp: 9583
+ports_description:
+  9583/tcp: Streamable HTTP MCP endpoint
+options:
+  backup_hint: normal
+  enable_skills: true
+  enable_skills_as_tools: false
+  enable_tool_search: false
+  enable_yaml_config_editing: false
+schema:
+  backup_hint: list(strong|normal|weak|auto)
+  enable_skills: bool?
+  enable_skills_as_tools: bool?
+  enable_tool_search: bool?
+  enable_yaml_config_editing: bool?
+image: ghcr.io/janejeon/home-assistant-mcp
