@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS builder
+FROM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS builder
 ARG SOURCE_COMMIT=0baa4f48c532d64162c88bad939d00f6e6524649
 RUN apk add --no-cache git ca-certificates nodejs npm
 WORKDIR /src
