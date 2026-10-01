@@ -1,5 +1,5 @@
 name: VictoriaMetrics MCP
-version: 1.0.0
+version: 1.1.0
 slug: victoriametrics-mcp
 description: Streamable HTTP MCP server for VictoriaMetrics
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victoriametrics-mcp
@@ -13,8 +13,10 @@ options:
   backend_url: http://1bd4a9fb-victoria-metrics:8428
   instance_type: single
   backend_bearer_token: ""
+  disabled_tools: documentation,export,flags,metric_relabel_debug,downsampling_filters_debug,retention_filters_debug,test_rules
 schema:
   backend_url: str
   instance_type: list(single|cluster)
   backend_bearer_token: password?
+  disabled_tools: str?
 image: ghcr.io/janejeon/victoriametrics-mcp
