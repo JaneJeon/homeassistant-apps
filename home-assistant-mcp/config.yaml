@@ -1,5 +1,5 @@
 name: Home Assistant MCP
-version: 7.2.0
+version: "7.2.0-1"
 slug: home-assistant-mcp
 description: Home Assistant MCP server over Streamable HTTP
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/home-assistant-mcp
@@ -8,6 +8,7 @@ arch:
   - amd64
 init: false
 hassio_api: true
+hassio_role: manager
 homeassistant_api: true
 ports:
   9583/tcp: 9583

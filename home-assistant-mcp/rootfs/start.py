@@ -37,6 +37,13 @@ def main() -> int:
         }
     )
 
+    # App-originated supervisor/api WebSocket commands are blocked by Supervisor.
+    # Use the app's scoped token against the supported Supervisor REST API.
+    from ha_mcp.tools import tools_addons
+    from supervisor_api import supervisor_api_call
+
+    tools_addons._supervisor_api_call = supervisor_api_call
+
     # Use the upstream v7.2.0 HTTP entry point, which configures its server,
     # stateless Streamable HTTP transport, browser response, and shutdown hooks.
     from ha_mcp.__main__ import main_web

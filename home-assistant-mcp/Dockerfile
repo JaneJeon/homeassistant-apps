@@ -37,6 +37,7 @@ FROM python:3.13-slim@sha256:3de9a8d7aedbb7984dc18f2dff178a7850f16c1ae7c34ba9d7e
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY rootfs/start.py /start.py
+COPY rootfs/supervisor_api.py /supervisor_api.py
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
