@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS builder
+FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
 
 ARG SOURCE_COMMIT=4ba74570e6161b955fd1f3071ce9472c5b689295
 ARG SOURCE_SHA256=f2300678103013a8dd2ffc44c67e892c186c41a05249bf7b7b74e616892b5771
@@ -18,7 +18,7 @@ RUN patch -p1 < /tmp/upstream.patch \
     && npm run build \
     && npm prune --omit=dev
 
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
 
 RUN apk add --no-cache jq tini
 WORKDIR /app
