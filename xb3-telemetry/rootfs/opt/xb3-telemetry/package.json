@@ -1,0 +1,25 @@
+{
+  "name": "xb3-telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "start": "node dist/main.js",
+    "once": "tsx src/main.ts --once"
+  },
+  "dependencies": {
+    "cheerio": "1.2.0",
+    "fetch-cookie": "3.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}
