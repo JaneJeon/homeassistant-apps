@@ -1,5 +1,5 @@
 name: XB3 Telemetry
-version: 0.2.0
+version: 0.2.1
 slug: xb3-telemetry
 description: Read-only XB3 modem metrics for Prometheus and gateway log snapshots
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/xb3-telemetry

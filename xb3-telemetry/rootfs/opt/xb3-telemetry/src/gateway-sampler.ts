@@ -67,6 +67,7 @@ function snapshotPage<T>(result: PageResult<T>): Record<string, unknown> {
     started_at_seconds: result.startedAtSeconds ?? null,
     observed_at_seconds: result.observedAtSeconds,
     duration_seconds: result.durationSeconds,
+    parse_duration_seconds: result.parseDurationSeconds ?? 0,
     started_monotonic_ms: result.startedAtMonotonicMs ?? null,
     completed_monotonic_ms: result.observedAtMonotonicMs ?? null,
   };

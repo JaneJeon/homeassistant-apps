@@ -34,6 +34,11 @@ transport failure skips later pages and imposes at least 60 seconds of cooldown.
 The 20-second option should be checked against actual request duration, usable
 observations and probe scheduling on the particular gateway.
 
+HTML parsing runs in a persistent worker so synchronous DOM work does not run
+on the probe scheduler's JavaScript thread. Worker requests are bounded; parsing
+duration includes startup and message overhead. HTTP completion bounds are
+captured before parsing, and parse failure remains an unavailable observation.
+
 `/metrics` serves memory immediately. A five-second scrape does not issue five-
 second portal requests. Cached page values keep their original timestamps and
 page sequence. Not-due auxiliary pages retain their original observation; an
