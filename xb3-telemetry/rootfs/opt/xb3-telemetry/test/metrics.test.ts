@@ -45,6 +45,11 @@ function metricLine(output: string, prefix: string): string | undefined {
   return output.split("\n").find((line) => line.startsWith(prefix));
 }
 
+function render(metrics: Metrics, value: Collection): string {
+  metrics.observe(value);
+  return metrics.render(value);
+}
+
 function assertMetricFamiliesAreWellFormed(
   output: string,
 ): Map<string, string> {
@@ -127,7 +132,8 @@ describe("Metrics", () => {
     const hardware = parseHardware(hardwareHtml);
     const lan = parseLan(lanHtml);
     const metrics = new Metrics();
-    const rendered = metrics.render(
+    const rendered = render(
+      metrics,
       collection(page(network, 1000), page(hardware, 1000), page(lan, 1000)),
     );
 
@@ -152,7 +158,8 @@ describe("Metrics", () => {
     const network = parseNetwork(partialNetworkHtml);
     const hardware = parseHardware(hardwareHtml);
     const lan = parseLan(lanHtml);
-    const rendered = new Metrics().render(
+    const rendered = render(
+      new Metrics(),
       collection(page(network, 1000), page(hardware, 1000), page(lan, 1000)),
     );
     const types = assertMetricFamiliesAreWellFormed(rendered);
@@ -166,12 +173,60 @@ describe("Metrics", () => {
     );
   });
 
+  it("advances last-success only when an observation is explicitly committed", () => {
+    const network = parseNetwork(partialNetworkHtml);
+    const hardware = parseHardware(hardwareHtml);
+    const lan = parseLan(lanHtml);
+    const metrics = new Metrics();
+    const observed = collection(
+      page(network, 1_000),
+      page(hardware, 1_000),
+      page(lan, 1_000),
+    );
+
+    const beforeObservation = metrics.render(observed);
+    assert.match(
+      beforeObservation,
+      /xb3_collection_last_success_timestamp_seconds\{collector="downstream"\} 0/,
+    );
+    metrics.observe(observed);
+    const firstRendered = metrics.render(observed);
+    assert.match(
+      firstRendered,
+      /xb3_collection_last_success_timestamp_seconds\{collector="downstream"\} 1000/,
+    );
+
+    const uncommittedNewer = collection(
+      page(network, 2_000),
+      page(hardware, 2_000),
+      page(lan, 2_000),
+    );
+    const preview = metrics.render(uncommittedNewer);
+    const repeated = metrics.render(observed);
+    assert.match(
+      preview,
+      /xb3_collection_last_success_timestamp_seconds\{collector="downstream"\} 1000/,
+    );
+    assert.match(
+      repeated,
+      /xb3_collection_last_success_timestamp_seconds\{collector="downstream"\} 1000/,
+    );
+
+    metrics.observe(uncommittedNewer);
+    const committed = metrics.render(uncommittedNewer);
+    assert.match(
+      committed,
+      /xb3_collection_last_success_timestamp_seconds\{collector="downstream"\} 2000/,
+    );
+  });
+
   it("does not re-emit stale RF after a failed page and freezes that group’s last-success time", () => {
     const metrics = new Metrics();
     const network = parseNetwork(partialNetworkHtml);
     const hardware = parseHardware(hardwareHtml);
     const lan = parseLan(lanHtml);
-    const first = metrics.render(
+    const first = render(
+      metrics,
       collection(page(network, 1000), page(hardware, 1000), page(lan, 1000)),
     );
     assert.match(
@@ -179,7 +234,8 @@ describe("Metrics", () => {
       /xb3_collection_last_success_timestamp_seconds\{collector="downstream"\} 1000/,
     );
 
-    const second = metrics.render(
+    const second = render(
+      metrics,
       collection(
         page(null, 1100, "auth_failed"),
         page(hardware, 1100),

@@ -2,16 +2,16 @@
 
 Home Assistant app repository for services running on HA Green. Add `https://github.com/JaneJeon/homeassistant-apps` in **Settings → Apps → Install app → ⋮ → Repositories**.
 
-| App                    | Purpose                           | Endpoint                         |
-| ---------------------- | --------------------------------- | -------------------------------- |
-| Grafana (Fixed)        | Grafana service                   | —                                |
-| Grafana Image Renderer | Rendering service for Grafana     | —                                |
-| XB3 Telemetry          | Gateway metrics and log snapshots | `/metrics` on app port 19090     |
-| Home Assistant MCP     | Home Assistant tools              | `http://homeassistant:9583/mcp`  |
-| Grafana MCP            | Grafana tools                     | `http://homeassistant:18080/mcp` |
-| VictoriaMetrics MCP    | Metrics queries                   | `http://homeassistant:18081/mcp` |
-| VictoriaLogs MCP       | Log queries                       | `http://homeassistant:18082/mcp` |
-| Paperless-ngx MCP      | Document retrieval                | `http://homeassistant:18083/mcp` |
+| App                    | Purpose                                | Endpoint                         |
+| ---------------------- | -------------------------------------- | -------------------------------- |
+| Grafana (Fixed)        | Grafana service                        | —                                |
+| Grafana Image Renderer | Rendering service for Grafana          | —                                |
+| XB3 Telemetry          | Timed probes, gateway metrics and logs | `/metrics` on app port 19090     |
+| Home Assistant MCP     | Home Assistant tools                   | `http://homeassistant:9583/mcp`  |
+| Grafana MCP            | Grafana tools                          | `http://homeassistant:18080/mcp` |
+| VictoriaMetrics MCP    | Metrics queries                        | `http://homeassistant:18081/mcp` |
+| VictoriaLogs MCP       | Log queries                            | `http://homeassistant:18082/mcp` |
+| Paperless-ngx MCP      | Document retrieval                     | `http://homeassistant:18083/mcp` |
 
 Each MCP is a separate app and container. The five endpoints use Streamable HTTP. Their Home Assistant app Options hold backend addresses and credentials; desktop client configurations contain only the MCP URL. See each app's `DOCS.md` for its options and pinned upstream version. The Paperless-ngx MCP app exposes only retrieval tools.
 
