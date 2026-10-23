@@ -168,7 +168,7 @@ the command arguments:
 printf 'header = "Authorization: Bearer %s"\n' "$SUPERVISOR_TOKEN" |
   curl --fail --silent --show-error --config - \
     --header 'Content-Type: application/json' \
-    --data-binary '{"input":"{\"command\":\"verify_correlation\",\"id\":\"operator-chosen-run\"}\n"}' \
+    --data-binary '{"command":"verify_correlation","id":"operator-chosen-run"}' \
     http://supervisor/addons/894a6dc5_xb3-telemetry/stdin
 ```
 
