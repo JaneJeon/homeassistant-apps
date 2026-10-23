@@ -1,7 +1,7 @@
 # Put this in the VictoriaMetrics app's own config directory, not HA /config.
 - job_name: xb3-telemetry
-  scrape_interval: 1m
-  scrape_timeout: 55s
+  scrape_interval: 5s
+  scrape_timeout: 3s
   static_configs:
     - targets:
         - 894a6dc5-xb3-telemetry:19090

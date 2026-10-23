@@ -1,7 +1,8 @@
 # XB3 Telemetry
 
-Read-only TypeScript exporter for the PHP admin portal on the ARRIS TG1682P XB3.
-VictoriaMetrics scrapes `/metrics`; gateway log snapshots are written to app
-stdout for the existing Vector → VictoriaLogs pipeline.
+TypeScript telemetry for the ARRIS TG1682P XB3: individually timed IPv4 probes,
+passive gateway observations and explicit retrieval brackets for loss windows.
+VictoriaMetrics scrapes `/metrics`; raw outcomes and snapshots use the existing
+Vector → VictoriaLogs pipeline through app stdout.
 
 See [DOCS.md](DOCS.md) for setup, metric meanings, and diagnostic limits.

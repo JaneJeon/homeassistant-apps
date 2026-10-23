@@ -58,6 +58,50 @@ export class Metrics {
   private lastSuccess = new Map<string, number>();
   readonly logs = new Map<string, LogQueryState>();
 
+  /** Commit acquisition status once, independently of HTTP rendering. */
+  observe(collection: Collection): void {
+    const n = collection.network.data;
+    const h = collection.hardware.data;
+    const groups: [string, boolean, number][] = [
+      [
+        "downstream",
+        n?.downstream != null,
+        collection.network.observedAtSeconds,
+      ],
+      ["upstream", n?.upstream != null, collection.network.observedAtSeconds],
+      ["codewords", n?.codewords != null, collection.network.observedAtSeconds],
+      [
+        "uptime",
+        n?.uptimeSeconds != null,
+        collection.network.observedAtSeconds,
+      ],
+      [
+        "internet_ui_status",
+        n?.internetActive != null,
+        collection.network.observedAtSeconds,
+      ],
+      [
+        "gateway_clock",
+        n?.gatewayTimeRaw != null,
+        collection.network.observedAtSeconds,
+      ],
+      [
+        "modem_info",
+        Boolean(n?.modem.model && n.modem.firmware && n.modem.hardwareVersion),
+        collection.network.observedAtSeconds,
+      ],
+      ["dram", h?.dramReported != null, collection.hardware.observedAtSeconds],
+      ["flash", h?.flashMb != null, collection.hardware.observedAtSeconds],
+      [
+        "lan_ports",
+        collection.lan.data?.ports != null,
+        collection.lan.observedAtSeconds,
+      ],
+    ];
+    for (const [group, available, at] of groups)
+      if (available) this.lastSuccess.set(group, at);
+  }
+
   render(collection: Collection): string {
     const out = new TextMetrics();
     const gauge = (
@@ -72,10 +116,9 @@ export class Metrics {
       observedAt: number,
       reason?: string,
     ) => {
-      if (available) this.lastSuccess.set(collector, observedAt);
       gauge(
         "xb3_collection_success",
-        "1 when the named measurement group was usable in this scrape.",
+        "1 when the named group was usable at its latest completed observation. Check its original last-success time and page age.",
         Number(available),
         { collector },
       );
@@ -110,6 +153,25 @@ export class Metrics {
         result.durationSeconds,
         { page },
       );
+      if (result.data !== null) {
+        gauge(
+          "xb3_page_observation_timestamp_seconds",
+          "Original response-completion time, not backend acquisition time or Prometheus scrape time.",
+          result.observedAtSeconds,
+          { page },
+        );
+        gauge(
+          "xb3_page_observation_age_seconds",
+          "Age of the cached usable response. Backend acquisition age is unknown.",
+          Math.max(
+            0,
+            result.observedAtMonotonicMs !== undefined
+              ? (performance.now() - result.observedAtMonotonicMs) / 1000
+              : Date.now() / 1000 - result.observedAtSeconds,
+          ),
+          { page },
+        );
+      }
       if (result.error)
         gauge(
           "xb3_page_fetch_error",
@@ -120,7 +182,7 @@ export class Metrics {
     }
     gauge(
       "xb3_scrape_duration_seconds",
-      "Duration of this passive collection sequence.",
+      "Duration of the latest background passive collection attempt, not this HTTP request.",
       collection.durationSeconds,
     );
 

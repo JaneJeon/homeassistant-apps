@@ -8,6 +8,7 @@ export interface Options {
   port: number;
   logMode: "off" | "firewall" | "all";
   logIntervalSeconds: number;
+  networkIntervalSeconds: number;
 }
 
 export async function loadOptions(): Promise<Options> {
@@ -58,7 +59,17 @@ export async function loadOptions(): Promise<Options> {
     throw new Error(
       "Set gateway_password in app Options or XB3_PASSWORD locally",
     );
+  const networkIntervalSeconds = integer(
+    "network_interval_seconds",
+    process.env.XB3_NETWORK_INTERVAL_SECONDS ?? data.network_interval_seconds,
+    20,
+    20,
+    60,
+  );
+  if (networkIntervalSeconds !== 20 && networkIntervalSeconds !== 60)
+    throw new Error("Invalid option: network_interval_seconds");
   return {
+    networkIntervalSeconds,
     gatewayUrl: string(
       "gateway_url",
       process.env.XB3_GATEWAY_URL ?? data.gateway_url,

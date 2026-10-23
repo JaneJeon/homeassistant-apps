@@ -1,159 +1,209 @@
 # XB3 Telemetry
 
-This app adds observations from the XB3 gateway to the existing Home Assistant
-and VictoriaMetrics timeline. It does not change gateway settings or run ping,
-traceroute, Wi-Fi scans, resets, or automatic recovery actions.
+This app records individual IPv4 probe outcomes and passive observations from
+the ARRIS TG1682P admin portal. VictoriaMetrics stores counters, gauges and RTT
+histograms. The existing Vector → VictoriaLogs path stores raw probe outcomes,
+gateway snapshots and retrieval brackets. It changes no gateway settings or
+recovery automations.
 
-The existing wired HA probes show when the Green can still reach the gateway
-while external targets lose replies. The new measurements show whether those
-episodes coincide with modem errors, RF or channel-lock changes, Ethernet-link
-changes, or valid uptime resets. Existing HA Router power and voltage readings
-provide another comparison. Keep the raw packet-loss series, including 3%
-episodes; the existing 20%-for-10-minutes flag does not gate collection.
+## Timing and what can be concluded
 
-Coinciding changes support an explanation. They do not uniquely distinguish
-modem electronics, coax, drop/tap, or shared provider infrastructure. Steady
-downstream readings also leave upstream reception and gateway forwarding
-unresolved. The inspected portal exposes no CPU utilization, forwarding-drop
-counters, or connection-table occupancy. Its gateway-origin ping allows only
-four probes and is not a routine equivalent to HA's 30-probe batches.
+Each of the existing targets—gateway `10.0.0.1`, Google `8.8.8.8` and Cloudflare
+`1.1.1.1`—has one scheduled probe per second. Unanswered probes do not postpone
+the next slot. At most two subprocesses per target can be outstanding. Missed
+local slots are recorded rather than filled with catch-up traffic.
 
-## Connect the existing metrics and logs
+Every outcome retains a target, sequence, scheduled UTC and completion UTC.
+Attempted probes also retain their recorded launch attempt, monotonic bounds,
+scheduler lag, clock-offset evidence and utility-reported RTT where available.
+Skipped local slots have no launch or RTT. Launch and completion are process bounds;
+the utility does not expose kernel transmit/receive timestamps. A recognized
+one-packet timeout is `no_reply_by_deadline`. Permission errors, parent process
+timeouts, malformed results and local scheduling skips remain separate.
 
-1. Install this app and set `gateway_password` in its Options. The username
-   defaults to `admin` and the gateway URL to `http://10.0.0.1`. The password stays
-   in app Options; it is not printed, exported, or placed in this repository.
-2. Add [example-scrape.yaml](example-scrape.yaml) to the VictoriaMetrics app's own
-   config directory, which is `/config` inside that app. This is separate from
-   HA Core's `/config`. Included files contain a job list directly, without a
-   `scrape_configs:` wrapper. Check the target hostname against Supervisor: the example
-   uses this repository's existing `894a6dc5` prefix.
-3. Restart the VictoriaMetrics app from its Home Assistant app page to load the
-   additional job. This briefly pauses metric ingestion. Check
-   `up{job="xb3-telemetry"}` and `xb3_collection_success` before
-   interpreting the modem values. `up` only confirms the exporter responded.
-4. Vector currently ingests other HA app containers through journald. After
-   installation, verify this app's own stream in VictoriaLogs using its
-   `xb3_exporter_started` event. The log worker starts after one minute. Then
-   look for `xb3_gateway_log_query` and `xb3_gateway_log_snapshot_record` event text.
-   The latter appears only when a query returns records. Stdout output alone
-   does not establish successful ingestion.
-   The current Vector configuration can retain JSON as message text. No new log
-   database or shipper is required.
+The app uses its own container network namespace on HA. Its interface addresses
+are logged at startup. Equivalence with HA Core's routing and the post-NAT source
+address are not established. ICMP observations do not establish identical
+behavior for browsing traffic or IPv6. One-second sampling can still miss a
+shorter event between probes.
 
-The exporter listens on port 19090 inside the app network. Host/LAN port mapping
-is disabled by default because VictoriaMetrics can use the app hostname. If
-enabled for inspection, keep the listener on the existing LAN/tailnet boundary.
-`/healthz` reports exporter process availability, not gateway or internet health.
+Gateway reads run independently. The network page has a configurable 20- or
+60-second schedule; hardware and LAN are due every 60 seconds. A single client
+reads pages sequentially. There is no overlap or catch-up burst. A timeout or
+transport failure skips later pages and imposes at least 60 seconds of cooldown.
+The 20-second option should be checked against actual request duration, usable
+observations and probe scheduling on the particular gateway.
 
-Each Prometheus scrape runs one bounded sequence of passive reads of
-`network_setup.php`, `hardware.php`, and `lan.php`. Concurrent scrape requests
-share the same sequence. Collection has a 45-second budget; the example uses
-a one-minute scrape interval and a 55-second scrape timeout. Cookies stay in
-memory. Recognized session expiry permits one authentication recovery; rejected
-authentication backs off rather than repeatedly submitting the password.
-After a timeout or transport failure, remaining pages in that scrape are marked
-unattempted. This limits additional same-session requests while earlier server
-work may still run. It can omit otherwise available observations; collection
-tries again on the next ordinary scrape.
+`/metrics` serves memory immediately. A five-second scrape does not issue five-
+second portal requests. Cached page values keep their original timestamps and
+page sequence. Not-due auxiliary pages retain their original observation; an
+attempted failure replaces that page with unavailable data. Source ages and
+expiry use monotonic time. Repeated Prometheus timestamps are not new gateway
+acquisitions.
 
-| Measurement                 | Metric                                                                                                       | Meaning                                                                                        |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| RF lock, frequency, power   | `xb3_channel_locked`, `xb3_channel_frequency_hertz`, `xb3_channel_power_dbmv`                                | Downstream receive and upstream transmit observations at the displayed RF slot                 |
-| Downstream SNR              | `xb3_downstream_snr_db`                                                                                      | Gateway-reported receiver reading                                                              |
-| Codewords                   | `xb3_downstream_codewords_total{slot,kind}`                                                                  | Raw cumulative unerrored, correctable, and uncorrectable totals at the displayed codeword slot |
-| Ethernet                    | `xb3_lan_link_active`, `xb3_lan_link_speed_bits_per_second`                                                  | Four port states and available link rates; HA's exact port is not mapped                       |
-| Uptime and displayed status | `xb3_uptime_seconds`, `xb3_internet_ui_active`                                                               | Valid positive uptime and a literal UI flag with the limits below                              |
-| DRAM and flash              | `xb3_dram_reported_value`, `xb3_flash_reported_megabytes`                                                    | Reported resource values with the interpretation limits below                                  |
-| Measurement quality         | `xb3_collection_success`, `xb3_collection_last_success_timestamp_seconds`, `xb3_page_fetch_duration_seconds` | Availability, age, and cost of each measurement group                                          |
-| Log queries                 | `xb3_log_query_success`, `xb3_log_query_duration_seconds`, `xb3_log_records_returned`                        | Collection results by category and queried time window, not new event counts                   |
+Each `xb3_gateway_snapshot` retains parsed values, raw decimal codeword totals,
+page retrieval bounds, group errors, startup identity and collection sequence.
+For a recorded no-reply window, `xb3_loss_correlation_window` links the nearest
+usable counter-context retrieval completed before launch and a usable request
+started after completion. Ordering uses monotonic time within the same startup.
+Missing prior context, failed intervening requests, a 120-second wait without a
+usable later observation and local queue limits are explicit. UTC clock changes
+are flagged without turning them into network loss.
 
-RF and codeword labels are UI positions, not actual DOCSIS channel IDs. The
-portal fetches those tables separately; their physical-channel association is
-not independently established. RF frequency is a separate gauge. Counter
-decreases can be resets or rollover. Existing VictoriaMetrics should calculate
-rates; exclude or visibly qualify windows with decreases or RF slot changes.
-Absence of a decrease does not establish stable physical-channel identity.
-Corrected codewords are recovered errors. Codeword error fractions are not IP
-packet-loss percentages.
+These are **HTTP retrieval brackets**, not backend acquisition bounds or causal
+attribution. Counter increments may remain visible after a brief event, but do
+not timestamp IP loss. A short RF/lock/link excursion can disappear between
+gateway reads. Steady later RF values cannot clear the RF path during a burst.
+The portal cannot uniquely separate modem electronics, coax/drop/tap, shared
+plant or gateway forwarding. It exposes no CPU utilization, forwarding-drop
+counters or connection-table occupancy.
 
-The actual portal sometimes returns valid RF tables alongside blank model,
-clock, firmware, or hardware fields. Its templates can turn missing inputs into
-zero uptime, zero flash capacity, or Disabled labels. This app keeps usable
-groups and omits unavailable measurements. It does not refresh old readings with
-new timestamps or substitute zero. Last-success timestamps remain available so
-gaps can be distinguished from quiet measurements.
+## Connect the existing storage
 
-Collection success establishes a fetched and parsed observation. The portal
-does not provide acquisition timestamps for every underlying measurement group,
-so it cannot independently establish that the gateway backend refreshed them.
+1. Install/update the app and set `gateway_password` in Options. The username
+   defaults to `admin`, URL to `http://10.0.0.1`, and network schedule to 20 seconds.
+   The password is not logged or exported.
+2. Put [example-scrape.yaml](example-scrape.yaml) in the VictoriaMetrics app's own
+   `/config`. This is separate from HA Core `/config`. The include contains a
+   bare job list, without a `scrape_configs:` wrapper. Check the repository prefix
+   in the target hostname. The example uses `894a6dc5-xb3-telemetry:19090`, a
+   five-second interval and three-second timeout.
+3. Restart the VictoriaMetrics app to load the include. This briefly pauses
+   ingestion. Check `up{job="xb3-telemetry"}`, per-group quality, source age,
+   worker state and advancing original observation timestamps. `up=1` establishes
+   an HTTP response, not usable or newly acquired gateway data.
+4. Verify this app's own VictoriaLogs stream using `xb3_exporter_started`, then
+   actual `xb3_probe_outcome`, `xb3_gateway_snapshot` and gateway log records.
+   The existing pipeline can retain JSON in `_msg`; `unpack_json` exposes its
+   fields. Stdout alone does not establish storage delivery.
 
-`xb3_internet_ui_active` means only that the UI displayed Active (1) or Inactive
-(0). Missing backend data can produce Inactive. The inspected upstream code
-forces Active in `bridge-static` mode. Neither value establishes external reachability. Its collection
-success means the displayed flag was parsed, not that its backend was verified.
+Port 19090 is internal to the app network; host mapping is disabled by default.
+`/healthz` is process liveness. The normal probe rate produces about 259,200 raw
+outcome rows per day before other records. Existing storage retention applies.
 
-DRAM values remain raw with `reported_unit="MB",unit_verified="false"`. The
-observed total was 1048576 with the UI displaying MB; a conversion is not
-established for this firmware. The UI's DRAM Available field maps to upstream
-`MemoryStatus.Free`, not established Linux `MemAvailable`. Neither a large used
-value nor the static processor clock establishes hardware overload.
+## Queries and event links
 
-## Retrieved gateway logs
+Keep `mode="live"` on ordinary probe queries. Local errors and skipped slots must
+not be counted as packet loss:
 
-`log_mode` defaults to `firewall`, with a 900-second interval. `off` disables
-queries. `all` additionally requests System and Event logs. On this gateway,
-System and Event queries each took about 121 seconds and returned empty arrays;
-a Firewall query took about 3.5 seconds and returned records. The fast category
-was tested alongside metric reads in separate authenticated sessions. Isolation
-of the slow categories has not been established, so they are not enabled by
-default. A timeout stops that entire log poll because server work can continue
-after client cancellation.
-
-Log queries use a separate session, never overlap within this app, and stay out
-of the metric scrape. Each poll requests Today and Yesterday to preserve records
-across gateway midnight. Output records carry their category, actual query
-window, query ID, index, collector UTC, raw gateway timestamp, and original
-decoded row. Repeated polls and overlapping windows can retrieve the same row.
-These are snapshots of retained records, not newly occurring drops at poll time.
-The reported Count is not accumulated. An empty successful array, failed query,
-and unavailable measurement remain distinct.
-
-Gateway timestamps have no verified timezone. Valid network-page clock readings
-are logged as `xb3_gateway_clock_snapshot` with collector UTC and fetch duration
-to retain an observation pair. No automatic timezone correction is applied.
-The observed Firewall records described IPv6 drops with placeholder endpoints;
-they do not explain loss to HA's IPv4 probe addresses or establish that legitimate
-browsing traffic was blocked. The browsing impairment and IPv4 loss are related
-observations, not yet proven to be identical failing traffic.
-
-## Local development and validation
-
-Use Node 22.22.2 or newer. Supply `XB3_PASSWORD` through the existing secret
-manager, then run these commands from `rootfs/opt/xb3-telemetry`:
-
-```sh
-npm ci --ignore-scripts
-npm test
-npm run build
-npm run once
+```promql
+sum by (target) (
+  increase(xb3_probe_outcomes_total{job="xb3-telemetry",mode="live",outcome="no_reply_by_deadline"}[1m])
+)
 ```
 
-`--once` prints one Prometheus exposition. `--logs-once` retrieves the configured
-log categories and prints JSON snapshots. The normal process serves `/metrics`.
-`XB3_GATEWAY_URL`, `XB3_USERNAME`, `XB3_LOG_MODE`, `XB3_LOG_INTERVAL_SECONDS`,
-`XB3_LISTEN_HOST`, `XB3_PORT`, and `XB3_OPTIONS_FILE` support local runs without
-putting secrets into tracked files. Building the Docker image also runs the
-TypeScript check and regression tests before producing the runtime image.
+This count window is useful for locating an episode. Raw VictoriaLogs rows retain
+the individual timing and sequence:
 
-The fixtures include sanitized complete and partial HTML from the actual
-TG1682P PHP interface. Tests also mutate those captures to exercise malformed
-cells, unavailable groups, and false defaults. The implementation targets this
-observed interface, not every gateway carrying the XB3 name.
+```text
+_stream:{container_name="app_894a6dc5_xb3-telemetry"}
+| unpack_json
+| filter mode:="live" AND event:="xb3_probe_outcome" AND outcome:="no_reply_by_deadline"
+```
 
-Useful source references: [VictoriaMetrics extra scrape jobs](https://github.com/VictoriaMetrics-Community/homeassistant-addon-victoriametrics/blob/main/victoria-metrics/prometheus.tpl),
-[upstream XB3 network rendering](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/network_setup.php),
-[hardware field mappings](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/hardware.php),
-and [log query handler](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/actionHandler/ajax_troubleshooting_logs.php).
-Published upstream code helps explain the interface; it does not establish the
-deployed gateway's exact binaries or patch state.
+Use `event:="xb3_loss_correlation_window"` for the bracket records. Their probe
+sequences and before/after collection sequences identify the corresponding raw
+events under the same `startup_id`. Retrieve `xb3_gateway_snapshot` events for
+those sequences and inspect their data and quality. A complete bracket requires
+`bracket_complete=true`; a missing bracket is not evidence of a healthy gateway.
+
+In VictoriaMetrics, `xb3_exporter_start_timestamp_seconds` matches
+`startup_seconds` in logs. `xb3_gateway_collection_sequence` identifies the last
+completed collection; `xb3_page_observation_sequence` identifies each cached
+page, including older auxiliary pages. IDs and changing timestamps are not
+Prometheus labels.
+
+| Data             | Metrics / interpretation                                                                                                                     |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Probe results    | `xb3_probe_outcomes_total{mode,target,outcome}`, launch/schedule counters and RTT histogram; counters preserve short changes between scrapes |
+| Recorder quality | Per-target last completion, scheduler lag, maximum launch gap, in-flight count, live worker state and local output-drop counter              |
+| Gateway quality  | `xb3_collection_success`, original last-success time, page age, page sequence, worker state, cooldown and skipped slots                      |
+| RF               | Lock, frequency Hz, power dBmV, downstream SNR and modulation at displayed UI positions                                                      |
+| Codewords        | `xb3_downstream_codewords_total{slot,kind}`; raw cumulative totals, not IP packet-loss percentages                                           |
+| Hardware         | Positive uptime, four Ethernet states/rates, reported DRAM/flash values and nonempty model/software metadata                                 |
+
+RF and codeword slots are UI positions, not actual DOCSIS channel IDs. Their
+tables are fetched separately and physical-channel correspondence is unverified.
+Decreases can be resets or rollover. Use VictoriaMetrics for rates and qualify
+windows with decreases or RF slot changes. Corrected errors are recovered errors.
+
+The portal sometimes returns RF alongside blank metadata and false-zero uptime
+or capacity. Groups are validated independently. The Internet flag is only a UI
+value: missing backend data can show Inactive, while upstream `bridge-static`
+code forces Active. Neither value proves external reachability.
+
+DRAM retains `reported_unit="MB",unit_verified="false"`; the observed total
+1048576 makes a byte conversion unestablished for this firmware. Available maps
+to upstream `MemoryStatus.Free`, not established Linux `MemAvailable`. Neither
+large used memory nor the static processor clock establishes overload. HA's
+exact Ethernet port remains unmapped; the portal supplies no port error counters.
+
+## Retained gateway logs
+
+Firewall snapshots default to every 900 seconds in a separate session, starting
+after one minute. `off` disables them. `all` adds System/Event, whose observed
+queries each took about 121 seconds and returned empty arrays. Slow-category
+isolation is unverified. Timeout stops the entire poll because PHP work may
+continue after cancellation.
+
+Today and Yesterday cover gateway midnight. Each record retains query ID,
+window, row index, collector UTC, raw source time and original decoded row.
+Repeated queries can return the same records. Counts are not accumulated as new
+events. Gateway timestamps have no verified timezone. Observed IPv6 Firewall
+drops with placeholder endpoints do not explain the existing IPv4 probe loss.
+
+## Finite pipeline verification
+
+Authenticated Supervisor stdin accepts one command per process startup:
+
+```json
+{ "command": "verify_correlation", "id": "operator-chosen-run" }
+```
+
+From the HA Terminal & SSH app, submit it to Supervisor as follows. The app token
+passes through curl's stdin configuration without being printed or placed in
+the command arguments:
+
+```sh
+printf 'header = "Authorization: Bearer %s"\n' "$SUPERVISOR_TOKEN" |
+  curl --fail --silent --show-error --config - \
+    --header 'Content-Type: application/json' \
+    --data-binary '{"input":"{\"command\":\"verify_correlation\",\"id\":\"operator-chosen-run\"}\n"}' \
+    http://supervisor/addons/894a6dc5_xb3-telemetry/stdin
+```
+
+There is no HTTP control endpoint, arbitrary destination or shell command. After
+a six-second zero-counter baseline, a synthetic transport runs the production
+recorder for 20 scheduled slots per target while live probes continue. Its known
+60-row pattern has 52 replies, six no-reply results and two local errors. External
+sequences 5–7 simulate a short loss run; sequence 9 simulates a local error.
+Every test row has `mode="validation"`, `synthetic=true` and the validation ID.
+It changes no live replies, firewall rules or gateway measurements. It does not
+automatically replay after restart.
+
+Verify the exact raw outcome order and every target/sequence in VictoriaLogs,
+and reconcile the stored validation counters in VictoriaMetrics with those rows.
+Check that correlation records reference real surrounding gateway snapshots,
+with monotonic bounds in the correct order and explicit quality. Recheck live
+probe continuity, actual launch spacing, source collection and resource use.
+This proves the pipeline preserves a known short pattern and its retrieval
+context. It does not prove that a real WAN loss or RF excursion happened.
+
+## Development
+
+Use Node 22.22.2 or newer. From `rootfs/opt/xb3-telemetry`, run `npm ci
+--ignore-scripts`, `npm test` and `npm run build`. The Docker build also checks
+types and tests. `XB3_PASSWORD` supplies the secret for local runs. `--once`
+prints one portal collection and `--logs-once` retrieves the configured log
+categories; neither starts continuous probes. Normal service mode does.
+
+`XB3_NETWORK_INTERVAL_SECONDS` accepts 20 or 60. Existing URL, username, log mode,
+log interval, listen host/port and options-file environment overrides remain.
+Fixtures preserve sanitized complete and partial TG1682P interface structures.
+This implementation targets that observed PHP interface, not every XB3 model.
+
+Sources: [HA extra scrape files](https://github.com/VictoriaMetrics-Community/homeassistant-addon-victoriametrics/blob/main/victoria-metrics/prometheus.tpl),
+[network rendering](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/network_setup.php),
+[hardware mappings](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/hardware.php),
+[log handler](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/actionHandler/ajax_troubleshooting_logs.php).
+Published upstream code does not establish the deployed firmware's exact binaries.
