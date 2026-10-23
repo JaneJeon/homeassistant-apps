@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { LogCollector } from "../src/logs.js";
 import { Metrics } from "../src/metrics.js";
 import { GatewayError } from "../src/client.js";
+import { PortalGate, type PortalGateClock } from "../src/portal-gate.js";
 
 const fixture = (name: string) =>
   readFileSync(
@@ -15,6 +16,62 @@ const firewallRows = JSON.parse(fixture("firewall.json")) as Record<
   string,
   unknown
 >[];
+
+class ManualGateClock implements PortalGateClock {
+  monotonic = 0;
+  wall = 1_800_000_000_000;
+  readonly sleeps: number[] = [];
+  private pending: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+    stop?: AbortSignal;
+    abort?: () => void;
+  }> = [];
+  monotonicMs(): number {
+    return this.monotonic;
+  }
+  wallMs(): number {
+    return this.wall;
+  }
+  sleep(ms: number, stop?: AbortSignal): Promise<void> {
+    this.sleeps.push(ms);
+    return new Promise<void>((resolve, reject) => {
+      const item = {
+        resolve,
+        reject,
+        stop,
+        abort: undefined as (() => void) | undefined,
+      };
+      item.abort = () => {
+        this.remove(item);
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      };
+      if (stop?.aborted) {
+        item.abort();
+        return;
+      }
+      stop?.addEventListener("abort", item.abort, { once: true });
+      this.pending.push(item);
+    });
+  }
+  advance(ms: number): void {
+    this.monotonic += ms;
+    this.wall += ms;
+    const pending = [...this.pending];
+    for (const item of pending) {
+      this.remove(item);
+      item.resolve();
+    }
+  }
+  private remove(item: (typeof this.pending)[number]): void {
+    const index = this.pending.indexOf(item);
+    if (index >= 0) this.pending.splice(index, 1);
+    if (item.stop && item.abort)
+      item.stop.removeEventListener("abort", item.abort);
+  }
+}
+
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("LogCollector", () => {
   it("queries Today and Yesterday sequentially, labels snapshots, and keeps repeated raw counts unaccumulated", async () => {
@@ -244,6 +301,86 @@ describe("LogCollector", () => {
       ]);
       assert.equal(metrics.logs.get("system:Today")?.success, true);
       assert.equal(metrics.logs.get("event:Yesterday")?.recordsReturned, 0);
+    }
+  });
+
+  it("waits behind metrics and holds the shared portal gate across Today and Yesterday", async () => {
+    const clock = new ManualGateClock();
+    const access = new PortalGate({ clock });
+    const metricsLease = access.tryAcquireMetrics();
+    assert.ok(metricsLease);
+    const calls: string[] = [];
+    const client = {
+      async logs(_kind: string, timeFrame: string) {
+        calls.push(timeFrame);
+        assert.equal(access.state.owner, "logs");
+        assert.equal(access.tryAcquireMetrics(), null);
+        return "[]";
+      },
+    };
+    const collector = new LogCollector(client, new Metrics(), () => {}, access);
+    const pending = collector.once(["firewall"], 5000);
+    assert.equal(access.state.logsWaiting, true);
+    assert.deepEqual(calls, []);
+    metricsLease.release();
+    clock.advance(1000);
+    await pending;
+    assert.deepEqual(calls, ["Today", "Yesterday"]);
+    assert.equal(access.state.owner, null);
+    assert.equal(access.state.logsWaiting, false);
+  });
+
+  it("cleans up an aborted waiting run so a later run can call the client", async () => {
+    const clock = new ManualGateClock();
+    const access = new PortalGate({ clock });
+    const metricsLease = access.tryAcquireMetrics();
+    assert.ok(metricsLease);
+    const calls: string[] = [];
+    const collector = new LogCollector(
+      {
+        async logs(_kind: string, timeFrame: string) {
+          calls.push(timeFrame);
+          return "[]";
+        },
+      },
+      new Metrics(),
+      () => {},
+      access,
+    );
+    const controller = new AbortController();
+    const waiting = collector.once(["firewall"], 5000, controller.signal);
+    assert.equal(access.state.logsWaiting, true);
+    controller.abort();
+    await waiting;
+    assert.deepEqual(calls, []);
+    assert.equal(access.state.logsWaiting, false);
+    metricsLease.release();
+
+    await collector.once(["firewall"], 5000);
+    assert.deepEqual(calls, ["Today", "Yesterday"]);
+  });
+
+  it("keeps a shared cooldown after a log timeout or transport failure releases its lease", async () => {
+    for (const code of ["timeout", "transport_failed"] as const) {
+      const clock = new ManualGateClock();
+      const access = new PortalGate({ clock });
+      const calls: string[] = [];
+      const collector = new LogCollector(
+        {
+          async logs(_kind: string, timeFrame: string) {
+            calls.push(timeFrame);
+            throw new GatewayError(code);
+          },
+        },
+        new Metrics(),
+        () => {},
+        access,
+      );
+      await collector.once(["firewall"], 5000);
+      assert.deepEqual(calls, ["Today"]);
+      assert.equal(access.state.owner, null);
+      assert.equal(access.state.cooldownRemainingSeconds, 60);
+      assert.equal(access.tryAcquireMetrics(), null);
     }
   });
 });

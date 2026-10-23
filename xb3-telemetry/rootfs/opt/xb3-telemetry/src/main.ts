@@ -10,6 +10,7 @@ import { WorkerParsers } from "./worker-parsers.js";
 import { Correlator } from "./correlation.js";
 import { LogCollector } from "./logs.js";
 import { Metrics } from "./metrics.js";
+import { PortalGate } from "./portal-gate.js";
 import {
   ProbeRecorder,
   PROBE_TARGETS,
@@ -75,8 +76,9 @@ async function main(): Promise<void> {
       12_000,
     );
   const metrics = new Metrics();
+  const access = new PortalGate();
   const collector = new Collector(client());
-  const logs = new LogCollector(client(), metrics, write);
+  const logs = new LogCollector(client(), metrics, write, access);
   const kinds =
     options.logMode === "all"
       ? (["system", "event", "firewall"] as const)
@@ -104,6 +106,7 @@ async function main(): Promise<void> {
     startupSeconds,
     networkIntervalMs: options.networkIntervalSeconds * 1000,
     auxiliaryIntervalMs: 60_000,
+    access,
     write,
     onObservation: (collection) => metrics.observe(collection),
   });
@@ -166,8 +169,23 @@ async function main(): Promise<void> {
       );
       output += gauge(
         "xb3_gateway_cooldown_until_timestamp_seconds",
-        "Metric-session cooldown after an ambiguous transport failure.",
+        "Shared portal cooldown after an ambiguous metrics or log transport failure.",
         state.cooldownUntilSeconds,
+      );
+      output += gauge(
+        "xb3_gateway_portal_busy",
+        "A metrics or logs sequence owns the shared portal gate.",
+        Number(access.state.owner !== null),
+      );
+      output += gauge(
+        "xb3_gateway_portal_logs_waiting",
+        "A log poll is waiting for exclusive portal access or shared cooldown.",
+        Number(access.state.logsWaiting),
+      );
+      output += gauge(
+        "xb3_gateway_portal_cooldown_remaining_seconds",
+        "Remaining shared portal cooldown measured with the monotonic clock.",
+        access.state.cooldownRemainingSeconds,
       );
       output += gauge(
         "xb3_gateway_schedule_skipped_slots",
@@ -207,7 +225,7 @@ async function main(): Promise<void> {
   });
   write({
     event: "xb3_exporter_started",
-    version: "0.2.1",
+    version: "0.2.2",
     port: options.port,
     log_mode: options.logMode,
     network_interval_seconds: options.networkIntervalSeconds,

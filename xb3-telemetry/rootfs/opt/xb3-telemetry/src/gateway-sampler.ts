@@ -1,5 +1,6 @@
 import type { Collection, PageResult } from "./collector.js";
 import { Collector } from "./collector.js";
+import type { PortalGate } from "./portal-gate.js";
 
 export interface SamplerClock {
   nowMonotonicMs(): number;
@@ -15,6 +16,7 @@ export interface GatewaySamplerOptions {
   onObservation?: (collection: Collection, sequence: number) => void;
   write?: (event: Record<string, unknown>) => void;
   clock?: SamplerClock;
+  access?: PortalGate;
 }
 
 export interface GatewaySamplerState {
@@ -101,6 +103,7 @@ export class GatewaySampler {
   private readonly onObservation?: GatewaySamplerOptions["onObservation"];
   private readonly write: NonNullable<GatewaySamplerOptions["write"]>;
   private readonly clock: SamplerClock;
+  private readonly access?: PortalGate;
   private runPromise?: Promise<void>;
   private cooldownUntilMonotonicMs = 0;
   private currentState: GatewaySamplerState = {
@@ -133,10 +136,16 @@ export class GatewaySampler {
     this.write =
       options.write ?? ((event) => console.log(JSON.stringify(event)));
     this.clock = options.clock ?? systemClock;
+    this.access = options.access;
   }
 
   get state(): GatewaySamplerState {
-    return { ...this.currentState };
+    return {
+      ...this.currentState,
+      cooldownUntilSeconds: this.access
+        ? this.access.state.cooldownUntilSeconds
+        : this.currentState.cooldownUntilSeconds,
+    };
   }
 
   run(stop: AbortSignal): Promise<void> {
@@ -183,113 +192,128 @@ export class GatewaySampler {
       if (auxiliaryDue)
         nextAuxiliaryDeadlineMs = nextAuxiliaryAfter(scheduledAtMs);
 
-      if (nowMonotonicMs < this.cooldownUntilMonotonicMs) {
+      if (
+        nowMonotonicMs < this.cooldownUntilMonotonicMs ||
+        (this.access?.state.cooldownRemainingSeconds ?? 0) > 0
+      ) {
         this.recordSkipped(scheduledAtMs, "cooldown");
         nextNetworkDeadlineMs += this.networkIntervalMs;
         continue;
       }
 
-      const scheduledAtSeconds = this.wallAtMonotonic(scheduledAtMs);
-      const sequence = this.currentState.sequence + 1;
-      const startedAtSeconds = this.clock.nowWallSeconds();
-      this.currentState = {
-        ...this.currentState,
-        sequence,
-        inProgress: true,
-        lastStartedSeconds: startedAtSeconds,
-      };
-
-      let raw: Collection;
-      try {
-        raw = await this.collector.collect({ auxiliary: auxiliaryDue });
-      } finally {
-        this.currentState = { ...this.currentState, inProgress: false };
+      const lease = this.access?.tryAcquireMetrics();
+      if (this.access && !lease) {
+        this.recordSkipped(scheduledAtMs, "portal_busy");
+        nextNetworkDeadlineMs += this.networkIntervalMs;
+        continue;
       }
 
-      const completedAtSeconds = this.clock.nowWallSeconds();
-      const completedAtMonotonicMs = this.clock.nowMonotonicMs();
-      const composed = mergeCollection(this.currentState.collection, raw);
-      this.currentState = {
-        ...this.currentState,
-        collection: composed,
-        completedSequence: sequence,
-        pageSequences: {
-          network: sequence,
-          hardware:
-            raw.hardware.error === "not_scheduled"
-              ? this.currentState.pageSequences.hardware
-              : sequence,
-          lan:
-            raw.lan.error === "not_scheduled"
-              ? this.currentState.pageSequences.lan
-              : sequence,
-        },
-        lastCompletedSeconds: completedAtSeconds,
-      };
-
-      this.write({
-        event: "xb3_gateway_snapshot",
-        startup_id: this.startupId,
-        startup_seconds: this.startupSeconds,
-        collection_sequence: sequence,
-        scheduled_at: scheduledAtSeconds,
-        started_at: startedAtSeconds,
-        completed_at: completedAtSeconds,
-        network: snapshotPage(raw.network),
-        hardware: snapshotPage(raw.hardware),
-        lan: snapshotPage(raw.lan),
-      });
       try {
-        this.onObservation?.(composed, sequence);
-      } catch {
-        this.write({
-          event: "xb3_gateway_observation_callback_failed",
-          startup_id: this.startupId,
-          startup_seconds: this.startupSeconds,
-          collection_sequence: sequence,
-          observed_at: completedAtSeconds,
-        });
-      }
-
-      const failedPages = [
-        ["network", raw.network],
-        ["hardware", raw.hardware],
-        ["lan", raw.lan],
-      ].filter(
-        ([, page]) =>
-          page &&
-          (page as PageResult<unknown>).error !== null &&
-          ["timeout", "transport_failed"].includes(
-            (page as PageResult<unknown>).error ?? "",
-          ),
-      ) as Array<[string, PageResult<unknown>]>;
-      if (failedPages.length > 0) {
-        this.cooldownUntilMonotonicMs = Math.max(
-          this.cooldownUntilMonotonicMs,
-          completedAtMonotonicMs + AMBIGUOUS_FAILURE_COOLDOWN_MS,
-        );
+        const scheduledAtSeconds = this.wallAtMonotonic(scheduledAtMs);
+        const sequence = this.currentState.sequence + 1;
+        const startedAtSeconds = this.clock.nowWallSeconds();
         this.currentState = {
           ...this.currentState,
-          cooldownUntilSeconds:
-            completedAtSeconds + AMBIGUOUS_FAILURE_COOLDOWN_MS / 1000,
+          sequence,
+          inProgress: true,
+          lastStartedSeconds: startedAtSeconds,
         };
+
+        let raw: Collection;
+        try {
+          raw = await this.collector.collect({ auxiliary: auxiliaryDue });
+        } finally {
+          this.currentState = { ...this.currentState, inProgress: false };
+        }
+
+        const completedAtSeconds = this.clock.nowWallSeconds();
+        const completedAtMonotonicMs = this.clock.nowMonotonicMs();
+        const composed = mergeCollection(this.currentState.collection, raw);
+        this.currentState = {
+          ...this.currentState,
+          collection: composed,
+          completedSequence: sequence,
+          pageSequences: {
+            network: sequence,
+            hardware:
+              raw.hardware.error === "not_scheduled"
+                ? this.currentState.pageSequences.hardware
+                : sequence,
+            lan:
+              raw.lan.error === "not_scheduled"
+                ? this.currentState.pageSequences.lan
+                : sequence,
+          },
+          lastCompletedSeconds: completedAtSeconds,
+        };
+
         this.write({
-          event: "xb3_gateway_collection_cooldown",
+          event: "xb3_gateway_snapshot",
           startup_id: this.startupId,
           startup_seconds: this.startupSeconds,
           collection_sequence: sequence,
+          scheduled_at: scheduledAtSeconds,
           started_at: startedAtSeconds,
           completed_at: completedAtSeconds,
-          cooldown_until: this.currentState.cooldownUntilSeconds,
-          failed_pages: failedPages.map(([page, result]) => ({
-            page,
-            reason: result.error,
-          })),
+          network: snapshotPage(raw.network),
+          hardware: snapshotPage(raw.hardware),
+          lan: snapshotPage(raw.lan),
         });
+        try {
+          this.onObservation?.(composed, sequence);
+        } catch {
+          this.write({
+            event: "xb3_gateway_observation_callback_failed",
+            startup_id: this.startupId,
+            startup_seconds: this.startupSeconds,
+            collection_sequence: sequence,
+            observed_at: completedAtSeconds,
+          });
+        }
+
+        const failedPages = [
+          ["network", raw.network],
+          ["hardware", raw.hardware],
+          ["lan", raw.lan],
+        ].filter(
+          ([, page]) =>
+            page &&
+            (page as PageResult<unknown>).error !== null &&
+            ["timeout", "transport_failed"].includes(
+              (page as PageResult<unknown>).error ?? "",
+            ),
+        ) as Array<[string, PageResult<unknown>]>;
+        if (failedPages.length > 0) {
+          this.access?.cooldown(AMBIGUOUS_FAILURE_COOLDOWN_MS);
+          this.cooldownUntilMonotonicMs = Math.max(
+            this.cooldownUntilMonotonicMs,
+            completedAtMonotonicMs + AMBIGUOUS_FAILURE_COOLDOWN_MS,
+          );
+          this.currentState = {
+            ...this.currentState,
+            cooldownUntilSeconds:
+              completedAtSeconds + AMBIGUOUS_FAILURE_COOLDOWN_MS / 1000,
+          };
+          this.write({
+            event: "xb3_gateway_collection_cooldown",
+            startup_id: this.startupId,
+            startup_seconds: this.startupSeconds,
+            collection_sequence: sequence,
+            started_at: startedAtSeconds,
+            completed_at: completedAtSeconds,
+            cooldown_until: this.currentState.cooldownUntilSeconds,
+            failed_pages: failedPages.map(([page, result]) => ({
+              page,
+              reason: result.error,
+            })),
+          });
+        }
+      } finally {
+        lease?.release();
       }
 
       nextNetworkDeadlineMs = scheduledAtMs + this.networkIntervalMs;
-      while (nextNetworkDeadlineMs <= completedAtMonotonicMs) {
+      while (nextNetworkDeadlineMs <= this.clock.nowMonotonicMs()) {
         const missedAtMs = nextNetworkDeadlineMs;
         if (missedAtMs >= nextAuxiliaryDeadlineMs)
           nextAuxiliaryDeadlineMs = nextAuxiliaryAfter(missedAtMs);
@@ -314,7 +338,7 @@ export class GatewaySampler {
 
   private recordSkipped(
     scheduledAtMs: number,
-    reason: "cooldown" | "missed_deadline",
+    reason: "cooldown" | "missed_deadline" | "portal_busy",
   ): void {
     this.currentState = {
       ...this.currentState,
@@ -327,7 +351,7 @@ export class GatewaySampler {
       scheduled_at: this.wallAtMonotonic(scheduledAtMs),
       reason,
       skipped_ticks: this.currentState.skippedTicks,
-      cooldown_until: this.currentState.cooldownUntilSeconds,
+      cooldown_until: this.state.cooldownUntilSeconds,
     });
   }
 }

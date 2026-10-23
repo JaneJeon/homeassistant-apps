@@ -28,9 +28,16 @@ behavior for browsing traffic or IPv6. One-second sampling can still miss a
 shorter event between probes.
 
 Gateway reads run independently. The network page has a configurable 20- or
-60-second schedule; hardware and LAN are due every 60 seconds. A single client
-reads pages sequentially. There is no overlap or catch-up burst. A timeout or
-transport failure skips later pages and imposes at least 60 seconds of cooldown.
+60-second schedule; hardware and LAN are due every 60 seconds. A shared gate
+serializes all portal access, including authentication, metric pages and log
+queries. Metric ticks skip explicitly as `portal_busy` while logs hold the gate
+or wait their turn. Log polling waits abortably and holds the gate through its
+complete Today/Yesterday sequence. There is no catch-up burst. A timeout or
+transport failure skips later pages and imposes at least 60 seconds of shared
+cooldown before either worker can issue another portal request. A skipped tick
+preserves the prior snapshot and its original age. Slow opt-in System/Event log
+queries can therefore create visible gaps in gateway observations. Probes and
+HTTP scrapes continue independently of the gate.
 The 20-second option should be checked against actual request duration, usable
 observations and probe scheduling on the particular gateway.
 
