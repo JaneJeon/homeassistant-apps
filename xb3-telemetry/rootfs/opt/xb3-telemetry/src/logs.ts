@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { GatewayClient, GatewayError, type LogKind } from "./client.js";
 import { parseLogs } from "./parser.js";
 import type { Metrics } from "./metrics.js";
+import type { PortalGate, PortalGateLease } from "./portal-gate.js";
 
 export class LogCollector {
   private running = false;
@@ -11,18 +12,27 @@ export class LogCollector {
     private readonly metrics: Metrics,
     private readonly write: (record: object) => void = (record) =>
       console.log(JSON.stringify(record)),
+    private readonly access?: PortalGate,
   ) {}
 
-  async once(kinds: LogKind[], timeoutMs: number): Promise<void> {
+  async once(
+    kinds: LogKind[],
+    timeoutMs: number,
+    stop?: AbortSignal,
+  ): Promise<void> {
     if (this.running) return;
     this.running = true;
+    let lease: PortalGateLease | null | undefined;
     try {
+      if (this.access) lease = await this.access.acquireLogs(stop);
+      if (stop?.aborted || (this.access && !lease)) return;
       // The upstream handler also uses shared temporary files. Never overlap
       // log requests, even though this client has a separate cookie jar.
       for (const kind of kinds) {
         // Explicit overlap avoids dropping events between the last poll before
         // gateway midnight and the first poll after it. Do not infer its TZ.
         for (const timeFrame of ["Today", "Yesterday"] as const) {
+          if (stop?.aborted) return;
           const key = `${kind}:${timeFrame}`;
           const state = this.metrics.logs.get(key) ?? {
             kind,
@@ -36,7 +46,14 @@ export class LogCollector {
           this.metrics.logs.set(key, state);
           state.inProgress = true;
           const start = performance.now();
+          const startedAtSeconds = Date.now() / 1000;
           const queryId = randomUUID();
+          const timing = () => ({
+            started_at_seconds: startedAtSeconds,
+            completed_at_seconds: Date.now() / 1000,
+            started_monotonic_ms: start,
+            completed_monotonic_ms: performance.now(),
+          });
           try {
             const rows = parseLogs(
               await this.client.logs(kind, timeFrame, timeoutMs),
@@ -66,8 +83,14 @@ export class LogCollector {
               time_frame: timeFrame,
               success: true,
               records_returned: rows.length,
+              ...timing(),
             });
           } catch (error) {
+            if (
+              error instanceof GatewayError &&
+              ["timeout", "transport_failed"].includes(error.code)
+            )
+              this.access?.cooldown();
             state.success = false;
             state.recordsReturned = null;
             this.write({
@@ -77,6 +100,7 @@ export class LogCollector {
               kind,
               time_frame: timeFrame,
               success: false,
+              ...timing(),
               reason:
                 error instanceof GatewayError ? error.code : "parse_failed",
             });
@@ -97,6 +121,7 @@ export class LogCollector {
         }
       }
     } finally {
+      lease?.release();
       this.running = false;
     }
   }
@@ -111,7 +136,7 @@ export class LogCollector {
       // Let initial metric collection establish its session before logging.
       await delay(60_000, undefined, { signal: stop });
       while (!stop.aborted) {
-        await this.once(kinds, timeoutMs);
+        await this.once(kinds, timeoutMs, stop);
         await delay(intervalSeconds * 1000, undefined, { signal: stop });
       }
     } catch (error) {

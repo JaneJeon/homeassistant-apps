@@ -4,6 +4,9 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Collector, type Collection } from "../src/collector.js";
 import { GatewayError } from "../src/client.js";
+import { LogCollector } from "../src/logs.js";
+import { Metrics } from "../src/metrics.js";
+import { PortalGate, type PortalGateClock } from "../src/portal-gate.js";
 import {
   GatewaySampler,
   type GatewaySamplerState,
@@ -48,6 +51,114 @@ class ManualClock implements SamplerClock {
 
   advanceBy(milliseconds: number): void {
     this.monotonicMs += milliseconds;
+  }
+}
+
+class ControlledSamplerClock implements SamplerClock {
+  monotonicMs = 0;
+  private waitCount = 0;
+  private pending: Array<{
+    deadline: number;
+    resolve: () => void;
+    stop: AbortSignal;
+    abort: () => void;
+  }> = [];
+  nowMonotonicMs(): number {
+    return this.monotonicMs;
+  }
+  nowWallSeconds(): number {
+    return 1_000 + this.monotonicMs / 1000;
+  }
+  sleepUntil(deadlineMs: number, stop: AbortSignal): Promise<void> {
+    this.waitCount++;
+    return new Promise<void>((resolve) => {
+      const item = {
+        deadline: deadlineMs,
+        resolve,
+        stop,
+        abort: () => {
+          this.remove(item);
+          resolve();
+        },
+      };
+      if (stop.aborted) {
+        resolve();
+        return;
+      }
+      stop.addEventListener("abort", item.abort, { once: true });
+      this.pending.push(item);
+    });
+  }
+  advanceNext(): void {
+    const item = this.pending.shift();
+    assert.ok(item, "expected a sampler sleep to be pending");
+    this.monotonicMs = Math.max(this.monotonicMs, item.deadline);
+    item.stop.removeEventListener("abort", item.abort);
+    item.resolve();
+  }
+  async waitForSleeps(count: number): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (this.waitCount >= count) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.fail(`sampler did not reach sleep ${count}`);
+  }
+  private remove(item: (typeof this.pending)[number]): void {
+    const index = this.pending.indexOf(item);
+    if (index >= 0) this.pending.splice(index, 1);
+    item.stop.removeEventListener("abort", item.abort);
+  }
+}
+
+class ManualGateClock implements PortalGateClock {
+  monotonic = 0;
+  wall = 1_800_000_000_000;
+  private pending: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+    stop?: AbortSignal;
+    abort?: () => void;
+  }> = [];
+  monotonicMs(): number {
+    return this.monotonic;
+  }
+  wallMs(): number {
+    return this.wall;
+  }
+  sleep(_ms: number, stop?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const item = {
+        resolve,
+        reject,
+        stop,
+        abort: undefined as (() => void) | undefined,
+      };
+      item.abort = () => {
+        this.remove(item);
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      };
+      if (stop?.aborted) {
+        item.abort();
+        return;
+      }
+      stop?.addEventListener("abort", item.abort, { once: true });
+      this.pending.push(item);
+    });
+  }
+  advance(ms: number): void {
+    this.monotonic += ms;
+    this.wall += ms;
+    const pending = [...this.pending];
+    for (const item of pending) {
+      this.remove(item);
+      item.resolve();
+    }
+  }
+  private remove(item: (typeof this.pending)[number]): void {
+    const index = this.pending.indexOf(item);
+    if (index >= 0) this.pending.splice(index, 1);
+    if (item.stop && item.abort)
+      item.stop.removeEventListener("abort", item.abort);
   }
 }
 
@@ -370,5 +481,112 @@ describe("GatewaySampler", () => {
       hardware: 1,
       lan: 1,
     });
+  });
+
+  it("skips a busy portal tick without changing the cached observation, then resumes next tick", async () => {
+    const clock = new ControlledSamplerClock();
+    const access = new PortalGate();
+    const stop = new AbortController();
+    let networkCalls = 0;
+    const fakeClient = {
+      async network() {
+        networkCalls++;
+        if (networkCalls === 2) stop.abort();
+        return networkHtml;
+      },
+      async hardware() {
+        return hardwareHtml;
+      },
+      async lan() {
+        return lanHtml;
+      },
+    };
+    const built = sampler(new Collector(fakeClient), clock, { access });
+    const running = built.sampler.run(stop.signal);
+    await clock.waitForSleeps(1);
+    clock.advanceNext();
+    await clock.waitForSleeps(2);
+    const previousObservedAt =
+      built.sampler.state.collection?.network.observedAtSeconds;
+    assert.ok(previousObservedAt);
+    assert.equal(networkCalls, 1);
+
+    const busyLease = access.tryAcquireMetrics();
+    assert.ok(busyLease);
+    clock.advanceNext();
+    await clock.waitForSleeps(3);
+    assert.equal(built.sampler.state.skippedTicks, 1);
+    assert.equal(
+      built.sampler.state.collection?.network.observedAtSeconds,
+      previousObservedAt,
+    );
+    assert.equal(built.sampler.state.pageSequences.network, 1);
+    assert.equal(networkCalls, 1);
+
+    busyLease.release();
+    clock.advanceNext();
+    await running;
+    assert.equal(networkCalls, 2);
+    assert.equal(built.sampler.state.sequence, 2);
+    assert.equal(built.sampler.state.completedSequence, 2);
+  });
+
+  it("shares a transport-timeout cooldown with a waiting log request", async () => {
+    const samplerClock = new ControlledSamplerClock();
+    const gateClock = new ManualGateClock();
+    const access = new PortalGate({ clock: gateClock });
+    const stop = new AbortController();
+    let logCollector: LogCollector;
+    let logPromise: Promise<void> | undefined;
+    const logCalls: string[] = [];
+    logCollector = new LogCollector(
+      {
+        async logs(_kind: string, timeFrame: string) {
+          logCalls.push(timeFrame);
+          return "[]";
+        },
+      },
+      new Metrics(),
+      () => {},
+      access,
+    );
+    let networkCalls = 0;
+    const fakeClient = {
+      async network() {
+        networkCalls++;
+        logPromise = logCollector.once(["firewall"], 5000);
+        assert.equal(access.state.owner, "metrics");
+        assert.equal(access.state.logsWaiting, true);
+        throw new GatewayError("transport_failed");
+      },
+      async hardware() {
+        return hardwareHtml;
+      },
+      async lan() {
+        return lanHtml;
+      },
+    };
+    const built = sampler(new Collector(fakeClient), samplerClock, { access });
+    const running = built.sampler.run(stop.signal);
+    await samplerClock.waitForSleeps(1);
+    samplerClock.advanceNext();
+    await samplerClock.waitForSleeps(2);
+
+    assert.equal(networkCalls, 1);
+    assert.equal(access.state.owner, null);
+    assert.equal(access.state.cooldownRemainingSeconds, 60);
+    assert.equal(access.tryAcquireMetrics(), null);
+    assert.deepEqual(logCalls, []);
+
+    gateClock.advance(1000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(logCalls, []);
+    assert.equal(access.state.cooldownRemainingSeconds, 59);
+
+    gateClock.advance(59_000);
+    await logPromise;
+    assert.deepEqual(logCalls, ["Today", "Yesterday"]);
+    stop.abort();
+    await running;
   });
 });
