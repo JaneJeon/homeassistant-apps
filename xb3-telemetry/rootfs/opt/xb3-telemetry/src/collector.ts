@@ -13,6 +13,7 @@ export interface PageResult<T> {
   startedAtSeconds?: number;
   startedAtMonotonicMs?: number;
   observedAtMonotonicMs?: number;
+  parseDurationSeconds?: number;
   error: string | null;
 }
 export interface Collection {
@@ -26,6 +27,11 @@ export interface CollectOptions {
   /** Whether to fetch hardware and LAN pages during this sequence. Defaults true. */
   auxiliary?: boolean;
 }
+export interface PageParsers {
+  network(html: string): NetworkSnapshot | Promise<NetworkSnapshot>;
+  hardware(html: string): HardwareSnapshot | Promise<HardwareSnapshot>;
+  lan(html: string): LanSnapshot | Promise<LanSnapshot>;
+}
 
 export class Collector {
   private inFlight?: Promise<Collection>;
@@ -34,6 +40,11 @@ export class Collector {
       GatewayClient,
       "network" | "hardware" | "lan"
     >,
+    private readonly parsers: PageParsers = {
+      network: parseNetwork,
+      hardware: parseHardware,
+      lan: parseLan,
+    },
   ) {}
 
   /** Coalesce concurrent Prometheus scrapes. Only one passive read sequence runs. */
@@ -47,29 +58,41 @@ export class Collector {
 
   private async page<T>(
     fetchPage: () => Promise<string>,
-    parse: (html: string) => T,
+    parse: (html: string) => T | Promise<T>,
   ): Promise<PageResult<T>> {
     const start = performance.now();
     const startedAtSeconds = Date.now() / 1000;
+    let responseAtSeconds: number | undefined;
+    let responseAtMonotonicMs: number | undefined;
+    let parseStarted: number | undefined;
     try {
-      const data = parse(await fetchPage());
+      const html = await fetchPage();
+      responseAtSeconds = Date.now() / 1000;
+      responseAtMonotonicMs = performance.now();
+      parseStarted = performance.now();
+      const data = await parse(html);
       return {
         data,
         durationSeconds: (performance.now() - start) / 1000,
-        observedAtSeconds: Date.now() / 1000,
+        observedAtSeconds: responseAtSeconds,
         startedAtSeconds,
         startedAtMonotonicMs: start,
-        observedAtMonotonicMs: performance.now(),
+        observedAtMonotonicMs: responseAtMonotonicMs,
+        parseDurationSeconds: (performance.now() - parseStarted) / 1000,
         error: null,
       };
     } catch (error) {
       return {
         data: null,
         durationSeconds: (performance.now() - start) / 1000,
-        observedAtSeconds: Date.now() / 1000,
+        observedAtSeconds: responseAtSeconds ?? Date.now() / 1000,
         startedAtSeconds,
         startedAtMonotonicMs: start,
-        observedAtMonotonicMs: performance.now(),
+        observedAtMonotonicMs: responseAtMonotonicMs ?? performance.now(),
+        parseDurationSeconds:
+          parseStarted === undefined
+            ? 0
+            : (performance.now() - parseStarted) / 1000,
         error: error instanceof GatewayError ? error.code : "parse_failed",
       };
     }
@@ -100,7 +123,7 @@ export class Collector {
     // preserve each page's own result instead of failing the whole scrape.
     const network = await this.page(
       () => this.client.network(signal),
-      parseNetwork,
+      (html) => this.parsers.network(html),
     );
     const ambiguous = (result: PageResult<unknown>) =>
       result.error === "timeout" || result.error === "transport_failed";
@@ -111,12 +134,18 @@ export class Collector {
       ? this.notScheduled<HardwareSnapshot>()
       : ambiguous(network)
         ? this.skippedAfterAmbiguousFailure<HardwareSnapshot>()
-        : await this.page(() => this.client.hardware(signal), parseHardware);
+        : await this.page(
+            () => this.client.hardware(signal),
+            (html) => this.parsers.hardware(html),
+          );
     const lan = !auxiliary
       ? this.notScheduled<LanSnapshot>()
       : ambiguous(network) || ambiguous(hardware)
         ? this.skippedAfterAmbiguousFailure<LanSnapshot>()
-        : await this.page(() => this.client.lan(signal), parseLan);
+        : await this.page(
+            () => this.client.lan(signal),
+            (html) => this.parsers.lan(html),
+          );
     return {
       network,
       hardware,

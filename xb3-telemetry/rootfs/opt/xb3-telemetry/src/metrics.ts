@@ -153,6 +153,12 @@ export class Metrics {
         result.durationSeconds,
         { page },
       );
+      gauge(
+        "xb3_page_parse_duration_seconds",
+        "Elapsed asynchronous parsing operation, including worker startup and message overhead.",
+        result.parseDurationSeconds ?? 0,
+        { page },
+      );
       if (result.data !== null) {
         gauge(
           "xb3_page_observation_timestamp_seconds",

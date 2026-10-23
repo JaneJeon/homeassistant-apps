@@ -6,6 +6,7 @@ import { GatewayClient } from "./client.js";
 import { Collector, type Collection, type PageResult } from "./collector.js";
 import { loadOptions } from "./config.js";
 import { GatewaySampler } from "./gateway-sampler.js";
+import { WorkerParsers } from "./worker-parsers.js";
 import { Correlator } from "./correlation.js";
 import { LogCollector } from "./logs.js";
 import { Metrics } from "./metrics.js";
@@ -94,10 +95,11 @@ async function main(): Promise<void> {
   }
   const stop = new AbortController();
   const probes = new ProbeRecorder({ startupId, startupSeconds, write });
+  const workerParsers = new WorkerParsers();
   let validation: ProbeRecorder | undefined;
   let validationRequested = false;
   let gatewayWorkerRunning = true;
-  const sampler = new GatewaySampler(collector, {
+  const sampler = new GatewaySampler(new Collector(client(), workerParsers), {
     startupId,
     startupSeconds,
     networkIntervalMs: options.networkIntervalSeconds * 1000,
@@ -205,7 +207,7 @@ async function main(): Promise<void> {
   });
   write({
     event: "xb3_exporter_started",
-    version: "0.2.0",
+    version: "0.2.1",
     port: options.port,
     log_mode: options.logMode,
     network_interval_seconds: options.networkIntervalSeconds,
@@ -337,9 +339,11 @@ async function main(): Promise<void> {
   correlationTimer.unref();
   const shutdown = () => {
     stop.abort();
+    correlator?.close();
     clearInterval(correlationTimer);
     server.close();
     setTimeout(() => {
+      workerParsers.close();
       correlator?.close();
       process.exit(0);
     }, 5_000).unref();
