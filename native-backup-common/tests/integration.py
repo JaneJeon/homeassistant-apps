@@ -50,8 +50,9 @@ def exercise(image, port, engine):
                 shutil.rmtree('/tmp/native-vl-capture', ignore_errors=True); shutil.copytree(root/'backup'/'payload', '/tmp/native-vl-capture')
             assert docker('inspect','-f','{{.State.Pid}}',container)==pid_before
             assert check(), 'database unavailable after export'
-            docker('exec',container,'chown','-R',f'{os.getuid()}:{os.getgid()}','/data')
             docker('stop',container); docker('rm',container); container=None
+            # VM writes cache files during graceful shutdown, so claim the volume afterward.
+            docker('run','--rm','--platform',os.environ.get('TEST_PLATFORM','linux/amd64'),'-v',str(root)+':/data','--entrypoint','chown',image,'-R',f'{os.getuid()}:{os.getgid()}','/data')
             legacy = root / 'legacy'; shutil.copytree(root / 'live', legacy)
             imported = root / 'imported'; imported.mkdir()
             imported_config = dict(config, bootstrap_mode='import_legacy')
