@@ -16,6 +16,8 @@ The default `bootstrap_mode` is `restore_only`. An initialized live database ope
 
 For an explicit legacy migration, stop the old app and select `import_legacy`. The app already mounts Share read-only. The runtime verifies and copies that engine's fixed legacy directory before promotion. Return the option to `restore_only` after import. Never run the old and new writers against the same source. An operation journal requires inspection after an interrupted promotion; do not remove it merely to make startup continue.
 
+After the replacement has accepted writes, a rollback must transfer that latest data. Follow the [rollback procedure](ROLLBACK.md) to preserve a fresh encrypted copy, verify staging and promote it while both writers are stopped.
+
 `native-backup startup init-empty` is an explicit initialization command for disposable test databases. It is not exposed as a production app option.
 
 ## Building and checking changes
