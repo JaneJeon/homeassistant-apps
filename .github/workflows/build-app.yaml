@@ -81,7 +81,8 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           container-registry-password: ${{ secrets.GITHUB_TOKEN }}
-          context: "./${{ inputs.app }}"
+          context: ${{ (inputs.app == 'victoria-metrics' || inputs.app == 'victoria-logs') && '.' || format('./{0}', inputs.app) }}
+          file: ${{ format('./{0}/Dockerfile', inputs.app) }}
           image: ${{ matrix.image }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
@@ -92,7 +93,17 @@ jobs:
             io.hass.description=${{ needs.prepare.outputs.description }}
             ${{ needs.prepare.outputs.url && format('io.hass.url={0}', needs.prepare.outputs.url) || '' }}
           push: ${{ inputs.publish }}
+          load: ${{ !inputs.publish && (inputs.app == 'victoria-metrics' || inputs.app == 'victoria-logs') }}
           version: ${{ needs.prepare.outputs.version }}
+
+      - name: Native snapshot and restore round trip
+        if: ${{ !inputs.publish && (inputs.app == 'victoria-metrics' || inputs.app == 'victoria-logs') }}
+        env:
+          TEST_ONLY_ENGINE: ${{ inputs.app == 'victoria-metrics' && 'vm' || 'vl' }}
+          TEST_VM_IMAGE: ${{ matrix.image }}:${{ needs.prepare.outputs.version }}
+          TEST_VL_IMAGE: ${{ matrix.image }}:${{ needs.prepare.outputs.version }}
+          TEST_PLATFORM: ${{ matrix.arch == 'aarch64' && 'linux/arm64' || 'linux/amd64' }}
+        run: python3 native-backup-common/tests/integration.py
 
   manifest:
     name: Publish multi-arch manifest

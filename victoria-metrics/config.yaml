@@ -1,0 +1,54 @@
+name: VictoriaMetrics
+version: "0.1.0"
+slug: victoria-metrics
+description: Time Series Database for long term storage as replacement for Prometheus, InfluxDB or Graphite
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victoria-metrics
+ingress: true
+ingress_port: 8428
+ingress_entry: /vmui
+# host_network: true
+ports:
+  8428/tcp: 8428
+  2003/tcp: null
+ports_description:
+  2003/tcp: Extra connection
+arch:
+  - aarch64
+  - amd64
+#  - i386
+init: false
+map:
+  - share:ro
+  - ssl
+  - addon_config
+backup_pre: /backup-pre
+backup_exclude:
+  - live/
+  - work/
+image: "ghcr.io/janejeon/victoria-metrics"
+options:
+  bootstrap_mode: restore_only
+  retention: "1y"
+  additionalArguments: ""
+  enableHTTPAuth: false
+  username: ""
+  password: ""
+  enablePrometheusScrape: false
+  prometheusScrapeHTTPS: false
+  prometheusScrapeInterval: "20s"
+  prometheusScrapeTimeout: "15s"
+  longelivedToken: ""
+  homeassistantUrl: ""
+schema:
+  bootstrap_mode: list(restore_only|import_legacy)
+  retention: "str?"
+  additionalArguments: "str?"
+  enableHTTPAuth: bool
+  username: "str?"
+  password: "password?"
+  enablePrometheusScrape: bool
+  prometheusScrapeHTTPS: bool
+  prometheusScrapeInterval: "str?"
+  prometheusScrapeTimeout: "str?"
+  longelivedToken: "password?"
+  homeassistantUrl: "str?"

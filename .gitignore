@@ -134,3 +134,6 @@ dist
 
 # Sentry Config File
 .sentryclirc
+
+__pycache__/
+*.py[cod]

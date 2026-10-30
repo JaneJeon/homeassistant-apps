@@ -29,6 +29,9 @@ jobs:
         id: changed_files
         uses: tj-actions/changed-files@v47
 
+      - name: Native backup lifecycle regressions
+        run: python3 -m unittest discover -s native-backup-common/tests -v
+
       - name: Find app directories
         id: apps
         uses: home-assistant/actions/helpers/find-addons@master
@@ -47,7 +50,7 @@ jobs:
           else
             for app in ${APPS}; do
               for file in ${MONITORED_FILES}; do
-                if [[ "${CHANGED_FILES}" =~ ${app}/${file} ]]; then
+                if [[ "${CHANGED_FILES}" =~ ${app}/${file} ]] || { [[ "${app}" == "victoria-metrics" || "${app}" == "victoria-logs" ]] && [[ "${CHANGED_FILES}" =~ native-backup-common/ ]]; }; then
                   changed_apps+=("${app}")
                   break
                 fi
