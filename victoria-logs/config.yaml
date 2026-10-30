@@ -3,7 +3,6 @@ version: "0.1.0"
 slug: victoria-logs
 description: The simple, resource-efficient and fast logs database that scales
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victoria-logs
-webui: "http://[HOST]:[PORT:9428]/"
 ingress: true
 ingress_port: 9428
 ingress_entry: select/vmui
@@ -18,7 +17,6 @@ init: false
 map:
   - share:ro
   - ssl
-backup: hot
 backup_pre: /backup-pre
 backup_exclude:
   - live/
