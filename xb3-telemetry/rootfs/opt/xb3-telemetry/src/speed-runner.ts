@@ -1,12 +1,32 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import type { SpeedResult } from "./speed-measure.js";
+import type { DirectionResult, SpeedResult } from "./speed-measure.js";
 
 export type Trigger = "schedule" | "manual";
 export type ChildOutcome =
   | { ok: true; colo: string | null; result: SpeedResult }
-  | { ok: false; colo: string | null; reason: string };
+  | {
+      ok: false;
+      colo: string | null;
+      reason: string;
+      retryAfterSeconds?: number | null;
+    };
 export type RunChild = (signal: AbortSignal) => Promise<ChildOutcome>;
+
+/**
+ * What became of one scheduled slot or requested test. Each has a fixed code
+ * for `xb3_speedtest_last_attempt_outcome`, so a dashboard can draw one row.
+ */
+export type Attempt = "tested" | "rate_limited" | "over_budget" | "failed";
+export const ATTEMPT_CODES: Record<Attempt, number> = {
+  tested: 1,
+  rate_limited: 2,
+  over_budget: 3,
+  failed: 4,
+};
+
+/** Why a test cannot start right now. */
+export type Hold = "busy" | "rate_limited" | "over_budget";
 
 export interface SpeedRunnerClock {
   wallMs(): number;
@@ -19,6 +39,11 @@ export interface SpeedRunnerOptions {
   /** Slots sit this many minutes past the interval boundary, away from :00 jobs. */
   offsetMinutes?: number;
   timeoutMs?: number;
+  /** Tests that may start in any rolling hour, scheduled and requested together. */
+  maxPerHour?: number;
+  /** Wait after a refusal that names no delay; doubles on each refusal in a row. */
+  backoffMinutes?: number;
+  maxBackoffMinutes?: number;
   write: (record: object) => void;
   runChild?: RunChild;
   clock?: SpeedRunnerClock;
@@ -33,32 +58,41 @@ export interface LastSpeedResult {
   result: SpeedResult;
 }
 
+const HOUR_MS = 3_600_000;
 const CHILD = fileURLToPath(new URL("./speed-child.js", import.meta.url));
 
 const nullableNumber = (value: unknown) =>
   value === null || (typeof value === "number" && Number.isFinite(value));
+
+function isDirectionResult(value: unknown): value is DirectionResult {
+  if (!value || typeof value !== "object") return false;
+  const d = value as Record<string, unknown>;
+  return (
+    Array.isArray(d.readingsBps) &&
+    d.readingsBps.every((v) => typeof v === "number" && Number.isFinite(v)) &&
+    [d.sustainedBps, d.worstBps, d.bestBps].every(nullableNumber) &&
+    typeof d.bytes === "number" &&
+    typeof d.requests === "number"
+  );
+}
 
 /** The child's line is trusted only in the shape the runner reads. */
 export function isChildOutcome(value: unknown): value is ChildOutcome {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   if (v.colo !== null && typeof v.colo !== "string") return false;
-  if (v.ok === false) return typeof v.reason === "string";
+  if (v.ok === false)
+    return (
+      typeof v.reason === "string" &&
+      (v.retryAfterSeconds === undefined || nullableNumber(v.retryAfterSeconds))
+    );
   if (v.ok !== true || !v.result || typeof v.result !== "object") return false;
   const r = v.result as Record<string, unknown>;
   return (
-    [
-      r.downloadBps,
-      r.uploadBps,
-      r.idleLatencyMs,
-      r.idleJitterMs,
-      r.downloadLoadedLatencyMs,
-      r.uploadLoadedLatencyMs,
-    ].every(nullableNumber) &&
-    typeof r.downloadBytes === "number" &&
-    typeof r.uploadBytes === "number" &&
-    Array.isArray(r.points) &&
-    Array.isArray(r.idleLatencyPoints)
+    isDirectionResult(r.download) &&
+    isDirectionResult(r.upload) &&
+    !!r.method &&
+    typeof r.method === "object"
   );
 }
 
@@ -84,7 +118,7 @@ export const runChildProcess: RunChild = (signal) =>
         return resolve({ ok: false, colo: null, reason: "timeout" });
       const line = output.trim().split("\n").at(-1) ?? "";
       try {
-        const parsed = JSON.parse(line) as ChildOutcome;
+        const parsed: unknown = JSON.parse(line);
         if (isChildOutcome(parsed)) return resolve(parsed);
       } catch {
         // fall through
@@ -110,9 +144,14 @@ const systemClock: SpeedRunnerClock = {
     }),
 };
 
+const iso = (ms: number) => new Date(ms).toISOString();
+const mbps = (bps: number | null) =>
+  bps === null ? null : Math.round(bps / 1e4) / 100;
+
 /**
  * Schedules speed tests on wall-clock slots and runs requested ones, one at a
- * time. Holds only the latest result and run counts.
+ * time, within an hourly budget and any wait Cloudflare asks for. Holds only
+ * the latest result, the latest attempt and run counts.
  */
 export class SpeedRunner {
   private sequence = 0;
@@ -120,34 +159,73 @@ export class SpeedRunner {
   private readonly clock: SpeedRunnerClock;
   private readonly timeoutMs: number;
   private readonly offsetMinutes: number;
+  readonly maxPerHour: number;
+  private readonly backoffMinutes: number;
+  private readonly maxBackoffMinutes: number;
   running = false;
   startedSeconds = 0;
   lastFinishedSeconds = 0;
-  skippedSlots = 0;
   last: LastSpeedResult | null = null;
+  lastAttempt: {
+    outcome: Attempt;
+    atSeconds: number;
+    trigger: Trigger;
+  } | null = null;
+  /** Wall time before which Cloudflare has asked not to be tested. */
+  rateLimitedUntilMs = 0;
+  private refusalsInRow = 0;
+  /** Wall times of test starts in the last hour. */
+  private starts: number[] = [];
   /** `${trigger}|${outcome}` → count. */
   readonly runs = new Map<string, number>();
+  /** Skipped scheduled slots by reason. */
+  readonly skipped = new Map<Hold, number>();
   private inFlight: Promise<void> | null = null;
 
   constructor(private readonly options: SpeedRunnerOptions) {
     this.runChild = options.runChild ?? runChildProcess;
     this.clock = options.clock ?? systemClock;
-    this.timeoutMs = options.timeoutMs ?? 150_000;
+    this.timeoutMs = options.timeoutMs ?? 90_000;
     this.offsetMinutes = options.offsetMinutes ?? 7;
+    this.maxPerHour = options.maxPerHour ?? 3;
+    this.backoffMinutes = options.backoffMinutes ?? 60;
+    this.maxBackoffMinutes = options.maxBackoffMinutes ?? 240;
   }
 
-  /** Start a test now unless one is running. */
-  trigger(trigger: Trigger, id?: string): "started" | "busy" {
-    if (this.running) {
+  private startsInLastHour(nowMs: number): number[] {
+    this.starts = this.starts.filter((at) => nowMs - at < HOUR_MS);
+    return this.starts;
+  }
+
+  /** Why a test cannot start now, and when it next could. */
+  hold(nowMs = this.clock.wallMs()): { hold: Hold; untilMs: number } | null {
+    if (this.running) return { hold: "busy", untilMs: nowMs };
+    if (this.rateLimitedUntilMs > nowMs)
+      return { hold: "rate_limited", untilMs: this.rateLimitedUntilMs };
+    const starts = this.startsInLastHour(nowMs);
+    if (starts.length >= this.maxPerHour)
+      return { hold: "over_budget", untilMs: starts[0]! + HOUR_MS };
+    return null;
+  }
+
+  /** Start a test now unless one is running, Cloudflare asked us to wait, or
+   * the hour's budget is used. */
+  trigger(trigger: Trigger, id?: string): "started" | Hold {
+    const nowMs = this.clock.wallMs();
+    const held = this.hold(nowMs);
+    if (held) {
       this.options.write({
         event: "xb3_speedtest_rejected",
         trigger,
         ...(id ? { request_id: id } : {}),
-        reason: "busy",
-        running_sequence: this.sequence,
+        reason: held.hold,
+        ...(held.hold === "busy"
+          ? { running_sequence: this.sequence }
+          : { next_allowed_at: iso(held.untilMs) }),
       });
-      return "busy";
+      return held.hold;
     }
+    this.starts.push(nowMs);
     this.inFlight = this.execute(trigger, id);
     return "started";
   }
@@ -165,6 +243,31 @@ export class SpeedRunner {
     );
   }
 
+  /** One scheduled slot: run a test, or record why not. */
+  slot(): void {
+    const nowMs = this.clock.wallMs();
+    const held = this.hold(nowMs);
+    if (!held) {
+      this.trigger("schedule");
+      return;
+    }
+    this.skipped.set(held.hold, (this.skipped.get(held.hold) ?? 0) + 1);
+    this.options.write({
+      event: "xb3_speedtest_slot_skipped",
+      reason: held.hold,
+      ...(held.hold === "busy"
+        ? { running_sequence: this.sequence }
+        : { next_allowed_at: iso(held.untilMs) }),
+    });
+    // A slot that finds a test already running is covered by that test.
+    if (held.hold !== "busy")
+      this.lastAttempt = {
+        outcome: held.hold,
+        atSeconds: nowMs / 1000,
+        trigger: "schedule",
+      };
+  }
+
   async run(stop: AbortSignal): Promise<void> {
     if (this.options.intervalMinutes <= 0) return;
     while (!stop.aborted) {
@@ -174,16 +277,7 @@ export class SpeedRunner {
       } catch {
         return;
       }
-      if (this.running) {
-        this.skippedSlots++;
-        this.options.write({
-          event: "xb3_speedtest_slot_skipped",
-          reason: "busy",
-          running_sequence: this.sequence,
-        });
-        continue;
-      }
-      this.trigger("schedule");
+      this.slot();
       await this.settled().catch(() => undefined);
     }
   }
@@ -197,6 +291,11 @@ export class SpeedRunner {
     } catch {
       this.count(trigger, "failed");
       this.lastFinishedSeconds = this.clock.wallMs() / 1000;
+      this.lastAttempt = {
+        outcome: "failed",
+        atSeconds: this.lastFinishedSeconds,
+        trigger,
+      };
       try {
         this.options.write({
           event: "xb3_speedtest_failed",
@@ -218,12 +317,12 @@ export class SpeedRunner {
     id?: string,
   ): Promise<void> {
     this.startedSeconds = this.clock.wallMs() / 1000;
-    const startedAt = new Date(this.startedSeconds * 1000).toISOString();
+    const startedAt = iso(this.startedSeconds * 1000);
     const common = {
       sequence,
       trigger,
       ...(id ? { request_id: id } : {}),
-      method: "cloudflare_engine_1.15.0",
+      method: "fill_line_10s",
     };
     this.options.write({
       event: "xb3_speedtest_started",
@@ -240,51 +339,92 @@ export class SpeedRunner {
     } finally {
       clearTimeout(timer);
     }
-    const finishedSeconds = this.clock.wallMs() / 1000;
+    const finishedMs = this.clock.wallMs();
+    const finishedSeconds = finishedMs / 1000;
     const base = {
       ...common,
       started_at: startedAt,
-      finished_at: new Date(finishedSeconds * 1000).toISOString(),
+      finished_at: iso(finishedMs),
       duration_seconds: finishedSeconds - this.startedSeconds,
       colo: outcome.colo,
     };
     if (
       outcome.ok &&
-      outcome.result.downloadBps !== null &&
-      outcome.result.uploadBps !== null
+      outcome.result.download.sustainedBps !== null &&
+      outcome.result.upload.sustainedBps !== null
     ) {
-      const r = outcome.result;
+      const { download, upload, method } = outcome.result;
       this.last = {
         sequence,
         trigger,
         startedSeconds: this.startedSeconds,
         finishedSeconds,
         colo: outcome.colo,
-        result: r,
+        result: outcome.result,
       };
+      this.refusalsInRow = 0;
       this.count(trigger, "success");
+      this.lastAttempt = {
+        outcome: "tested",
+        atSeconds: finishedSeconds,
+        trigger,
+      };
+      const round = (values: number[]) => values.map((v) => Math.round(v));
       this.options.write({
         event: "xb3_speedtest_result",
         ...base,
-        download_bps: r.downloadBps,
-        upload_bps: r.uploadBps,
-        idle_latency_ms: r.idleLatencyMs,
-        idle_jitter_ms: r.idleJitterMs,
-        download_loaded_latency_ms: r.downloadLoadedLatencyMs,
-        upload_loaded_latency_ms: r.uploadLoadedLatencyMs,
-        download_bytes: r.downloadBytes,
-        upload_bytes: r.uploadBytes,
-        idle_latency_points_ms: r.idleLatencyPoints,
-        bandwidth_points: r.points.map((p) => [
-          p.dir,
-          p.bytes,
-          Math.round(p.bps),
-          Math.round(p.durationMs * 10) / 10,
-        ]),
+        download_sustained_bps: download.sustainedBps,
+        download_worst_bps: download.worstBps,
+        download_best_bps: download.bestBps,
+        upload_sustained_bps: upload.sustainedBps,
+        upload_worst_bps: upload.worstBps,
+        upload_best_bps: upload.bestBps,
+        download_bytes: download.bytes,
+        upload_bytes: upload.bytes,
+        download_requests: download.requests,
+        upload_requests: upload.requests,
+        window_ms: method.durationMs,
+        warmup_ms: method.warmupMs,
+        bin_ms: method.binMs,
+        connections: method.connections,
+        download_readings_bps: round(download.readingsBps),
+        upload_readings_bps: round(upload.readingsBps),
+      });
+    } else if (!outcome.ok && outcome.reason === "http_429") {
+      this.refusalsInRow++;
+      const waitSeconds =
+        outcome.retryAfterSeconds ??
+        60 *
+          Math.min(
+            this.maxBackoffMinutes,
+            this.backoffMinutes * 2 ** (this.refusalsInRow - 1),
+          );
+      this.rateLimitedUntilMs = Math.max(
+        this.rateLimitedUntilMs,
+        finishedMs + waitSeconds * 1000,
+      );
+      this.count(trigger, "rate_limited");
+      this.lastAttempt = {
+        outcome: "rate_limited",
+        atSeconds: finishedSeconds,
+        trigger,
+      };
+      this.options.write({
+        event: "xb3_speedtest_failed",
+        ...base,
+        reason: "rate_limited",
+        retry_after_seconds: outcome.retryAfterSeconds ?? null,
+        refusals_in_row: this.refusalsInRow,
+        rate_limited_until: iso(this.rateLimitedUntilMs),
       });
     } else {
-      const reason = outcome.ok ? "no_usable_bandwidth" : outcome.reason;
+      const reason = outcome.ok ? "no_readings" : outcome.reason;
       this.count(trigger, reason === "timeout" ? "timeout" : "failed");
+      this.lastAttempt = {
+        outcome: "failed",
+        atSeconds: finishedSeconds,
+        trigger,
+      };
       this.options.write({ event: "xb3_speedtest_failed", ...base, reason });
     }
     this.lastFinishedSeconds = finishedSeconds;
@@ -296,6 +436,7 @@ export class SpeedRunner {
   }
 
   render(): string {
+    const nowMs = this.clock.wallMs();
     const lines: string[] = [];
     const family = (name: string, help: string, type: "gauge" | "counter") =>
       lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
@@ -331,14 +472,43 @@ export class SpeedRunner {
     );
     sample("xb3_speedtest_interval_seconds", this.options.intervalMinutes * 60);
     family(
-      "xb3_speedtest_skipped_slots",
-      "Scheduled slots skipped because a test was already running.",
+      "xb3_speedtest_budget_per_hour",
+      "Tests that may start in any rolling hour, scheduled and requested together.",
       "gauge",
     );
-    sample("xb3_speedtest_skipped_slots", this.skippedSlots);
+    sample("xb3_speedtest_budget_per_hour", this.maxPerHour);
+    family(
+      "xb3_speedtest_tests_last_hour",
+      "Tests started in the last hour.",
+      "gauge",
+    );
+    sample(
+      "xb3_speedtest_tests_last_hour",
+      this.startsInLastHour(nowMs).length,
+    );
+    family(
+      "xb3_speedtest_rate_limited_until_timestamp_seconds",
+      "Cloudflare refused a test and no test starts before this time; 0 when not waiting.",
+      "gauge",
+    );
+    sample(
+      "xb3_speedtest_rate_limited_until_timestamp_seconds",
+      this.rateLimitedUntilMs > nowMs ? this.rateLimitedUntilMs / 1000 : 0,
+    );
+    family(
+      "xb3_speedtest_skipped_slots_total",
+      "Scheduled slots without a test, by reason: busy (a requested test was running), rate_limited, over_budget.",
+      "counter",
+    );
+    for (const [reason, value] of this.skipped)
+      sample(
+        "xb3_speedtest_skipped_slots_total",
+        value,
+        `{reason="${reason}"}`,
+      );
     family(
       "xb3_speedtest_runs_total",
-      "Finished speed tests by trigger and outcome.",
+      "Finished speed tests by trigger and outcome: success, rate_limited, failed or timeout.",
       "counter",
     );
     for (const [key, value] of this.runs) {
@@ -349,9 +519,28 @@ export class SpeedRunner {
         `{trigger="${trigger}",outcome="${outcome}"}`,
       );
     }
+    if (this.lastAttempt) {
+      family(
+        "xb3_speedtest_last_attempt_timestamp_seconds",
+        "When the latest slot or requested test was decided: tested, refused, skipped or failed.",
+        "gauge",
+      );
+      sample(
+        "xb3_speedtest_last_attempt_timestamp_seconds",
+        this.lastAttempt.atSeconds,
+      );
+      family(
+        "xb3_speedtest_last_attempt_outcome",
+        "Latest attempt: 1 tested, 2 rate limited by Cloudflare, 3 over the hourly budget, 4 failed.",
+        "gauge",
+      );
+      sample(
+        "xb3_speedtest_last_attempt_outcome",
+        ATTEMPT_CODES[this.lastAttempt.outcome],
+      );
+    }
     const last = this.last;
     if (last) {
-      const r = last.result;
       family(
         "xb3_speedtest_last_success_timestamp_seconds",
         "End of the latest successful speed test; the result gauges below belong to it.",
@@ -368,52 +557,37 @@ export class SpeedRunner {
       );
       sample("xb3_speedtest_result_sequence", last.sequence);
       family(
-        "xb3_speedtest_download_bits_per_second",
-        "Download speed of the latest successful test (90th percentile of request speeds).",
+        "xb3_speedtest_bits_per_second",
+        "Latest successful test, from quarter-second readings over 8 seconds of a full line: sustained is the median, worst the 10th percentile, best the 90th.",
         "gauge",
       );
-      sample("xb3_speedtest_download_bits_per_second", r.downloadBps);
+      for (const [direction, d] of [
+        ["download", last.result.download],
+        ["upload", last.result.upload],
+      ] as const)
+        for (const [stat, value] of [
+          ["sustained", d.sustainedBps],
+          ["worst", d.worstBps],
+          ["best", d.bestBps],
+        ] as const)
+          sample(
+            "xb3_speedtest_bits_per_second",
+            value,
+            `{direction="${direction}",stat="${stat}"}`,
+          );
       family(
-        "xb3_speedtest_upload_bits_per_second",
-        "Upload speed of the latest successful test (90th percentile of request speeds).",
-        "gauge",
-      );
-      sample("xb3_speedtest_upload_bits_per_second", r.uploadBps);
-      family(
-        "xb3_speedtest_idle_latency_seconds",
-        "Median round trip to the test server before loading the line.",
+        "xb3_speedtest_readings",
+        "Readings behind the latest result; fewer than 32 means part of the window was not confirmed.",
         "gauge",
       );
       sample(
-        "xb3_speedtest_idle_latency_seconds",
-        r.idleLatencyMs === null ? null : r.idleLatencyMs / 1000,
-      );
-      family(
-        "xb3_speedtest_idle_jitter_seconds",
-        "Mean change between consecutive idle round trips.",
-        "gauge",
-      );
-      sample(
-        "xb3_speedtest_idle_jitter_seconds",
-        r.idleJitterMs === null ? null : r.idleJitterMs / 1000,
-      );
-      family(
-        "xb3_speedtest_loaded_latency_seconds",
-        "Median round trip while a download or upload fills the line.",
-        "gauge",
-      );
-      sample(
-        "xb3_speedtest_loaded_latency_seconds",
-        r.downloadLoadedLatencyMs === null
-          ? null
-          : r.downloadLoadedLatencyMs / 1000,
+        "xb3_speedtest_readings",
+        last.result.download.readingsBps.length,
         '{direction="download"}',
       );
       sample(
-        "xb3_speedtest_loaded_latency_seconds",
-        r.uploadLoadedLatencyMs === null
-          ? null
-          : r.uploadLoadedLatencyMs / 1000,
+        "xb3_speedtest_readings",
+        last.result.upload.readingsBps.length,
         '{direction="upload"}',
       );
     }
@@ -422,26 +596,39 @@ export class SpeedRunner {
 
   /** Read-only summary for GET /speedtest. */
   snapshot(): object {
+    const nowMs = this.clock.wallMs();
+    const held = this.hold(nowMs);
     const last = this.last;
-    const mbps = (bps: number | null) =>
-      bps === null ? null : Math.round(bps / 1e4) / 100;
+    const direction = (d: DirectionResult) => ({
+      sustained_mbps: mbps(d.sustainedBps),
+      worst_mbps: mbps(d.worstBps),
+      best_mbps: mbps(d.bestBps),
+    });
     return {
+      status: held ? (held.hold === "busy" ? "running" : held.hold) : "ready",
       running: this.running,
+      next_allowed_at: held && held.hold !== "busy" ? iso(held.untilMs) : null,
       interval_minutes: this.options.intervalMinutes,
+      budget_per_hour: this.maxPerHour,
+      tests_last_hour: this.startsInLastHour(nowMs).length,
       last_finished_at: this.lastFinishedSeconds
-        ? new Date(this.lastFinishedSeconds * 1000).toISOString()
+        ? iso(this.lastFinishedSeconds * 1000)
+        : null,
+      last_attempt: this.lastAttempt
+        ? {
+            outcome: this.lastAttempt.outcome,
+            at: iso(this.lastAttempt.atSeconds * 1000),
+            trigger: this.lastAttempt.trigger,
+          }
         : null,
       last_result: last
         ? {
             sequence: last.sequence,
             trigger: last.trigger,
-            finished_at: new Date(last.finishedSeconds * 1000).toISOString(),
+            finished_at: iso(last.finishedSeconds * 1000),
             server: last.colo,
-            download_mbps: mbps(last.result.downloadBps),
-            upload_mbps: mbps(last.result.uploadBps),
-            idle_latency_ms: last.result.idleLatencyMs,
-            download_loaded_latency_ms: last.result.downloadLoadedLatencyMs,
-            upload_loaded_latency_ms: last.result.uploadLoadedLatencyMs,
+            download: direction(last.result.download),
+            upload: direction(last.result.upload),
           }
         : null,
     };

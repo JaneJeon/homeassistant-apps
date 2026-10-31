@@ -1,70 +1,113 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-  CLOUDFLARE_SETTINGS,
-  jitter,
+  HttpError,
   measure,
+  METHOD,
+  nextChunkBytes,
+  parseRetryAfter,
   parseServerTime,
   percentile,
-  pingOf,
-  pointOf,
-  type Direction,
-  type Phase,
-  type RequestTiming,
-  type SpeedTransport,
+  readingsFrom,
+  spread,
+  summarize,
+  type MethodSettings,
+  type StreamTransport,
+  type UploadTiming,
 } from "../src/speed-measure.js";
 
-/** A line with fixed speeds and round trip; side latency rises under load. */
-class SimulatedLine implements SpeedTransport {
-  readonly requests: { dir: Direction; bytes: number; during: Phase }[] = [];
+/** Small, fast settings: 400 ms per direction, 50 ms readings after 100 ms. */
+const FAST: MethodSettings = {
+  durationMs: 400,
+  warmupMs: 100,
+  binMs: 50,
+  connections: 2,
+  downloadRequestBytes: 1_000_000,
+  uploadChunkTargetMs: 20,
+  uploadFirstChunkBytes: 1_000,
+  uploadMinChunkBytes: 500,
+  uploadMaxChunkBytes: 200_000,
+  uploadGraceMs: 1_000,
+  gapMs: 10,
+};
+
+const wait = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      },
+      { once: true },
+    );
+  });
+
+/**
+ * A line with a fixed speed in bytes per millisecond, shared by all
+ * connections. `rateAt` can slow it down for part of a test.
+ */
+class SimulatedLine implements StreamTransport {
+  downloads = 0;
+  uploads = 0;
+  private readonly t0 = performance.now();
   constructor(
-    private readonly downBps = 100e6,
-    private readonly upBps = 20e6,
-    private readonly rttMs = 15,
-    private readonly loadedRttMs = 60,
-    private readonly serverMs = 3,
+    private readonly rateAt: (dir: "down" | "up", ms: number) => number = () =>
+      100,
+    private readonly failWith?: Error,
   ) {}
-  async request(
-    dir: Direction,
+  now(): number {
+    return performance.now();
+  }
+  async download(
     bytes: number,
-    during: Phase,
-    signal?: AbortSignal,
-  ): Promise<RequestTiming> {
-    signal?.throwIfAborted();
-    this.requests.push({ dir, bytes, during });
-    await new Promise((resolve) => setTimeout(resolve, 1));
-    const rtt =
-      bytes === 0 && during !== "idle" ? this.loadedRttMs : this.rttMs;
-    if (dir === "down")
-      return {
-        ttfbMs: rtt + this.serverMs,
-        payloadMs: bytes ? ((bytes * 8) / this.downBps) * 1000 : 0,
-        bytes,
-        serverMs: this.serverMs,
-      };
-    return {
-      ttfbMs: rtt + ((bytes * 8) / this.upBps) * 1000,
-      payloadMs: 0,
-      bytes,
-      serverMs: this.serverMs,
-    };
+    onBytes: (count: number, atMs: number) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.downloads++;
+    if (this.failWith) throw this.failWith;
+    let left = bytes;
+    while (left > 0) {
+      await wait(5, signal);
+      // Two connections share the line.
+      const count = Math.min(
+        left,
+        (this.rateAt("down", this.now() - this.t0) * 5) / 2,
+      );
+      left -= count;
+      onBytes(count, this.now());
+    }
+  }
+  async upload(bytes: number, signal: AbortSignal): Promise<UploadTiming> {
+    this.uploads++;
+    if (this.failWith) throw this.failWith;
+    const startMs = this.now();
+    let left = bytes;
+    while (left > 0) {
+      await wait(5, signal);
+      left -= (this.rateAt("up", this.now() - this.t0) * 5) / 2;
+    }
+    return { startMs, endMs: this.now(), serverMs: undefined };
   }
 }
 
-const fast = { ...CLOUDFLARE_SETTINGS, loadedThrottleMs: 0 };
-
 describe("speed method helpers", () => {
+  it("reads Retry-After as seconds or a date", () => {
+    const now = Date.parse("2026-10-31T20:00:00Z");
+    assert.equal(parseRetryAfter("120", now), 120);
+    assert.equal(parseRetryAfter("Sat, 31 Oct 2026 20:30:00 GMT", now), 1800);
+    assert.equal(parseRetryAfter("soon", now), null);
+    assert.equal(parseRetryAfter(undefined, now), null);
+  });
+
   it("reads server time the way Cloudflare's engine does", () => {
     assert.equal(parseServerTime("cfRequestDuration;dur=12.5"), 12.5);
     assert.equal(
       parseServerTime("cfSpeedEdge;dur=3, cfSpeedWorker;dur=32"),
       35,
     );
-    assert.equal(
-      parseServerTime('cfL4;desc="?proto=TCP&rtt=9655", cfSpeedEdge;dur=3'),
-      3,
-    );
-    assert.equal(parseServerTime("cfSpeedEdge;dur=0"), undefined);
     assert.equal(parseServerTime(undefined), undefined);
   });
 
@@ -72,119 +115,114 @@ describe("speed method helpers", () => {
     assert.equal(percentile([], 0.5), null);
     assert.equal(percentile([3, 1, 2], 0.5), 2);
     assert.equal(
-      percentile([10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 0.9),
-      91,
+      percentile([10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 0.1),
+      19,
     );
   });
 
-  it("computes jitter as the mean step between consecutive pings", () => {
-    assert.equal(jitter([10]), null);
-    assert.equal(jitter([10, 14, 12]), 3);
+  it("spreads a confirmed chunk evenly over the bins it spans", () => {
+    const bins: number[] = [];
+    spread(bins, 1000, 100, 600, 250);
+    assert.deepEqual(
+      bins.map((b) => Math.round(b)),
+      [300, 500, 200],
+    );
+    const instant: number[] = [];
+    spread(instant, 10, 260, 260, 250);
+    assert.equal(instant.length, 2);
+    assert.equal(instant[0], undefined);
+    assert.equal(instant[1], 10);
   });
 
-  it("takes server time out of the round trip, never below zero", () => {
-    assert.equal(
-      pingOf({ ttfbMs: 20, payloadMs: 0, bytes: 0, serverMs: 5 }),
-      15,
-    );
-    assert.equal(pingOf({ ttfbMs: 2, payloadMs: 0, bytes: 0, serverMs: 5 }), 0);
-    assert.equal(
-      pingOf({ ttfbMs: 20, payloadMs: 0, bytes: 0, serverMs: undefined }),
-      20,
-    );
+  it("drops the warm-up and anything not covered", () => {
+    const settings = { ...FAST, durationMs: 1500, warmupMs: 500, binMs: 250 };
+    const bins = [1, 1, 10, 20, 30, 40];
+    // 10 bytes in 250 ms is 320 bits per second.
+    assert.deepEqual(readingsFrom(bins, settings), [320, 640, 960, 1280]);
+    assert.deepEqual(readingsFrom(bins, settings, 1200), [320, 640]);
   });
 
-  it("times downloads as ping plus body, uploads as time to response", () => {
-    const down = pointOf("down", 1e6, {
-      ttfbMs: 20,
-      payloadMs: 85,
-      bytes: 1e6,
-      serverMs: 5,
-    });
-    assert.equal(down.durationMs, 100);
-    assert.equal(down.bps, 80e6);
-    const up = pointOf("up", 1e6, {
-      ttfbMs: 400,
-      payloadMs: 0,
-      bytes: 1e6,
-      serverMs: 5,
-    });
-    assert.equal(up.durationMs, 400);
-    assert.ok(Math.abs(up.bps - 20.1e6) < 1);
+  it("sizes upload chunks to take about half a second at the last speed", () => {
+    // 24 Mbit/s over two connections: 1.5 MB/s each, so 11 × 64 KiB.
+    assert.equal(nextChunkBytes(1_500_000, 1000, METHOD), 720_896);
+    // 2.5 Mbit/s each: 2 × 64 KiB, so a slow line still gets short chunks.
+    assert.equal(nextChunkBytes(312_500, 1000, METHOD), 131_072);
+    // Never below the minimum or above the maximum.
+    assert.equal(nextChunkBytes(10_000, 1000, METHOD), 65_536);
+    assert.equal(nextChunkBytes(1e9, 1000, METHOD), 4_194_304);
+    assert.equal(nextChunkBytes(1000, 0, METHOD), 4_194_304);
+  });
+
+  it("calls the median sustained and the tails worst and best", () => {
+    const readings = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    const result = summarize(readings, 5, 2);
+    assert.equal(result.sustainedBps, 55);
+    assert.equal(result.worstBps, 19);
+    assert.equal(result.bestBps, 91);
   });
 });
 
 describe("measure", () => {
-  it("recovers a 100/20 Mbps line and stops ramping once requests pass a second", async () => {
+  it("reads a steady line as steady, in both directions", async () => {
     const line = new SimulatedLine();
-    const result = await measure(line, undefined, fast);
-    assert.ok(
-      Math.abs(result.downloadBps! - 100e6) / 100e6 < 0.01,
-      `${result.downloadBps}`,
-    );
-    assert.ok(
-      Math.abs(result.uploadBps! - 20.1e6) / 20.1e6 < 0.01,
-      `${result.uploadBps}`,
-    );
-    assert.equal(result.idleLatencyMs, 15);
-    assert.equal(result.idleJitterMs, 0);
-    // 25 MB downloads take 2 s at 100 Mbps, so the 100 MB set never runs.
-    const bandwidth = line.requests.filter((r) => r.bytes > 0);
-    assert.ok(bandwidth.some((r) => r.dir === "down" && r.bytes === 2.5e7));
-    assert.ok(!bandwidth.some((r) => r.dir === "down" && r.bytes === 1e8));
-    // 10 MB uploads take 4 s at 20 Mbps, so larger uploads never run.
-    assert.ok(bandwidth.some((r) => r.dir === "up" && r.bytes === 1e7));
-    assert.ok(!bandwidth.some((r) => r.dir === "up" && r.bytes > 1e7));
-    assert.equal(
-      result.downloadBytes,
-      1e5 * 10 + 1e6 * 8 + 1e7 * 6 + 2.5e7 * 4,
-    );
-    assert.equal(result.uploadBytes, 1e5 * 8 + 1e6 * 6 + 1e7 * 4);
+    const result = await measure(line, FAST);
+    // 100 bytes per ms is 800,000 bits per second.
+    assert.equal(result.download.readingsBps.length, 6);
+    assert.ok(result.upload.readingsBps.length >= 5);
+    for (const d of [result.download, result.upload]) {
+      assert.ok(
+        Math.abs(d.sustainedBps! - 800_000) / 800_000 < 0.25,
+        `${d.sustainedBps}`,
+      );
+    }
+    assert.equal(result.method.binMs, 50);
   });
 
-  it("counts loaded latency only from sets that kept the line busy", async () => {
-    const line = new SimulatedLine();
-    const result = await measure(line, undefined, fast);
-    assert.equal(result.downloadLoadedLatencyMs, 60);
-    assert.equal(result.uploadLoadedLatencyMs, 60);
-    const side = line.requests.filter(
-      (r) => r.bytes === 0 && r.during !== "idle",
+  it("shows a dip in the worst moments, not in the best", async () => {
+    // Download drops to a fifth between 200 and 330 ms into the test.
+    const line = new SimulatedLine((dir, ms) =>
+      dir === "down" && ms >= 200 && ms < 330 ? 20 : 100,
     );
-    assert.ok(side.some((r) => r.during === "download"));
-    assert.ok(side.some((r) => r.during === "upload"));
-    // 100 kB downloads take about 23 ms here, far under the 250 ms bar, so a
-    // run of only short requests has no loaded latency at all.
-    const short = await measure(
-      new SimulatedLine(),
-      [{ type: "down", bytes: 1e5, count: 3 }],
-      fast,
-    );
-    assert.equal(short.downloadLoadedLatencyMs, null);
-    assert.equal(short.uploadBps, null);
+    const { download } = await measure(line, FAST);
+    assert.ok(download.worstBps! < 400_000, `${download.worstBps}`);
+    assert.ok(download.bestBps! > 600_000, `${download.bestBps}`);
   });
 
-  it("drops requests too short to time", async () => {
-    const result = await measure(
-      new SimulatedLine(1e12),
-      [{ type: "down", bytes: 1e5, count: 4 }],
-      fast,
-    );
-    // A 15 ms ping plus a near-instant body is still above the 10 ms floor.
-    assert.equal(result.points.length, 4);
-    const tiny = await measure(
-      new SimulatedLine(1e12, 20e6, 1, 1, 0),
-      [{ type: "down", bytes: 1e5, count: 4 }],
-      fast,
-    );
-    assert.equal(tiny.points.length, 0);
-    assert.equal(tiny.downloadBps, null);
+  it("shows an upload dip too, because chunks stay short", async () => {
+    // Upload drops to a fifth for 130 ms of its 400 ms.
+    let uploadFrom: number | null = null;
+    const slow = new SimulatedLine((dir, ms) => {
+      if (dir === "down") return 100;
+      uploadFrom ??= ms;
+      const into = ms - uploadFrom;
+      return into >= 200 && into < 330 ? 20 : 100;
+    });
+    const { upload } = await measure(slow, FAST);
+    assert.ok(upload.worstBps! < 450_000, `${upload.worstBps}`);
+    assert.ok(upload.bestBps! > 600_000, `${upload.bestBps}`);
+  });
+
+  it("keeps few requests: the line is filled, not sampled", async () => {
+    const line = new SimulatedLine();
+    const result = await measure(line, FAST);
+    // 1 MB requests at 100 bytes/ms never finish in 400 ms: one per connection.
+    assert.equal(result.download.requests, 2);
+    assert.equal(line.downloads, 2);
+  });
+
+  it("passes on a refusal with the wait the server asked for", async () => {
+    const line = new SimulatedLine(undefined, new HttpError(429, 600));
+    await assert.rejects(measure(line, FAST), (error: unknown) => {
+      assert.ok(error instanceof HttpError);
+      assert.equal(error.status, 429);
+      assert.equal(error.retryAfterSeconds, 600);
+      return true;
+    });
   });
 
   it("stops when aborted", async () => {
     const stop = new AbortController();
-    stop.abort(new Error("stop"));
-    await assert.rejects(
-      measure(new SimulatedLine(), undefined, fast, stop.signal),
-    );
+    setTimeout(() => stop.abort(new Error("stop")), 50);
+    await assert.rejects(measure(new SimulatedLine(), FAST, stop.signal));
   });
 });

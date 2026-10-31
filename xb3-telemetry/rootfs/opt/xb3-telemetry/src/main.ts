@@ -19,7 +19,7 @@ import {
 } from "./probes.js";
 import { SpeedRunner } from "./speed-runner.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 function emptyCollection(): Collection {
   const page = <T>(): PageResult<T> => ({

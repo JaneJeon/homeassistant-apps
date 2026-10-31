@@ -1,83 +1,138 @@
 import { Agent, request as httpsRequest } from "node:https";
+import type { ClientRequest, IncomingMessage } from "node:http";
 import type { TLSSocket } from "node:tls";
 import {
+  HttpError,
+  parseRetryAfter,
   parseServerTime,
-  type Direction,
-  type Phase,
-  type RequestTiming,
-  type SpeedTransport,
+  type StreamTransport,
+  type UploadTiming,
 } from "./speed-measure.js";
 
 const CHUNK = Buffer.alloc(64 * 1024, "0");
 const REQUEST_TIMEOUT_MS = 60_000;
 
 /**
- * Speed-test requests against Cloudflare's measurement endpoints.
+ * Requests against Cloudflare's speed-test endpoints (`/__down`, `/__up`).
  *
- * Bandwidth and idle latency share one keep-alive connection; loaded latency uses
- * a second, so it can run while a transfer is in progress. Timing starts once the
- * request's connection is established, matching the browser's `requestStart`.
- * Download bodies are counted and discarded; upload bodies repeat one 64 KiB
- * buffer, so memory stays flat at any test size.
+ * Connections are kept alive and reused, up to `connections` at a time.
+ * Download bodies are counted as they arrive and discarded; upload bodies
+ * repeat one 64 KiB buffer, so memory stays flat at any size.
  */
-export class HttpsSpeedTransport implements SpeedTransport {
-  private readonly main = new Agent({ keepAlive: true, maxSockets: 1 });
-  private readonly side = new Agent({ keepAlive: true, maxSockets: 1 });
+export class HttpsSpeedTransport implements StreamTransport {
+  private readonly agent: Agent;
   /** Cloudflare site that answered the latest request, from the CF-RAY suffix. */
   colo: string | null = null;
 
   constructor(
+    connections: number,
     private readonly base = "https://speed.cloudflare.com",
-    private readonly now = () => performance.now(),
-  ) {}
+  ) {
+    this.agent = new Agent({ keepAlive: true, maxSockets: connections });
+  }
 
-  request(
-    dir: Direction,
-    bytes: number,
-    during: Phase,
-    signal?: AbortSignal,
-  ): Promise<RequestTiming> {
-    const sideLatency = bytes === 0 && during !== "idle";
-    const url = new URL(dir === "down" ? "/__down" : "/__up", this.base);
-    if (dir === "down") url.searchParams.set("bytes", String(bytes));
-    if (bytes === 0) url.searchParams.set("during", during);
-    return new Promise<RequestTiming>((resolve, reject) => {
-      let start: number | undefined;
-      let headersAt = 0;
+  now(): number {
+    return performance.now();
+  }
+
+  private open(
+    method: "GET" | "POST",
+    url: URL,
+    headers: Record<string, string>,
+    signal: AbortSignal,
+    onReady: (req: ClientRequest) => void,
+    onResponse: (res: IncomingMessage, settle: Settle) => void,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       let settled = false;
-      const fail = (error: Error) => {
-        if (settled) return;
-        settled = true;
-        req.destroy();
-        reject(error);
+      const settle: Settle = {
+        ok: () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        },
+        fail: (error: Error) => {
+          if (settled) return;
+          settled = true;
+          req.destroy();
+          reject(error);
+        },
       };
       const req = httpsRequest(url, {
-        method: dir === "down" ? "GET" : "POST",
-        agent: sideLatency ? this.side : this.main,
-        headers:
-          dir === "up"
-            ? {
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Content-Length": String(bytes),
-              }
-            : {},
+        method,
+        agent: this.agent,
+        headers,
         signal,
         timeout: REQUEST_TIMEOUT_MS,
       });
       req.on("socket", (socket) => {
         const tls = socket as TLSSocket;
         // A reused keep-alive socket is ready now; a new one is ready after TLS.
-        if (req.reusedSocket || (!tls.connecting && tls.encrypted)) {
-          start = this.now();
-          write();
-        } else
-          tls.once("secureConnect", () => {
-            start = this.now();
-            write();
-          });
+        if (req.reusedSocket || (!tls.connecting && tls.encrypted))
+          onReady(req);
+        else tls.once("secureConnect", () => onReady(req));
       });
-      const write = () => {
-        if (dir === "down") return void req.end();
+      req.on("timeout", () => settle.fail(new Error("request_timeout")));
+      req.on("error", (error) => settle.fail(error));
+      req.on("response", (res) => {
+        const ray = res.headers["cf-ray"];
+        const site =
+          typeof ray === "string" ? ray.split("-").at(-1) : undefined;
+        if (site && /^[A-Z]{3}$/.test(site)) this.colo = site;
+        const status = res.statusCode ?? 0;
+        if (status < 200 || status >= 300) {
+          res.resume();
+          const retryAfter = res.headers["retry-after"];
+          return settle.fail(
+            new HttpError(
+              status,
+              parseRetryAfter(
+                Array.isArray(retryAfter) ? retryAfter[0] : retryAfter,
+                Date.now(),
+              ),
+            ),
+          );
+        }
+        res.on("error", (error) => settle.fail(error));
+        onResponse(res, settle);
+      });
+    });
+  }
+
+  download(
+    bytes: number,
+    onBytes: (count: number, atMs: number) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const url = new URL("/__down", this.base);
+    url.searchParams.set("bytes", String(bytes));
+    return this.open(
+      "GET",
+      url,
+      {},
+      signal,
+      (req) => req.end(),
+      (res, settle) => {
+        res.on("data", (chunk: Buffer) => onBytes(chunk.length, this.now()));
+        res.on("end", () => settle.ok());
+      },
+    );
+  }
+
+  async upload(bytes: number, signal: AbortSignal): Promise<UploadTiming> {
+    let startMs = 0;
+    let endMs = 0;
+    let serverMs: number | undefined;
+    await this.open(
+      "POST",
+      new URL("/__up", this.base),
+      {
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Content-Length": String(bytes),
+      },
+      signal,
+      (req) => {
+        startMs = this.now();
         let remaining = bytes;
         const pump = () => {
           while (remaining > 0) {
@@ -91,44 +146,26 @@ export class HttpsSpeedTransport implements SpeedTransport {
           req.end();
         };
         pump();
-      };
-      req.on("timeout", () => fail(new Error("request_timeout")));
-      req.on("error", (error) => fail(error));
-      req.on("response", (res) => {
-        headersAt = this.now();
-        const ray = res.headers["cf-ray"];
-        const site =
-          typeof ray === "string" ? ray.split("-").at(-1) : undefined;
-        if (site && /^[A-Z]{3}$/.test(site)) this.colo = site;
-        const status = res.statusCode ?? 0;
-        if (status < 200 || status >= 300) {
-          res.resume();
-          return fail(new Error(`http_${status}`));
-        }
-        const serverTiming = res.headers["server-timing"];
-        const serverMs = parseServerTime(
-          Array.isArray(serverTiming) ? serverTiming.join(", ") : serverTiming,
+      },
+      (res, settle) => {
+        endMs = this.now();
+        const timing = res.headers["server-timing"];
+        serverMs = parseServerTime(
+          Array.isArray(timing) ? timing.join(", ") : timing,
         );
-        let received = 0;
-        res.on("data", (chunk: Buffer) => (received += chunk.length));
-        res.on("error", (error) => fail(error));
-        res.on("end", () => {
-          if (settled) return;
-          settled = true;
-          const end = this.now();
-          resolve({
-            ttfbMs: headersAt - (start ?? headersAt),
-            payloadMs: end - headersAt,
-            bytes: dir === "down" ? received : bytes,
-            serverMs,
-          });
-        });
-      });
-    });
+        res.resume();
+        res.on("end", () => settle.ok());
+      },
+    );
+    return { startMs, endMs, serverMs };
   }
 
   close(): void {
-    this.main.destroy();
-    this.side.destroy();
+    this.agent.destroy();
   }
+}
+
+interface Settle {
+  ok(): void;
+  fail(error: Error): void;
 }

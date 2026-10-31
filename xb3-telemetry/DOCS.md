@@ -78,42 +78,64 @@ how much it carries, so the app runs speed tests: every 30 minutes by default,
 at 7 and 37 minutes past the hour, and on request. `speedtest_interval_minutes`
 accepts 0, 15, 30 or 60; 0 runs tests only on request. One test runs at a time.
 
-The test uses Cloudflare's speed-test servers (`speed.cloudflare.com`) and the
-method of its published engine, `@cloudflare/speedtest` 1.15.0 (MIT). That
-package cannot run in Node unchanged: it reads `window.location`, takes timings
-from browser resource-timing entries and holds each download body in memory.
-The app keeps its sequence and arithmetic and times requests with Node's own
-clock instead:
+### How a test measures
 
-- Idle latency: the median of 21 empty requests on a warm connection, minus the
-  server time reported in `Server-Timing`. Jitter is the mean change between
-  consecutive values.
-- Bandwidth: sets of 100 kB, 1 MB, 10 MB and 25 MB requests in each direction.
-  A direction stops growing once every request in a set takes over a second.
-  Download time is ping plus body; upload time is request start to response
-  headers. The result is the 90th percentile of request speeds.
-- Loaded latency: empty requests on a second connection every 400 ms during each
-  set, kept only from sets whose fastest request lasted at least 250 ms.
+A test keeps the line full and reads how fast data moves, every quarter
+second. It uses Cloudflare's speed-test endpoints (`speed.cloudflare.com`,
+`/__down` and `/__up`), but not its published engine or its arithmetic: the app
+computes every number itself from its own readings.
 
-Cloudflare's own sequence continues to 100 and 250 MB downloads above about 200
-Mbps. On 2026-10-31 the endpoint answered 403 to a 100 MB request, so the app
-stops at 25 MB. Faster lines are measured with shorter requests.
+- Each direction runs for 10 seconds over 2 parallel connections. Download
+  first, then upload, half a second apart.
+- Downloads ask for 25 MB at a time and are cut off at 10 seconds. Bytes are
+  counted when they arrive.
+- Uploads send chunks and count a chunk only once Cloudflare confirms it
+  arrived. Its bytes are spread evenly over its transfer. Each chunk is sized
+  from the previous one's speed to take about half a second (64 KiB to 4 MiB),
+  so an upload slowdown shows within about half a second, as a download one
+  does. A fixed large chunk would take seconds on a slow line and average a
+  short dip away.
+- The first 2 seconds are dropped while the connections speed up. The other
+  8 seconds give 32 readings per direction.
+- From the readings: sustained is the median, worst the 10th percentile, best
+  the 90th. Every reading is logged, so any other figure can be computed later.
 
-Each test runs in a child process, so transfers and garbage collection cannot
-delay the one-second probes, and is killed after 150 seconds. Download bodies
-are discarded as they arrive and uploads repeat one 64 KiB buffer.
+At about 117 Mbit/s down and 24 up, a test makes about 6 download and 40 upload
+requests and moves about 150 MB down and 30 MB up. It takes about 25 seconds.
 
-What a result covers: the gateway, cable line and Comcast's network as far as
+### What a result covers, and what it cannot
+
+A result covers the gateway, the cable line and Comcast's network as far as
 Cloudflare's nearest site, recorded as `colo` (the `CF-RAY` suffix). Wi-Fi is
-not in the path. To compare a device, use speed.cloudflare.com on it.
-Speedtest.net uses other servers and another method, so its numbers are not
-directly comparable. The app does not send results to Cloudflare's results
-endpoint; Cloudflare still sees the requests.
+not in the path. Traffic from other devices shares the line during a test and
+lowers its readings. The app cannot tell that traffic apart.
 
-Cost: a test fills the line for roughly half a minute. At 100 Mbps down and
-20 Mbps up it moves about 170 MB down and 50 MB up. While it runs,
-`xb3_speedtest_running` is 1 and this app's probes see the test's own load.
-Delay or loss inside those windows is not evidence of a line fault.
+While a test runs, `xb3_speedtest_running` is 1 and this app's probes see the
+test's own load. Delay or loss inside those windows is not evidence of a line
+fault. Delay under load comes from those probes, not from the test.
+
+To compare a device, use speed.cloudflare.com on it. That page uses Cloudflare's
+own method, so its figures are close but not the same. Speedtest.net uses other
+servers and another method.
+
+### Limits: Cloudflare's, and the app's budget
+
+Cloudflare refuses tests from an address that tests too much (HTTP 429) and
+does not publish the limit. On 2026-10-31, four tests in 30 minutes from the
+Green were followed by refusals for over an hour. A refusal seen that day, at
+another address, asked for a 3600-second wait (`Retry-After`). So the app:
+
+- Starts at most 3 tests in any rolling hour, scheduled and requested together.
+  A request over the budget is refused with the time the next one may run.
+- After a refusal, waits as long as `Retry-After` asks. Without one it waits
+  60 minutes, doubling for each refusal in a row up to 4 hours.
+- Records every scheduled slot: tested, rate limited, over budget or failed.
+  A slot without a result is a marked gap, never a number.
+
+The budget and the wait are kept in memory. After the app restarts, it does not
+know about a wait Cloudflare asked for earlier.
+
+### Requests and data
 
 Request a test through Supervisor stdin, which needs no new listener:
 
@@ -122,18 +144,24 @@ Request a test through Supervisor stdin, which needs no new listener:
 ```
 
 From Home Assistant, call the Supervisor stdin service with app
-`894a6dc5_xb3-telemetry` and that object as input. A request while a test runs
-is rejected and logged as `xb3_speedtest_rejected`. A scheduled slot that finds
-a test running is skipped and logged.
+`894a6dc5_xb3-telemetry` and that object as input. A request while a test runs,
+while Cloudflare's wait lasts or over the budget is refused and logged as
+`xb3_speedtest_rejected` with the reason.
 
-| Data               | Where                                                                                                                                                      |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Latest result      | `xb3_speedtest_download_bits_per_second`, `_upload_bits_per_second`, `_idle_latency_seconds`, `_idle_jitter_seconds`, `_loaded_latency_seconds{direction}` |
-| Which test         | `xb3_speedtest_last_success_timestamp_seconds`, `xb3_speedtest_result_sequence`; the gauges hold the latest success until the next one                     |
-| Test windows       | `xb3_speedtest_running`, `_last_started_timestamp_seconds`, `_last_finished_timestamp_seconds`                                                             |
-| Outcomes           | `xb3_speedtest_runs_total{trigger,outcome}` with outcome `success`, `failed` or `timeout`; `xb3_speedtest_skipped_slots`                                   |
-| Every test in logs | `xb3_speedtest_started`, `xb3_speedtest_result` (all values and every request's speed and duration), `xb3_speedtest_failed` with a reason                  |
-| Summary for HA     | Read-only `GET /speedtest` on port 19090: running state and the latest result in Mbit/s and ms                                                             |
+| Data               | Where                                                                                                                                                             |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Latest result      | `xb3_speedtest_bits_per_second{direction,stat}`: direction `download` or `upload`, stat `sustained`, `worst` or `best`; `xb3_speedtest_readings{direction}`       |
+| Which test         | `xb3_speedtest_last_success_timestamp_seconds`, `xb3_speedtest_result_sequence`; the gauges hold the latest success until the next one                            |
+| Every slot         | `xb3_speedtest_last_attempt_outcome` (1 tested, 2 rate limited, 3 over budget, 4 failed) and `xb3_speedtest_last_attempt_timestamp_seconds`                       |
+| Test windows       | `xb3_speedtest_running`, `_last_started_timestamp_seconds`, `_last_finished_timestamp_seconds`                                                                    |
+| Limits             | `xb3_speedtest_budget_per_hour`, `_tests_last_hour`, `_rate_limited_until_timestamp_seconds` (0 when not waiting)                                                 |
+| Counts             | `xb3_speedtest_runs_total{trigger,outcome}`: `success`, `rate_limited`, `failed`, `timeout`; `xb3_speedtest_skipped_slots_total{reason}`                          |
+| Every test in logs | `xb3_speedtest_started`; `xb3_speedtest_result` with the three figures, bytes, requests and every reading; `xb3_speedtest_failed` with a reason and any wait      |
+| Summary for HA     | Read-only `GET /speedtest` on port 19090: status (`ready`, `running`, `rate_limited`, `over_budget`), when the next test may run, and the latest result in Mbit/s |
+
+Each test runs in a child process, so transfers and garbage collection cannot
+delay the one-second probes, and is killed after 90 seconds. Download bodies
+are discarded as they arrive and uploads repeat one 64 KiB buffer.
 
 ## Connect the existing storage
 
