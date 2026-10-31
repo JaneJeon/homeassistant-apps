@@ -1,5 +1,5 @@
 name: XB3 Telemetry
-version: 0.4.0
+version: 0.4.1
 slug: xb3-telemetry
 description: Read-only XB3 modem metrics, internet probes and speed tests for Prometheus
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/xb3-telemetry
