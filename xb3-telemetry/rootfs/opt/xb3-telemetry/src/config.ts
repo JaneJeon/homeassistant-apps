@@ -9,6 +9,8 @@ export interface Options {
   logMode: "off" | "firewall" | "all";
   logIntervalSeconds: number;
   networkIntervalSeconds: number;
+  /** 0 runs speed tests only on request. */
+  speedtestIntervalMinutes: number;
 }
 
 export async function loadOptions(): Promise<Options> {
@@ -68,8 +70,19 @@ export async function loadOptions(): Promise<Options> {
   );
   if (networkIntervalSeconds !== 20 && networkIntervalSeconds !== 60)
     throw new Error("Invalid option: network_interval_seconds");
+  const speedtestIntervalMinutes = integer(
+    "speedtest_interval_minutes",
+    process.env.XB3_SPEEDTEST_INTERVAL_MINUTES ??
+      data.speedtest_interval_minutes,
+    30,
+    0,
+    60,
+  );
+  if (![0, 15, 30, 60].includes(speedtestIntervalMinutes))
+    throw new Error("Invalid option: speedtest_interval_minutes");
   return {
     networkIntervalSeconds,
+    speedtestIntervalMinutes,
     gatewayUrl: string(
       "gateway_url",
       process.env.XB3_GATEWAY_URL ?? data.gateway_url,

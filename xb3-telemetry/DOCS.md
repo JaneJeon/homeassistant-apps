@@ -3,7 +3,8 @@
 This app records individual IPv4 probe outcomes and passive observations from
 the ARRIS TG1682P admin portal. VictoriaMetrics stores counters, gauges and RTT
 histograms. The existing Vector → VictoriaLogs path stores raw probe outcomes,
-gateway snapshots and retrieval brackets. It changes no gateway settings or
+gateway snapshots and retrieval brackets. It also runs scheduled and requested
+download/upload speed tests against Cloudflare. It changes no gateway settings or
 recovery automations.
 
 ## Timing and what can be concluded
@@ -69,6 +70,70 @@ gateway reads. Steady later RF values cannot clear the RF path during a burst.
 The portal cannot uniquely separate modem electronics, coax/drop/tap, shared
 plant or gateway forwarding. It exposes no CPU utilization, forwarding-drop
 counters or connection-table occupancy.
+
+## Speed tests
+
+Pings show delay and loss on a nearly idle line. Only filling the line shows
+how much it carries, so the app runs speed tests: every 30 minutes by default,
+at 7 and 37 minutes past the hour, and on request. `speedtest_interval_minutes`
+accepts 0, 15, 30 or 60; 0 runs tests only on request. One test runs at a time.
+
+The test uses Cloudflare's speed-test servers (`speed.cloudflare.com`) and the
+method of its published engine, `@cloudflare/speedtest` 1.15.0 (MIT). That
+package cannot run in Node unchanged: it reads `window.location`, takes timings
+from browser resource-timing entries and holds each download body in memory.
+The app keeps its sequence and arithmetic and times requests with Node's own
+clock instead:
+
+- Idle latency: the median of 21 empty requests on a warm connection, minus the
+  server time reported in `Server-Timing`. Jitter is the mean change between
+  consecutive values.
+- Bandwidth: sets of 100 kB, 1 MB, 10 MB and 25 MB requests in each direction.
+  A direction stops growing once every request in a set takes over a second.
+  Download time is ping plus body; upload time is request start to response
+  headers. The result is the 90th percentile of request speeds.
+- Loaded latency: empty requests on a second connection every 400 ms during each
+  set, kept only from sets whose fastest request lasted at least 250 ms.
+
+Cloudflare's own sequence continues to 100 and 250 MB downloads above about 200
+Mbps. On 2026-10-31 the endpoint answered 403 to a 100 MB request, so the app
+stops at 25 MB. Faster lines are measured with shorter requests.
+
+Each test runs in a child process, so transfers and garbage collection cannot
+delay the one-second probes, and is killed after 150 seconds. Download bodies
+are discarded as they arrive and uploads repeat one 64 KiB buffer.
+
+What a result covers: the gateway, cable line and Comcast's network as far as
+Cloudflare's nearest site, recorded as `colo` (the `CF-RAY` suffix). Wi-Fi is
+not in the path. To compare a device, use speed.cloudflare.com on it.
+Speedtest.net uses other servers and another method, so its numbers are not
+directly comparable. The app does not send results to Cloudflare's results
+endpoint; Cloudflare still sees the requests.
+
+Cost: a test fills the line for roughly half a minute. At 100 Mbps down and
+20 Mbps up it moves about 170 MB down and 50 MB up. While it runs,
+`xb3_speedtest_running` is 1 and this app's probes see the test's own load.
+Delay or loss inside those windows is not evidence of a line fault.
+
+Request a test through Supervisor stdin, which needs no new listener:
+
+```json
+{ "command": "speed_test", "id": "phone-button" }
+```
+
+From Home Assistant, call the Supervisor stdin service with app
+`894a6dc5_xb3-telemetry` and that object as input. A request while a test runs
+is rejected and logged as `xb3_speedtest_rejected`. A scheduled slot that finds
+a test running is skipped and logged.
+
+| Data               | Where                                                                                                                                                      |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Latest result      | `xb3_speedtest_download_bits_per_second`, `_upload_bits_per_second`, `_idle_latency_seconds`, `_idle_jitter_seconds`, `_loaded_latency_seconds{direction}` |
+| Which test         | `xb3_speedtest_last_success_timestamp_seconds`, `xb3_speedtest_result_sequence`; the gauges hold the latest success until the next one                     |
+| Test windows       | `xb3_speedtest_running`, `_last_started_timestamp_seconds`, `_last_finished_timestamp_seconds`                                                             |
+| Outcomes           | `xb3_speedtest_runs_total{trigger,outcome}` with outcome `success`, `failed` or `timeout`; `xb3_speedtest_skipped_slots`                                   |
+| Every test in logs | `xb3_speedtest_started`, `xb3_speedtest_result` (all values and every request's speed and duration), `xb3_speedtest_failed` with a reason                  |
+| Summary for HA     | Read-only `GET /speedtest` on port 19090: running state and the latest result in Mbit/s and ms                                                             |
 
 ## Connect the existing storage
 
@@ -166,7 +231,7 @@ drops with placeholder endpoints do not explain the existing IPv4 probe loss.
 
 ## Finite pipeline verification
 
-Authenticated Supervisor stdin accepts one command per process startup:
+Authenticated Supervisor stdin accepts this command once per process startup:
 
 ```json
 { "command": "verify_correlation", "id": "operator-chosen-run" }
@@ -207,9 +272,12 @@ Use Node 22.22.2 or newer. From `rootfs/opt/xb3-telemetry`, run `npm ci
 --ignore-scripts`, `npm test` and `npm run build`. The Docker build also checks
 types and tests. `XB3_PASSWORD` supplies the secret for local runs. `--once`
 prints one portal collection and `--logs-once` retrieves the configured log
-categories; neither starts continuous probes. Normal service mode does.
+categories; neither starts continuous probes. Normal service mode does. After
+`npm run build`, `node dist/speed-child.js` runs one speed test and prints its
+JSON result; it needs no gateway password.
 
-`XB3_NETWORK_INTERVAL_SECONDS` accepts 20 or 60. Existing URL, username, log mode,
+`XB3_NETWORK_INTERVAL_SECONDS` accepts 20 or 60.
+`XB3_SPEEDTEST_INTERVAL_MINUTES` accepts 0, 15, 30 or 60. Existing URL, username, log mode,
 log interval, listen host/port and options-file environment overrides remain.
 Fixtures preserve sanitized complete and partial TG1682P interface structures.
 This implementation targets that observed PHP interface, not every XB3 model.
@@ -219,3 +287,4 @@ Sources: [HA extra scrape files](https://github.com/VictoriaMetrics-Community/ho
 [hardware mappings](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/hardware.php),
 [log handler](https://github.com/rdkcentral/webui/blob/dd9ad14f97bec8dc94fc45045c9b86d3e0869b38/source/Styles/xb3/code/actionHandler/ajax_troubleshooting_logs.php).
 Published upstream code does not establish the deployed firmware's exact binaries.
+Speed method: [`@cloudflare/speedtest`](https://github.com/cloudflare/speedtest).
