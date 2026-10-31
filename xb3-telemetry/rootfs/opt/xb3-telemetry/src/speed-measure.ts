@@ -1,108 +1,102 @@
 /**
- * Cloudflare's speed-test method (the engine behind speed.cloudflare.com,
- * @cloudflare/speedtest 1.15.0), re-implemented with Node's own clock.
+ * Line speed, measured by keeping the line full for a fixed time.
  *
- * The published package cannot run here unchanged: it reads `window.location`,
- * takes request timings from the browser's PerformanceResourceTiming entries,
- * and buffers every download body as a string. This module keeps its
- * measurement sequence, ramp-up stop rule, server-time subtraction and
- * percentile reductions, and receives timings from an injected transport.
+ * Each direction runs for `durationMs` over `connections` parallel connections
+ * to Cloudflare's speed-test endpoints. Bytes are put into `binMs` buckets by
+ * the time they moved: downloads by when they arrived, uploads spread evenly
+ * over each chunk's transfer once Cloudflare has confirmed it. The first
+ * `warmupMs` is dropped while the connections speed up. Every remaining bucket
+ * is one reading of the line's speed at that moment, and the app computes all
+ * of its own numbers from those readings.
  */
 
 export type Direction = "down" | "up";
-export type Phase = "idle" | "download" | "upload";
 
-export interface RequestTiming {
-  /** Request start to final response headers, in milliseconds. */
-  ttfbMs: number;
-  /** Final response headers to the last body byte, in milliseconds. */
-  payloadMs: number;
-  /** Body bytes received (download) or sent (upload). */
-  bytes: number;
-  /** Server processing time reported by Server-Timing, in milliseconds. */
+export interface MethodSettings {
+  /** How long each direction keeps the line full. */
+  durationMs: number;
+  /** Readings before this are dropped while connections speed up. */
+  warmupMs: number;
+  /** Width of one reading. */
+  binMs: number;
+  /** Parallel connections per direction. */
+  connections: number;
+  /** Size of each download request; downloads are cut off at the deadline. */
+  downloadRequestBytes: number;
+  /**
+   * An upload chunk counts only once Cloudflare confirms it, and its bytes are
+   * spread over its whole transfer, so a chunk longer than a dip averages the
+   * dip away. Each chunk is sized from the previous one's speed to take about
+   * this long, between the minimum and maximum sizes.
+   */
+  uploadChunkTargetMs: number;
+  uploadFirstChunkBytes: number;
+  uploadMinChunkBytes: number;
+  uploadMaxChunkBytes: number;
+  /** How long confirmed upload chunks may run past the deadline. */
+  uploadGraceMs: number;
+  /** Pause between the download and upload halves. */
+  gapMs: number;
+}
+
+export const METHOD: MethodSettings = {
+  durationMs: 10_000,
+  warmupMs: 2_000,
+  binMs: 250,
+  connections: 2,
+  downloadRequestBytes: 25_000_000,
+  uploadChunkTargetMs: 500,
+  uploadFirstChunkBytes: 262_144,
+  uploadMinChunkBytes: 65_536,
+  uploadMaxChunkBytes: 4_194_304,
+  uploadGraceMs: 15_000,
+  gapMs: 500,
+};
+
+/** Timing of one confirmed upload chunk, on the transport's clock. */
+export interface UploadTiming {
+  /** The connection was ready and the first byte was written. */
+  startMs: number;
+  /** Cloudflare's response headers arrived. */
+  endMs: number;
+  /** Server processing time from Server-Timing, if reported. */
   serverMs: number | undefined;
 }
 
-export interface SpeedTransport {
-  request(
-    dir: Direction,
+export interface StreamTransport {
+  now(): number;
+  /** Resolves when the body ends; `onBytes` sees every piece as it arrives. */
+  download(
     bytes: number,
-    during: Phase,
-    signal?: AbortSignal,
-  ): Promise<RequestTiming>;
+    onBytes: (count: number, atMs: number) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
+  /** Resolves once Cloudflare has received the whole chunk and answered. */
+  upload(bytes: number, signal: AbortSignal): Promise<UploadTiming>;
 }
 
-export type Step =
-  | { type: "latency"; count: number }
-  | {
-      type: Direction;
-      bytes: number;
-      count: number;
-      bypassMinDuration?: boolean;
-    };
-
-/**
- * Cloudflare's default sequence, capped at 25 MB per request. Its larger sets
- * (100 and 250 MB down, 50 MB up) run only when every 25 MB request finishes
- * within a second, which needs about 200 Mbps. On 2026-10-31 the download
- * endpoint answered 403 to a 100 MB request from a fast test host, so those
- * sets would fail rather than measure.
- */
-export const CLOUDFLARE_STEPS: readonly Step[] = [
-  { type: "latency", count: 1 },
-  { type: "down", bytes: 1e5, count: 1, bypassMinDuration: true },
-  { type: "latency", count: 20 },
-  { type: "down", bytes: 1e5, count: 9 },
-  { type: "down", bytes: 1e6, count: 8 },
-  { type: "up", bytes: 1e5, count: 8 },
-  { type: "up", bytes: 1e6, count: 6 },
-  { type: "down", bytes: 1e7, count: 6 },
-  { type: "up", bytes: 1e7, count: 4 },
-  { type: "down", bytes: 2.5e7, count: 4 },
-  { type: "up", bytes: 2.5e7, count: 4 },
-];
-
-export interface SpeedSettings {
-  /** A direction stops ramping once a whole set's fastest request takes longer. */
-  finishRequestMs: number;
-  /** Shorter requests are too noisy to use for bandwidth. */
-  minRequestMs: number;
-  /** Side latency counts only from sets whose fastest request lasted this long. */
-  loadedRequestMinMs: number;
-  loadedThrottleMs: number;
-  loadedMaxPoints: number;
-  bandwidthPercentile: number;
-  latencyPercentile: number;
+/** A refusal from the server, with how long it asked us to wait. */
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly retryAfterSeconds: number | null = null,
+  ) {
+    super(`http_${status}`);
+  }
 }
 
-export const CLOUDFLARE_SETTINGS: SpeedSettings = {
-  finishRequestMs: 1000,
-  minRequestMs: 10,
-  loadedRequestMinMs: 250,
-  loadedThrottleMs: 400,
-  loadedMaxPoints: 20,
-  bandwidthPercentile: 0.9,
-  latencyPercentile: 0.5,
-};
-
-export interface BandwidthPoint {
-  dir: Direction;
-  bytes: number;
-  bps: number;
-  durationMs: number;
-}
-
-export interface SpeedResult {
-  downloadBps: number | null;
-  uploadBps: number | null;
-  idleLatencyMs: number | null;
-  idleJitterMs: number | null;
-  downloadLoadedLatencyMs: number | null;
-  uploadLoadedLatencyMs: number | null;
-  downloadBytes: number;
-  uploadBytes: number;
-  points: BandwidthPoint[];
-  idleLatencyPoints: number[];
+/** Retry-After as delay seconds or an HTTP date. */
+export function parseRetryAfter(
+  header: string | undefined,
+  nowMs: number,
+): number | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  const at = Date.parse(trimmed);
+  return Number.isFinite(at)
+    ? Math.max(0, Math.ceil((at - nowMs) / 1000))
+    : null;
 }
 
 /** Same reading of Server-Timing as Cloudflare's engine. */
@@ -122,7 +116,7 @@ export function parseServerTime(
   return sum > 0.01 ? sum : undefined;
 }
 
-/** Linear interpolation between ranks, as in Cloudflare's engine. */
+/** Linear interpolation between ranks. */
 export function percentile(
   values: readonly number[],
   p: number,
@@ -135,39 +129,201 @@ export function percentile(
   return low + (high - low) * (index % 1);
 }
 
-/** Mean absolute difference between consecutive latencies. */
-export function jitter(values: readonly number[]): number | null {
-  if (values.length < 2) return null;
-  let sum = 0;
-  for (let i = 1; i < values.length; i++)
-    sum += Math.abs(values[i]! - values[i - 1]!);
-  return sum / (values.length - 1);
+export interface DirectionResult {
+  /** One reading per bin after the warm-up, in bits per second. */
+  readingsBps: number[];
+  /** Median reading: the speed the line held. */
+  sustainedBps: number | null;
+  /** 10th percentile: the slowest moments. */
+  worstBps: number | null;
+  /** 90th percentile: the fastest moments. */
+  bestBps: number | null;
+  /** Bytes moved, warm-up included. */
+  bytes: number;
+  requests: number;
 }
 
-/** Round-trip time with the server's own processing time taken out. */
-export function pingOf(timing: RequestTiming): number {
-  return Math.max(0, timing.ttfbMs - (timing.serverMs ?? 0));
+export interface SpeedResult {
+  download: DirectionResult;
+  upload: DirectionResult;
+  method: Pick<
+    MethodSettings,
+    "durationMs" | "warmupMs" | "binMs" | "connections"
+  >;
 }
 
-export function pointOf(
-  dir: Direction,
+export function summarize(
+  readingsBps: number[],
   bytes: number,
-  timing: RequestTiming,
-): BandwidthPoint {
-  // Download: ping plus body transfer. Upload: request start to response
-  // headers, with Cloudflare's 0.5% allowance for request overhead.
-  const durationMs =
-    dir === "down" ? pingOf(timing) + timing.payloadMs : timing.ttfbMs;
-  const bits = dir === "down" ? 8 * timing.bytes : 8 * bytes * 1.005;
+  requests: number,
+): DirectionResult {
   return {
-    dir,
+    readingsBps,
+    sustainedBps: percentile(readingsBps, 0.5),
+    worstBps: percentile(readingsBps, 0.1),
+    bestBps: percentile(readingsBps, 0.9),
     bytes,
-    bps: durationMs > 0 ? bits / (durationMs / 1000) : 0,
-    durationMs,
+    requests,
   };
 }
 
-const sleep = (ms: number, signal?: AbortSignal) =>
+/** Bins whose whole span lies in [warmup, coveredUntil] become readings. */
+export function readingsFrom(
+  binBytes: readonly number[],
+  settings: MethodSettings,
+  coveredUntilMs = settings.durationMs,
+): number[] {
+  const first = Math.ceil(settings.warmupMs / settings.binMs);
+  const last = Math.floor(
+    Math.min(coveredUntilMs, settings.durationMs) / settings.binMs,
+  );
+  const readings: number[] = [];
+  for (let i = first; i < last; i++)
+    readings.push(((binBytes[i] ?? 0) * 8) / (settings.binMs / 1000));
+  return readings;
+}
+
+/** Add `bytes` spread evenly over [fromMs, toMs) into the bins. */
+export function spread(
+  binBytes: number[],
+  bytes: number,
+  fromMs: number,
+  toMs: number,
+  binMs: number,
+): void {
+  if (toMs <= fromMs) {
+    const i = Math.max(0, Math.floor(fromMs / binMs));
+    binBytes[i] = (binBytes[i] ?? 0) + bytes;
+    return;
+  }
+  const rate = bytes / (toMs - fromMs);
+  for (let i = Math.max(0, Math.floor(fromMs / binMs)); i * binMs < toMs; i++) {
+    const overlap =
+      Math.min(toMs, (i + 1) * binMs) - Math.max(fromMs, i * binMs);
+    if (overlap > 0) binBytes[i] = (binBytes[i] ?? 0) + rate * overlap;
+  }
+}
+
+/**
+ * Size the next upload chunk to take about the target time at the last speed,
+ * as a whole number of minimum-size chunks within the limits.
+ */
+export function nextChunkBytes(
+  lastBytes: number,
+  lastMs: number,
+  settings: MethodSettings,
+): number {
+  if (lastMs <= 0) return settings.uploadMaxChunkBytes;
+  const step = settings.uploadMinChunkBytes;
+  const wanted = (lastBytes / lastMs) * settings.uploadChunkTargetMs;
+  return Math.min(
+    settings.uploadMaxChunkBytes,
+    Math.max(step, Math.round(wanted / step) * step),
+  );
+}
+
+const isAbort = (error: unknown) =>
+  error instanceof Error &&
+  (error.name === "AbortError" || error.message === "aborted");
+
+async function downloadHalf(
+  transport: StreamTransport,
+  settings: MethodSettings,
+  signal: AbortSignal | undefined,
+): Promise<DirectionResult> {
+  const binBytes: number[] = [];
+  const t0 = transport.now();
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), settings.durationMs);
+  const stop = signal
+    ? AbortSignal.any([signal, deadline.signal])
+    : deadline.signal;
+  let bytes = 0;
+  let requests = 0;
+  const loop = async () => {
+    while (!stop.aborted) {
+      requests++;
+      try {
+        await transport.download(
+          settings.downloadRequestBytes,
+          (count, atMs) => {
+            const offset = atMs - t0;
+            bytes += count;
+            if (offset < settings.durationMs) {
+              const i = Math.floor(offset / settings.binMs);
+              binBytes[i] = (binBytes[i] ?? 0) + count;
+            }
+          },
+          stop,
+        );
+      } catch (error) {
+        if (deadline.signal.aborted && !signal?.aborted && isAbort(error))
+          return;
+        throw error;
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: settings.connections }, loop));
+  } finally {
+    clearTimeout(timer);
+    deadline.abort();
+  }
+  signal?.throwIfAborted();
+  return summarize(readingsFrom(binBytes, settings), bytes, requests);
+}
+
+async function uploadHalf(
+  transport: StreamTransport,
+  settings: MethodSettings,
+  signal: AbortSignal | undefined,
+): Promise<DirectionResult> {
+  const binBytes: number[] = [];
+  const t0 = transport.now();
+  const grace = new AbortController();
+  const timer = setTimeout(
+    () => grace.abort(),
+    settings.durationMs + settings.uploadGraceMs,
+  );
+  const stop = signal ? AbortSignal.any([signal, grace.signal]) : grace.signal;
+  const coveredUntil = Array.from({ length: settings.connections }, () => 0);
+  let bytes = 0;
+  let requests = 0;
+  const loop = async (_: unknown, connection: number) => {
+    let chunk = settings.uploadFirstChunkBytes;
+    while (transport.now() - t0 < settings.durationMs && !stop.aborted) {
+      requests++;
+      try {
+        const timing = await transport.upload(chunk, stop);
+        const from = timing.startMs - t0;
+        const to = Math.max(from, timing.endMs - (timing.serverMs ?? 0) - t0);
+        spread(binBytes, chunk, from, to, settings.binMs);
+        bytes += chunk;
+        coveredUntil[connection] = to;
+        chunk = nextChunkBytes(chunk, to - from, settings);
+      } catch (error) {
+        // A chunk cut off by the grace limit is unconfirmed: its span is left
+        // out rather than guessed.
+        if (grace.signal.aborted && !signal?.aborted && isAbort(error)) return;
+        throw error;
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: settings.connections }, loop));
+  } finally {
+    clearTimeout(timer);
+    grace.abort();
+  }
+  signal?.throwIfAborted();
+  return summarize(
+    readingsFrom(binBytes, settings, Math.min(...coveredUntil)),
+    bytes,
+    requests,
+  );
+}
+
+const pause = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
     const timer = setTimeout(resolve, ms);
@@ -182,90 +338,21 @@ const sleep = (ms: number, signal?: AbortSignal) =>
   });
 
 export async function measure(
-  transport: SpeedTransport,
-  steps: readonly Step[] = CLOUDFLARE_STEPS,
-  settings: SpeedSettings = CLOUDFLARE_SETTINGS,
+  transport: StreamTransport,
+  settings: MethodSettings = METHOD,
   signal?: AbortSignal,
 ): Promise<SpeedResult> {
-  const finished: Record<Direction, boolean> = { down: false, up: false };
-  const points: BandwidthPoint[] = [];
-  const idleLatencyPoints: number[] = [];
-  const loaded: Record<Direction, number[]> = { down: [], up: [] };
-  const transferred: Record<Direction, number> = { down: 0, up: 0 };
-
-  for (const step of steps) {
-    signal?.throwIfAborted();
-    if (step.type === "latency") {
-      for (let i = 0; i < step.count; i++)
-        idleLatencyPoints.push(
-          pingOf(await transport.request("down", 0, "idle", signal)),
-        );
-      continue;
-    }
-    const dir = step.type;
-    if (finished[dir]) continue;
-
-    // Loaded latency runs on its own connection while the set transfers.
-    const side: number[] = [];
-    const setDone = new AbortController();
-    const sideSignal = signal
-      ? AbortSignal.any([signal, setDone.signal])
-      : setDone.signal;
-    const sideLoop = (async () => {
-      const phase: Phase = dir === "down" ? "download" : "upload";
-      while (!sideSignal.aborted) {
-        side.push(
-          pingOf(await transport.request("down", 0, phase, sideSignal)),
-        );
-        await sleep(settings.loadedThrottleMs, sideSignal);
-      }
-    })().catch(() => undefined);
-
-    const durations: number[] = [];
-    try {
-      for (let i = 0; i < step.count; i++) {
-        const timing = await transport.request(
-          dir,
-          step.bytes,
-          dir === "down" ? "download" : "upload",
-          signal,
-        );
-        transferred[dir] += timing.bytes;
-        const point = pointOf(dir, step.bytes, timing);
-        durations.push(point.durationMs);
-        if (point.bps > 0 && point.durationMs >= settings.minRequestMs)
-          points.push(point);
-      }
-    } finally {
-      setDone.abort();
-      await sideLoop;
-    }
-    const fastest = Math.min(...durations);
-    if (fastest >= settings.loadedRequestMinMs) loaded[dir].push(...side);
-    if (!step.bypassMinDuration && fastest > settings.finishRequestMs)
-      finished[dir] = true;
-  }
-
-  const bandwidth = (dir: Direction) =>
-    percentile(
-      points.filter((p) => p.dir === dir).map((p) => p.bps),
-      settings.bandwidthPercentile,
-    );
-  const loadedLatency = (dir: Direction) =>
-    percentile(
-      loaded[dir].slice(-settings.loadedMaxPoints),
-      settings.latencyPercentile,
-    );
+  const download = await downloadHalf(transport, settings, signal);
+  await pause(settings.gapMs, signal);
+  const upload = await uploadHalf(transport, settings, signal);
   return {
-    downloadBps: bandwidth("down"),
-    uploadBps: bandwidth("up"),
-    idleLatencyMs: percentile(idleLatencyPoints, settings.latencyPercentile),
-    idleJitterMs: jitter(idleLatencyPoints),
-    downloadLoadedLatencyMs: loadedLatency("down"),
-    uploadLoadedLatencyMs: loadedLatency("up"),
-    downloadBytes: transferred.down,
-    uploadBytes: transferred.up,
-    points,
-    idleLatencyPoints,
+    download,
+    upload,
+    method: {
+      durationMs: settings.durationMs,
+      warmupMs: settings.warmupMs,
+      binMs: settings.binMs,
+      connections: settings.connections,
+    },
   };
 }
