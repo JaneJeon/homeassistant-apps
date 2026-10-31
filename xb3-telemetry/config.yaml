@@ -1,7 +1,7 @@
 name: XB3 Telemetry
-version: 0.2.2
+version: 0.3.0
 slug: xb3-telemetry
-description: Read-only XB3 modem metrics for Prometheus and gateway log snapshots
+description: Read-only XB3 modem metrics, internet probes and speed tests for Prometheus
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/xb3-telemetry
 arch:
   - aarch64
@@ -20,6 +20,7 @@ options:
   log_mode: firewall
   log_interval_seconds: 900
   network_interval_seconds: "20"
+  speedtest_interval_minutes: "30"
 schema:
   gateway_url: str
   gateway_username: str
@@ -27,4 +28,5 @@ schema:
   log_mode: list(off|firewall|all)
   log_interval_seconds: int(60,86400)
   network_interval_seconds: list(20|60)
+  speedtest_interval_minutes: list(0|15|30|60)
 image: ghcr.io/janejeon/xb3-telemetry

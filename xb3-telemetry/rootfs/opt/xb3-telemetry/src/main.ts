@@ -17,6 +17,9 @@ import {
   renderProbeMetrics,
   validationDriver,
 } from "./probes.js";
+import { SpeedRunner } from "./speed-runner.js";
+
+const VERSION = "0.3.0";
 
 function emptyCollection(): Collection {
   const page = <T>(): PageResult<T> => ({
@@ -110,6 +113,10 @@ async function main(): Promise<void> {
     write,
     onObservation: (collection) => metrics.observe(collection),
   });
+  const speed = new SpeedRunner({
+    intervalMinutes: options.speedtestIntervalMinutes,
+    write,
+  });
   const gauge = (name: string, help: string, value: number) =>
     `# HELP ${name} ${help}\n# TYPE ${name} gauge\n${name} ${value}\n`;
   const server = createServer((request, response) => {
@@ -119,6 +126,16 @@ async function main(): Promise<void> {
     }
     if (request.url === "/healthz") {
       response.writeHead(200, { "Content-Type": "text/plain" }).end("ok\n");
+      return;
+    }
+    // Read-only latest speed result; tests start only through Supervisor stdin.
+    if (request.url === "/speedtest") {
+      response
+        .writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        })
+        .end(JSON.stringify(speed.snapshot()) + "\n");
       return;
     }
     if (request.url !== "/metrics") {
@@ -207,6 +224,7 @@ async function main(): Promise<void> {
         "Live probe scheduler is running.",
         Number(probes.isRunning),
       );
+      output += speed.render();
       output += `# HELP xb3_log_records_dropped_total Records dropped locally because stdout buffering exceeded its limit.\n# TYPE xb3_log_records_dropped_total counter\nxb3_log_records_dropped_total ${droppedLogRecords}\n`;
       response.writeHead(200, {
         "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
@@ -225,7 +243,8 @@ async function main(): Promise<void> {
   });
   write({
     event: "xb3_exporter_started",
-    version: "0.2.2",
+    version: VERSION,
+    speedtest_interval_minutes: options.speedtestIntervalMinutes,
     port: options.port,
     log_mode: options.logMode,
     network_interval_seconds: options.networkIntervalSeconds,
@@ -255,8 +274,12 @@ async function main(): Promise<void> {
     void logs
       .loop([...kinds], options.logIntervalSeconds, 150_000, stop.signal)
       .catch(() => write({ event: "xb3_log_worker_failed" }));
+  void speed
+    .run(stop.signal)
+    .catch(() => write({ event: "xb3_speedtest_worker_failed" }));
 
-  // Supervisor-authenticated stdin only: one finite, isolated synthetic test.
+  // Supervisor-authenticated stdin only: one finite, isolated synthetic test,
+  // and on-request speed tests (one at a time).
   let input = "";
   let discarding = false;
   process.stdin.setEncoding("utf8");
@@ -284,11 +307,15 @@ async function main(): Promise<void> {
         if (
           !command ||
           Object.keys(command).sort().join(",") !== "command,id" ||
-          command.command !== "verify_correlation" ||
+          !["verify_correlation", "speed_test"].includes(command.command) ||
           typeof command.id !== "string" ||
           !/^[A-Za-z0-9_-]{1,64}$/.test(command.id)
         )
           throw new Error();
+        if (command.command === "speed_test") {
+          speed.trigger("manual", command.id);
+          continue;
+        }
         if (validationRequested) {
           write({
             event: "xb3_validation_rejected",
