@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { SpeedResult } from "../src/speed-measure.js";
 import {
+  isChildOutcome,
   SpeedRunner,
   type ChildOutcome,
   type SpeedRunnerClock,
@@ -153,6 +154,52 @@ describe("SpeedRunner", () => {
     assert.equal(records.at(-1)!.reason, "no_usable_bandwidth");
     assert.equal(speed.last, null);
     assert.doesNotMatch(speed.render(), /download_bits_per_second/);
+  });
+
+  it("never stays stuck as running after an unexpected error", async () => {
+    let broken = true;
+    const { speed, records } = runner(async () =>
+      broken
+        ? ({
+            ok: true,
+            colo: null,
+            result: { ...result, points: undefined },
+          } as unknown as ChildOutcome)
+        : { ok: true, colo: null, result },
+    );
+    speed.trigger("schedule");
+    await speed.settled();
+    assert.equal(speed.running, false);
+    assert.equal(records.at(-1)!.event, "xb3_speedtest_failed");
+    assert.equal(records.at(-1)!.reason, "runner_failed");
+    broken = false;
+    assert.equal(speed.trigger("manual", "after"), "started");
+    await speed.settled();
+    assert.equal(records.at(-1)!.event, "xb3_speedtest_result");
+  });
+
+  it("accepts child output only in the shape it reads", () => {
+    assert.equal(isChildOutcome({ ok: true, colo: "SJC", result }), true);
+    assert.equal(isChildOutcome({ ok: false, colo: null, reason: "x" }), true);
+    assert.equal(isChildOutcome({ ok: true, colo: null }), false);
+    assert.equal(
+      isChildOutcome({
+        ok: true,
+        colo: null,
+        result: { ...result, points: 1 },
+      }),
+      false,
+    );
+    assert.equal(
+      isChildOutcome({
+        ok: true,
+        colo: null,
+        result: { ...result, downloadBps: "fast" },
+      }),
+      false,
+    );
+    assert.equal(isChildOutcome({ ok: false, colo: 3, reason: "x" }), false);
+    assert.equal(isChildOutcome(null), false);
   });
 
   it("kills a test that runs too long", async () => {

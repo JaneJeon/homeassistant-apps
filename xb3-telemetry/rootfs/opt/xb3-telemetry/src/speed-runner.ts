@@ -35,6 +35,33 @@ export interface LastSpeedResult {
 
 const CHILD = fileURLToPath(new URL("./speed-child.js", import.meta.url));
 
+const nullableNumber = (value: unknown) =>
+  value === null || (typeof value === "number" && Number.isFinite(value));
+
+/** The child's line is trusted only in the shape the runner reads. */
+export function isChildOutcome(value: unknown): value is ChildOutcome {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (v.colo !== null && typeof v.colo !== "string") return false;
+  if (v.ok === false) return typeof v.reason === "string";
+  if (v.ok !== true || !v.result || typeof v.result !== "object") return false;
+  const r = v.result as Record<string, unknown>;
+  return (
+    [
+      r.downloadBps,
+      r.uploadBps,
+      r.idleLatencyMs,
+      r.idleJitterMs,
+      r.downloadLoadedLatencyMs,
+      r.uploadLoadedLatencyMs,
+    ].every(nullableNumber) &&
+    typeof r.downloadBytes === "number" &&
+    typeof r.uploadBytes === "number" &&
+    Array.isArray(r.points) &&
+    Array.isArray(r.idleLatencyPoints)
+  );
+}
+
 /** Run speed-child.js and parse its single JSON line. */
 export const runChildProcess: RunChild = (signal) =>
   new Promise((resolve) => {
@@ -58,7 +85,7 @@ export const runChildProcess: RunChild = (signal) =>
       const line = output.trim().split("\n").at(-1) ?? "";
       try {
         const parsed = JSON.parse(line) as ChildOutcome;
-        if (typeof parsed?.ok === "boolean") return resolve(parsed);
+        if (isChildOutcome(parsed)) return resolve(parsed);
       } catch {
         // fall through
       }
@@ -157,13 +184,39 @@ export class SpeedRunner {
         continue;
       }
       this.trigger("schedule");
-      await this.settled();
+      await this.settled().catch(() => undefined);
     }
   }
 
+  /** Whatever happens inside a run, the next one is never blocked by it. */
   private async execute(trigger: Trigger, id?: string): Promise<void> {
     const sequence = ++this.sequence;
     this.running = true;
+    try {
+      await this.executeRun(sequence, trigger, id);
+    } catch {
+      this.count(trigger, "failed");
+      this.lastFinishedSeconds = this.clock.wallMs() / 1000;
+      try {
+        this.options.write({
+          event: "xb3_speedtest_failed",
+          sequence,
+          trigger,
+          reason: "runner_failed",
+        });
+      } catch {
+        // Logging is best-effort here; clearing `running` below is not.
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async executeRun(
+    sequence: number,
+    trigger: Trigger,
+    id?: string,
+  ): Promise<void> {
     this.startedSeconds = this.clock.wallMs() / 1000;
     const startedAt = new Date(this.startedSeconds * 1000).toISOString();
     const common = {
@@ -235,7 +288,6 @@ export class SpeedRunner {
       this.options.write({ event: "xb3_speedtest_failed", ...base, reason });
     }
     this.lastFinishedSeconds = finishedSeconds;
-    this.running = false;
   }
 
   private count(trigger: Trigger, outcome: string): void {
