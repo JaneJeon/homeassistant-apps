@@ -1,0 +1,5 @@
+# The Paperless-ngx version this app's end-to-end tests passed on.
+# The app refuses to commit to any other version. Renovate bumps the line
+# below when Paperless releases, and CI reruns the tests on that version.
+# renovate: datasource=docker depName=ghcr.io/paperless-ngx/paperless-ngx
+3.3.4

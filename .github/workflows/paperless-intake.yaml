@@ -1,0 +1,56 @@
+name: Paperless Intake tests
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "paperless-intake/**"
+      - ".github/workflows/paperless-intake.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "paperless-intake/**"
+      - ".github/workflows/paperless-intake.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Unit and end-to-end tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: paperless-intake
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the font and pinned dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+          python -m pip install --require-hashes --no-deps -r rootfs/requirements.txt
+
+      - name: Unit tests
+        working-directory: paperless-intake/tests
+        env:
+          PYTHONPATH: ../rootfs/app:.
+        run: python -m unittest -v test_google_backend test_page_order test_checks_and_web test_pipeline test_worker
+
+      - name: End-to-end tests against stock Paperless at the tested version
+        working-directory: paperless-intake/tests
+        env:
+          PYTHONPATH: ../rootfs/app:.
+          INTAKE_E2E: "1"
+        run: |
+          echo "Paperless version under test: $(grep -v '^#' ../rootfs/app/tested-paperless-version)"
+          python -m unittest -v test_e2e_paperless

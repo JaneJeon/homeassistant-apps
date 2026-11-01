@@ -1,0 +1,45 @@
+name: Paperless Intake
+version: "1.0.0"
+slug: paperless-intake
+description: Checks scans with Google OCR before committing them into Paperless-ngx
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/paperless-intake
+arch:
+  - aarch64
+  - amd64
+init: false
+ingress: true
+panel_icon: mdi:mailbox-open-up
+panel_title: Mail intake
+map:
+  - share:rw
+options:
+  paperless_url: http://ca5234a0-paperless-ngx:80
+  paperless_token: "-"
+  google_service_account: "-"
+  processor_version: projects/paperlss-document-pipeline/locations/us/processors/484e7be4b20b5629/processorVersions/pretrained-ocr-v2.1-2024-08-07
+  physical_mail_tag: Physical Mail
+  intake_tag: Mail intake
+  ha_url: http://homeassistant:8123
+  webhook_started: 3b9d98f8-989d-4d0e-93f6-b9ad7aa683c1
+  webhook_finished: f2de5a2c-7360-4387-9698-88ab679fcd74
+  webhook_alert: bbd89851-5a89-4848-bba2-7a5e4d70925e
+  daily_page_cap: 200
+  min_free_mib: 1024
+  keep_local_copies_days: 7
+  watchdog_minutes: 45
+schema:
+  paperless_url: url
+  paperless_token: password
+  google_service_account: password
+  processor_version: str
+  physical_mail_tag: str
+  intake_tag: str
+  ha_url: url
+  webhook_started: str?
+  webhook_finished: str?
+  webhook_alert: str?
+  daily_page_cap: int(1,)
+  min_free_mib: int(0,)
+  keep_local_copies_days: int(1,)
+  watchdog_minutes: int(1,)
+image: ghcr.io/janejeon/paperless-intake
