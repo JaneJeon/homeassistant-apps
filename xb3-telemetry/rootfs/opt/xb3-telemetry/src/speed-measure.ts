@@ -53,14 +53,17 @@ export const METHOD: MethodSettings = {
   gapMs: 500,
 };
 
-/** Timing of one confirmed upload chunk, on the transport's clock. */
+/**
+ * Timing of one confirmed upload chunk, on the transport's clock. Server time
+ * is deliberately not taken off: Cloudflare's upload Server-Timing counts the
+ * time spent receiving the body, so subtracting it erases the transfer itself
+ * (0.4.0 did, and read uploads as instant bursts).
+ */
 export interface UploadTiming {
   /** The connection was ready and the first byte was written. */
   startMs: number;
   /** Cloudflare's response headers arrived. */
   endMs: number;
-  /** Server processing time from Server-Timing, if reported. */
-  serverMs: number | undefined;
 }
 
 export interface StreamTransport {
@@ -97,23 +100,6 @@ export function parseRetryAfter(
   return Number.isFinite(at)
     ? Math.max(0, Math.ceil((at - nowMs) / 1000))
     : null;
-}
-
-/** Same reading of Server-Timing as Cloudflare's engine. */
-export function parseServerTime(
-  header: string | undefined,
-): number | undefined {
-  if (!header) return undefined;
-  const single = header.match(
-    /(?:^|,\s*)cfReq(?:uest)?Dur(?:ation)?;\s*dur=([0-9.]+)/i,
-  );
-  if (single && Number(single[1]) > 0.01) return Number(single[1]);
-  let sum = 0;
-  for (const match of header.matchAll(
-    /(?:^|,\s*)cfSpeed[a-zA-Z]*;\s*dur=([0-9.]+)/gi,
-  ))
-    sum += Number(match[1]);
-  return sum > 0.01 ? sum : undefined;
 }
 
 /** Linear interpolation between ranks. */
@@ -296,7 +282,7 @@ async function uploadHalf(
       try {
         const timing = await transport.upload(chunk, stop);
         const from = timing.startMs - t0;
-        const to = Math.max(from, timing.endMs - (timing.serverMs ?? 0) - t0);
+        const to = Math.max(from, timing.endMs - t0);
         spread(binBytes, chunk, from, to, settings.binMs);
         bytes += chunk;
         coveredUntil[connection] = to;

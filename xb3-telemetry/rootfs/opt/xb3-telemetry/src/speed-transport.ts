@@ -1,10 +1,13 @@
-import { Agent, request as httpsRequest } from "node:https";
-import type { ClientRequest, IncomingMessage } from "node:http";
-import type { TLSSocket } from "node:tls";
+import {
+  Agent as HttpAgent,
+  request as httpRequest,
+  type ClientRequest,
+  type IncomingMessage,
+} from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import {
   HttpError,
   parseRetryAfter,
-  parseServerTime,
   type StreamTransport,
   type UploadTiming,
 } from "./speed-measure.js";
@@ -17,10 +20,12 @@ const REQUEST_TIMEOUT_MS = 60_000;
  *
  * Connections are kept alive and reused, up to `connections` at a time.
  * Download bodies are counted as they arrive and discarded; upload bodies
- * repeat one 64 KiB buffer, so memory stays flat at any size.
+ * repeat one 64 KiB buffer, so memory stays flat at any size. A plain `http:`
+ * base is accepted so tests can use a local server.
  */
 export class HttpsSpeedTransport implements StreamTransport {
-  private readonly agent: Agent;
+  private readonly agent: HttpAgent;
+  private readonly secure: boolean;
   /** Cloudflare site that answered the latest request, from the CF-RAY suffix. */
   colo: string | null = null;
 
@@ -28,7 +33,9 @@ export class HttpsSpeedTransport implements StreamTransport {
     connections: number,
     private readonly base = "https://speed.cloudflare.com",
   ) {
-    this.agent = new Agent({ keepAlive: true, maxSockets: connections });
+    this.secure = new URL(base).protocol === "https:";
+    const options = { keepAlive: true, maxSockets: connections };
+    this.agent = this.secure ? new HttpsAgent(options) : new HttpAgent(options);
   }
 
   now(): number {
@@ -58,7 +65,7 @@ export class HttpsSpeedTransport implements StreamTransport {
           reject(error);
         },
       };
-      const req = httpsRequest(url, {
+      const req = (this.secure ? httpsRequest : httpRequest)(url, {
         method,
         agent: this.agent,
         headers,
@@ -66,11 +73,13 @@ export class HttpsSpeedTransport implements StreamTransport {
         timeout: REQUEST_TIMEOUT_MS,
       });
       req.on("socket", (socket) => {
-        const tls = socket as TLSSocket;
-        // A reused keep-alive socket is ready now; a new one is ready after TLS.
-        if (req.reusedSocket || (!tls.connecting && tls.encrypted))
-          onReady(req);
-        else tls.once("secureConnect", () => onReady(req));
+        // A reused keep-alive socket is ready now; a new one is ready after
+        // TLS (or, for a plain test server, after the TCP connect).
+        if (req.reusedSocket || !socket.connecting) onReady(req);
+        else
+          socket.once(this.secure ? "secureConnect" : "connect", () =>
+            onReady(req),
+          );
       });
       req.on("timeout", () => settle.fail(new Error("request_timeout")));
       req.on("error", (error) => settle.fail(error));
@@ -122,7 +131,6 @@ export class HttpsSpeedTransport implements StreamTransport {
   async upload(bytes: number, signal: AbortSignal): Promise<UploadTiming> {
     let startMs = 0;
     let endMs = 0;
-    let serverMs: number | undefined;
     await this.open(
       "POST",
       new URL("/__up", this.base),
@@ -149,15 +157,11 @@ export class HttpsSpeedTransport implements StreamTransport {
       },
       (res, settle) => {
         endMs = this.now();
-        const timing = res.headers["server-timing"];
-        serverMs = parseServerTime(
-          Array.isArray(timing) ? timing.join(", ") : timing,
-        );
         res.resume();
         res.on("end", () => settle.ok());
       },
     );
-    return { startMs, endMs, serverMs };
+    return { startMs, endMs };
   }
 
   close(): void {

@@ -6,7 +6,6 @@ import {
   METHOD,
   nextChunkBytes,
   parseRetryAfter,
-  parseServerTime,
   percentile,
   readingsFrom,
   spread,
@@ -89,7 +88,7 @@ class SimulatedLine implements StreamTransport {
       await wait(5, signal);
       left -= (this.rateAt("up", this.now() - this.t0) * 5) / 2;
     }
-    return { startMs, endMs: this.now(), serverMs: undefined };
+    return { startMs, endMs: this.now() };
   }
 }
 
@@ -100,15 +99,6 @@ describe("speed method helpers", () => {
     assert.equal(parseRetryAfter("Sat, 31 Oct 2026 20:30:00 GMT", now), 1800);
     assert.equal(parseRetryAfter("soon", now), null);
     assert.equal(parseRetryAfter(undefined, now), null);
-  });
-
-  it("reads server time the way Cloudflare's engine does", () => {
-    assert.equal(parseServerTime("cfRequestDuration;dur=12.5"), 12.5);
-    assert.equal(
-      parseServerTime("cfSpeedEdge;dur=3, cfSpeedWorker;dur=32"),
-      35,
-    );
-    assert.equal(parseServerTime(undefined), undefined);
   });
 
   it("interpolates percentiles between ranks", () => {
