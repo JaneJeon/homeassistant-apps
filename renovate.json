@@ -1,4 +1,22 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>JaneJeon/dev//packages/renovate-config/default.json"]
+  "extends": ["github>JaneJeon/dev//packages/renovate-config/default.json"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Paperless-ngx version paperless-intake's end-to-end tests run against",
+      "managerFilePatterns": ["/(^|/)tested-paperless-version$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n(?<currentValue>\\S+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "A Paperless bump needs green end-to-end tests and a person to merge it",
+      "matchDepNames": ["ghcr.io/paperless-ngx/paperless-ngx"],
+      "automerge": false,
+      "labels": ["paperless-intake", "paperless-version"]
+    }
+  ]
 }

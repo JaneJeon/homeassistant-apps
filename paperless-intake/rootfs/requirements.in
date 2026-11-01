@@ -1,0 +1,7 @@
+# Versions match what the October parser was qualified with (pypdf, reportlab,
+# google-auth from its lock; numpy and pillow from the Paperless image it ran in).
+pypdf==6.10.0
+reportlab==4.4.9
+pillow==12.3.0
+numpy==2.4.1
+google-auth[requests]==2.60.0

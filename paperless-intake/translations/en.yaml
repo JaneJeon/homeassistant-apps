@@ -1,0 +1,43 @@
+configuration:
+  paperless_url:
+    name: Paperless URL
+    description: Internal address of the Paperless-ngx app.
+  paperless_token:
+    name: Paperless API token
+    description: Token of the dedicated Paperless user the app uploads as. Use a !secret reference.
+  google_service_account:
+    name: Google service-account key
+    description: The Document AI service account's JSON key. Use a !secret reference to a multi-line value in secrets.yaml.
+  processor_version:
+    name: Document AI processor version
+    description: Full resource name of the pinned OCR processor version.
+  physical_mail_tag:
+    name: Physical Mail tag
+    description: Paperless tag added to every committed scan.
+  intake_tag:
+    name: Intake tag
+    description: Paperless tag marking documents this app uploaded. The Paperless ingest workflow excludes it, so it doesn't also signal Home Assistant.
+  ha_url:
+    name: Home Assistant URL
+    description: Where the ingest webhooks are sent.
+  webhook_started:
+    name: Started webhook ID
+    description: Existing "consume started" webhook; starts the 45-minute watchdog.
+  webhook_finished:
+    name: Finished webhook ID
+    description: Existing "document added" webhook; sent when a scan is committed, held or failed.
+  webhook_alert:
+    name: Alert webhook ID
+    description: Webhook for holds, commit failures, commit warnings and long waits, plus a "resolved" message once an alerted scan is committed or discarded.
+  daily_page_cap:
+    name: Daily Google page cap
+    description: Scans wait once this many pages have gone to Google today.
+  min_free_mib:
+    name: Minimum free disk (MiB)
+    description: Scans wait while free space on the Green is below this.
+  keep_local_copies_days:
+    name: Days to keep local copies
+    description: Local PDF copies are deleted this many days after a verified commit.
+  watchdog_minutes:
+    name: Watchdog minutes
+    description: Must match the Home Assistant watchdog; no "finished" webhook is sent after this long.
