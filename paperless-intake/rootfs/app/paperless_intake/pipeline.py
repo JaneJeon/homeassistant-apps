@@ -8,7 +8,8 @@ where it stopped:
 - Before adding version 2, the versions list is checked for its checksum.
 
 The app never deletes or edits anything in Paperless except the document it
-just created, to which it only adds a version and a note. Its tags are set at upload.
+just created. Its tags are set at upload; after that it clears the owner Paperless
+gives an API upload, and adds a version and a note.
 """
 
 from __future__ import annotations
@@ -302,6 +303,7 @@ class Pipeline:
 
         try:
             doc_id = self._ensure_original(item, original, tag_ids)
+            self._ensure_unowned(item, doc_id)
             if mode == WITH_GOOGLE:
                 self._ensure_version(item, doc_id)
             problems, warnings = self._read_back(item, doc_id, tag_ids, mode)
@@ -358,6 +360,19 @@ class Pipeline:
         item.event("original_in_paperless", doc_id=int(doc_id))
         return int(doc_id)
 
+    def _ensure_unowned(self, item: Item, doc_id: int) -> None:
+        """Leave the document with no owner, like every scan from the consume folder.
+
+        Paperless makes an API upload the uploader's own, and a document with an
+        owner is hidden from other users who have no superuser rights or explicit
+        permission. Clearing the owner keeps the app's documents visible to the
+        same people as before. Only the owner may clear it, and that is this app.
+        """
+        if self.paperless.document(doc_id).get("owner") is None:
+            return
+        self.paperless.set_owner(doc_id, None)
+        item.event("owner_cleared", doc_id=doc_id)
+
     def _ensure_version(self, item: Item, doc_id: int) -> None:
         wanted = item.state["searchable_sha256"]
         if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
@@ -394,6 +409,8 @@ class Pipeline:
             if stored != item.sha:
                 problems.append("the original downloaded from Paperless doesn't match the scan byte for byte")
         document = self.paperless.document(doc_id)
+        if document.get("owner") is not None:
+            warnings.append("the document still has an owner, so other Paperless users may not see it")
         present = set(document.get("tags") or [])
         for name, tag_id in zip((self.settings.physical_mail_tag, self.settings.intake_tag), tag_ids):
             if tag_id not in present:

@@ -99,6 +99,7 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(doc["versions"][-1]["data"], scan.pdf)                 # version 1 is the original
         self.assertEqual(doc["versions"][0]["checksum"], item.state["searchable_sha256"])
         self.assertEqual(doc["tags"], [1, 2])
+        self.assertIsNone(doc["owner"])                    # visible to every Paperless user, like consume-folder scans
         self.assertEqual(len(doc["notes"]), 1)
         self.assertIn("confirmed by the printed page numbers", doc["notes"][0])
         self.assertEqual([kind for kind, _ in h.notifier.sent], ["started", "finished"])
@@ -232,6 +233,7 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
         self.assertEqual(len(h.paperless.docs), 1)
         self.assertEqual(h.paperless.calls.count("post_document"), 1)
+        self.assertIsNone(h.paperless.docs[item.state["doc_id"]]["owner"])   # cleared on resume too
 
     def test_crash_after_version_upload_resumes_without_a_second_version(self):
         h = Harness(self)

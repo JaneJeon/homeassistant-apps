@@ -37,6 +37,10 @@ VERSION = tested_paperless_version(ROOT / "rootfs" / "app" / "tested-paperless-v
 PROCESSOR = ("projects/paperlss-document-pipeline/locations/us/processors/e2e/"
              "processorVersions/pretrained-ocr-v2.1-2024-08-07")
 PASSWORD = "synthetic-e2e-password"
+# The global permissions the app's own Paperless user needs, as DOCS.md tells Jane to set them.
+# Every test drives the app with this user, not the admin, so a missing permission fails here.
+INTAKE_PERMISSIONS = ["add_document", "view_document", "change_document", "add_note", "view_note",
+                      "view_tag", "view_paperlesstask"]
 E2E = os.environ.get("INTAKE_E2E") == "1"
 
 
@@ -128,10 +132,32 @@ class PaperlessE2E(unittest.TestCase):
             time.sleep(3)
         cls.api = requests.Session()
         cls.api.headers.update({"Authorization": f"Token {cls.token}", "Accept": "application/json; version=10"})
-        cls.tag = cls.api.post(f"{cls.base}/api/tags/", json={"name": "Physical Mail"}).json()["id"]
-        cls.intake_tag = cls.api.post(f"{cls.base}/api/tags/", json={"name": "Mail intake"}).json()["id"]
+        admin_id = cls.api.get(f"{cls.base}/api/users/", params={"username__iexact": "admin"}).json()["results"][0]["id"]
+        cls.intake_token, intake_id = cls._user("intake", INTAKE_PERMISSIONS)
+        cls.reader_token, _ = cls._user("reader", ["view_document"])    # another user, like an MCP client
+        # Jane's tags are owned by her account, so the app's user needs view permission on them.
+        view = {"view": {"users": [intake_id], "groups": []}, "change": {"users": [], "groups": []}}
+        cls.tag = cls._tag("Physical Mail", admin_id, view)
+        cls.intake_tag = cls._tag("Mail intake", admin_id, view)
         cls.hooks = HookListener()
         cls._jane_workflows()
+
+    @classmethod
+    def _user(cls, name: str, permissions: list[str]) -> tuple[str, int]:
+        response = cls.api.post(f"{cls.base}/api/users/", json={
+            "username": name, "password": PASSWORD, "is_superuser": False, "is_staff": False,
+            "user_permissions": permissions})
+        response.raise_for_status()
+        token = requests.post(f"{cls.base}/api/token/", data={"username": name, "password": PASSWORD}, timeout=10)
+        token.raise_for_status()
+        return token.json()["token"], response.json()["id"]
+
+    @classmethod
+    def _tag(cls, name: str, owner: int, permissions: dict) -> int:
+        response = cls.api.post(f"{cls.base}/api/tags/", json={"name": name, "owner": owner,
+                                                               "set_permissions": permissions})
+        response.raise_for_status()
+        return response.json()["id"]
 
     @classmethod
     def _jane_workflows(cls):
@@ -168,7 +194,7 @@ class PaperlessE2E(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="intake-e2e-app-"))
         self.addCleanup(shutil.rmtree, root, True)
         values = dict(
-            paperless_url=self.base, paperless_token=self.token, google_service_account=None,
+            paperless_url=self.base, paperless_token=self.intake_token, google_service_account=None,
             processor_version=PROCESSOR, physical_mail_tag="Physical Mail", intake_tag="Mail intake", ha_url="http://ha.invalid",
             webhook_started="s", webhook_finished="f", webhook_alert="a", daily_page_cap=500, min_free_mib=0,
             keep_local_copies_days=7, watchdog_minutes=45, capture_dir=root / "capture", intake_dir=root / "intake",
@@ -180,7 +206,7 @@ class PaperlessE2E(unittest.TestCase):
         google = FakeGoogle()
         store = Store(settings.items_dir)
         notifier = RecordingNotifier()
-        client = Paperless(self.base, self.token)
+        client = Paperless(self.base, self.intake_token)
 
         def backend(item):
             return GoogleDocumentAIBackend(GoogleBackendConfig(PROCESSOR, item.google_dir()),
@@ -214,6 +240,10 @@ class PaperlessE2E(unittest.TestCase):
         self.assertEqual(len(document["versions"]), 2)
         self.assertIn(self.tag, document["tags"])
         self.assertIn(self.intake_tag, document["tags"])
+        self.assertIsNone(document["owner"])                                     # like consume-folder scans
+        reader = requests.get(f"{self.base}/api/documents/{doc_id}/", timeout=10,
+                              headers={"Authorization": f"Token {self.reader_token}"})
+        self.assertEqual(reader.status_code, 200)                                # other users still see it
         self.assertIn(marker, document["content"])
         notes = self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json()
         self.assertEqual(len(notes), 1)
@@ -276,7 +306,7 @@ class PaperlessE2E(unittest.TestCase):
         self.assertEqual(self.hooks.paths()[before:], ["/consume_started", "/document_added"])
         # The backfill adds a version to documents like this one. That must not signal again:
         # Paperless skips workflows for version documents.
-        client = Paperless(self.base, self.token)
+        client = Paperless(self.base, self.intake_token)
         doc_id = client.find_by_checksum(scan.sha256)
         self.assertIsNotNone(doc_id)
         version = numbered_letter(1, tag=uuid.uuid4().hex[:8])
@@ -288,7 +318,7 @@ class PaperlessE2E(unittest.TestCase):
         """Why the intake tag exists. If this starts failing, Paperless now honours sources on
         "document added", and the tag could go. Either way the main test shows no double signal."""
         before = len(self.hooks.received)
-        client = Paperless(self.base, self.token)
+        client = Paperless(self.base, self.intake_token)
         scan = numbered_letter(1, tag=uuid.uuid4().hex[:8])
         client.wait_for_task(client.post_document("api-only.pdf", scan.pdf, tag_ids=[self.tag]))
         deadline = time.time() + 60

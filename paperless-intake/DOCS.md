@@ -22,8 +22,19 @@ Scans are worked on one at a time, each in a short-lived worker process. On a sy
 
 ## Paperless setup
 
-- **A dedicated user** for the app's API token. It needs to add and change documents, add notes, and view tags.
-- **Two tags:** `Physical Mail`, and `Mail intake`, which marks what this app uploaded. If either is missing, nothing commits, and scans wait with an alert.
+- **A dedicated user** for the app's API token, not a superuser. Give it these permissions and no others:
+
+  | Type          | View | Add | Change |
+  | ------------- | ---- | --- | ------ |
+  | Document      | yes  | yes | yes    |
+  | Note          | yes  | yes |        |
+  | Tag           | yes  |     |        |
+  | PaperlessTask | yes  |     |        |
+
+  The end-to-end tests run the app as a user with exactly these permissions.
+
+- **Two tags:** `Physical Mail`, and `Mail intake`, which marks what this app uploaded. The app's user must be able to see both: on each tag, either leave the owner empty or give that user View permission. If either tag is missing or hidden, nothing commits, and scans wait with an alert.
+- **Owner.** Paperless makes an uploaded document its uploader's own, which hides it from other users who aren't superusers. The app clears that owner straight after upload, so its documents have no owner, like scans from the consume folder.
 - **The "document added" ingest workflow must skip the `Mail intake` tag.** Add the filter "Does not have these tags: Mail intake" to its trigger. The app already signals Home Assistant itself, so without the filter each scan counts as finished twice. The workflow's source filter can't do this: Paperless checks sources only on "consumption started" triggers. The end-to-end tests check both points.
 
 ## Options
