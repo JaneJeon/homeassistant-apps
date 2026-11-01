@@ -1,5 +1,5 @@
 name: Paperless Intake
-version: "1.0.0"
+version: "1.0.1"
 slug: paperless-intake
 description: Checks scans with Google OCR before committing them into Paperless-ngx
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/paperless-intake

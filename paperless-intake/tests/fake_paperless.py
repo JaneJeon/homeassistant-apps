@@ -68,7 +68,7 @@ class FakePaperless:
             self.tasks[task] = {"status": "failure", "result": "Not consuming: It is a duplicate"}
         else:
             doc_id = next(self.ids)
-            self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "versions": [
+            self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "owner": 7, "versions": [
                 {"id": doc_id, "checksum": sha, "label": None, "data": data, "archive": True,
                  "content": "TESSERACT TEXT"}]}
             self.tasks[task] = {"status": "success", "related_document": doc_id}
@@ -111,7 +111,7 @@ class FakePaperless:
     def document(self, doc_id):
         self._check("document")
         doc = self.docs[doc_id]
-        return {"id": doc_id, "tags": doc["tags"], "content": doc["versions"][0]["content"],
+        return {"id": doc_id, "tags": doc["tags"], "owner": doc["owner"], "content": doc["versions"][0]["content"],
                 "versions": [{"id": v["id"], "checksum": v["checksum"]} for v in doc["versions"]]}
 
     def metadata(self, doc_id, version_id=None):
@@ -122,6 +122,10 @@ class FakePaperless:
     def download_original(self, doc_id, version_id):
         self._check("download_original")
         return next(v for v in self.docs[doc_id]["versions"] if v["id"] == version_id)["data"]
+
+    def set_owner(self, doc_id, owner):
+        self._check("set_owner")
+        self.docs[doc_id]["owner"] = owner
 
     def add_note(self, doc_id, text):
         self._check("add_note")

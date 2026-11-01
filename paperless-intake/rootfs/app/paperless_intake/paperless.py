@@ -1,7 +1,7 @@
 """The parts of the Paperless-ngx REST API this app uses, pinned to API version 10.
 
 Everything here is documented API: post_document, update_version, tasks,
-documents (with their versions list), download, metadata, notes and tags.
+documents (with their versions list and owner), download, metadata, notes and tags.
 """
 
 from __future__ import annotations
@@ -108,6 +108,9 @@ class Paperless:
         response = self._request("POST", f"/api/documents/{doc_id}/update_version/", files=files,
                                  data={"version_label": label[:64]})
         return str(response.json())
+
+    def set_owner(self, doc_id: int, owner: int | None) -> None:
+        self._request("PATCH", f"/api/documents/{doc_id}/", json={"owner": owner})
 
     def add_note(self, doc_id: int, text: str) -> None:
         self._request("POST", f"/api/documents/{doc_id}/notes/", json={"note": text})
