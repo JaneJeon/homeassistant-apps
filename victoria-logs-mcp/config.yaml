@@ -2,7 +2,7 @@ name: VictoriaLogs MCP
 version: 1.0.0
 slug: victorialogs-mcp
 description: Streamable HTTP MCP server for VictoriaLogs
-url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victorialogs-mcp
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victoria-logs-mcp
 arch:
   - aarch64
   - amd64

@@ -5,13 +5,13 @@ on:
     branches:
       - main
     paths:
-      - "paperless-intake/**"
+      - "paperless-ngx-intake/**"
       - ".github/workflows/paperless-intake.yaml"
   push:
     branches:
       - main
     paths:
-      - "paperless-intake/**"
+      - "paperless-ngx-intake/**"
       - ".github/workflows/paperless-intake.yaml"
 
 permissions:
@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: paperless-intake
+        working-directory: paperless-ngx-intake
     steps:
       - name: Check out the repository
         uses: actions/checkout@v6.0.3
@@ -41,13 +41,13 @@ jobs:
           python -m pip install --require-hashes --no-deps -r rootfs/requirements.txt
 
       - name: Unit tests
-        working-directory: paperless-intake/tests
+        working-directory: paperless-ngx-intake/tests
         env:
           PYTHONPATH: ../rootfs/app:.
         run: python -m unittest -v test_google_backend test_page_order test_checks_and_web test_pipeline test_worker
 
       - name: End-to-end tests against stock Paperless at the tested version
-        working-directory: paperless-intake/tests
+        working-directory: paperless-ngx-intake/tests
         env:
           PYTHONPATH: ../rootfs/app:.
           INTAKE_E2E: "1"
