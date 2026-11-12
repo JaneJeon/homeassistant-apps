@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS builder
 WORKDIR /opt/xb3-telemetry
 COPY rootfs/opt/xb3-telemetry/package*.json ./
 RUN npm ci --ignore-scripts
@@ -8,7 +8,7 @@ COPY rootfs/opt/xb3-telemetry/src ./src
 COPY rootfs/opt/xb3-telemetry/test ./test
 RUN npm run check && npm test && npm run build && npm prune --omit=dev --ignore-scripts
 
-FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5
 WORKDIR /opt/xb3-telemetry
 COPY --from=builder /opt/xb3-telemetry/package*.json ./
 COPY --from=builder /opt/xb3-telemetry/node_modules ./node_modules
