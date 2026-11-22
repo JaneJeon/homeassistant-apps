@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1
+
+The first real scan 1.1.0 worked on went in without its searchable copy. The scanner had saved some of its pages as one-bit black and white images and the rest as JPEGs, and 1.1.0 built a copy only from JPEG pages. No test scan had a page like that.
+
+- **The copy is built from any page image.** JPEG, one-bit fax or Flate images, JBIG2, a page in layers: the page is carried over as the scanner wrote it and the text is laid on top. Nothing needs to decode the image. The check that every image is the scanner's own, byte for byte, now covers every image on the page, with the description that says how its bytes are read.
+- **A copy an earlier version couldn't build is built again.** When a new version starts, it tries once more for each scan whose copy failed in the app's own handling, for as long as the local scan is kept. A scan still on its way into Paperless carries on with the copy. A scan already in Paperless gets the copy added as version 2 of the same document, with a second note, and the earlier warning is closed. If the try fails, the document stays exactly as it was: never held, never waiting, nothing new said. Its owner and tags are left as Jane has them. Three tries per version at most.
+- **When a copy can't be built, the log records the shape of each page** as the scanner wrote it (page box, image formats and sizes, drawing operators), so the cause can be read without opening the scan.
+- **The log names each page's image format** next to its turn, word count and image match. The image match is left unmeasured, with the reason, for a page the app can't decode or that isn't a single image. Only JPEG pages are remarked on against the match yardstick, because that is what it was set on.
+
 ## 1.1.0
 
 Version 1.0 held both of the first two real scans it was given, over the invisible text layer. Neither had lost anything. This version changes what can hold a scan.

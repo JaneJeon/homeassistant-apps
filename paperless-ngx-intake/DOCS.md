@@ -9,7 +9,7 @@ For each scan in `/share/paperless/capture`, the app:
 1. Picks it up once it has stopped changing for 30 seconds and opens as a complete PDF.
 2. Sends it to Google Document AI for OCR, using the pinned processor version.
 3. Decides, for the stack as a whole, which way up it is and whether it went in flipped (next section).
-4. Builds the searchable copy. The page images are the scanner's own, byte for byte. Pages are turned upright and put in reading order. Google's text sits invisibly on top, word by word.
+4. Builds the searchable copy. The page images are the scanner's own, byte for byte, in whatever format the scanner chose for each page (a scanner that detects colour mixes JPEG pages with one-bit black and white ones). Pages are turned upright and put in reading order. Google's text sits invisibly on top, word by word.
 5. Checks that the printed page numbers don't reveal a missing page.
 6. Commits to Paperless through the REST API: the untouched scan as version 1, the searchable copy as version 2. Then it reads both back and checks the bytes, the tags and the search text.
 7. Adds a note to the document saying what it decided. The evidence behind each decision is in the scan's `checks.json` (see Files).
@@ -40,6 +40,8 @@ Nothing about the searchable copy holds a scan: not rotation, not page order, no
 
 If Google can't read one particular scan, or the app can't build the searchable copy from Google's answer, the untouched scan still goes into Paperless, with Paperless's own OCR, and an alert says so. If Google refuses for a reason that would hit every scan (permission, a retired processor version, a wrong setting), scans wait and an alert says why.
 
+When the app itself couldn't build the copy, the next version of the app tries once more, for as long as the local scan is kept (`keep_local_copies_days`). If it works, the copy is added to the same Paperless document as version 2, a second note says so, and the earlier warning is closed. If it doesn't, the document stays exactly as it was and nothing new is said. The app doesn't touch the document's owner or tags at that point; they are yours to have changed.
+
 The invisible text covers the characters almost all mail uses (Unicode's basic plane, which includes Korean, Chinese, Japanese, Thai, Arabic and Hebrew). Arabic and Hebrew words are stored so they read back in the right order. Rarer characters outside that range are left out of the text layer, and the note says so.
 
 ## What you are told
@@ -52,7 +54,7 @@ The invisible text covers the characters almost all mail uses (Unicode's basic p
 
 Alerts never include document text.
 
-The app never deletes or edits anything in Paperless except the document it just created. It uploads that document with the Physical Mail and Mail intake tags, then only adds a version and a note.
+The app never deletes anything in Paperless, and edits only documents it created itself. It uploads a document with the Physical Mail and Mail intake tags and clears its owner. After that it only adds a version and a note, either straight away or when a later version of the app builds a copy the first one couldn't.
 
 Scans are worked on one at a time, each in a short-lived worker process. On a synthetic 15-page scan at 300 dpi, the 1.0 worker peaked at about 350 MiB. The worker then exits, so the app idles at about 90 MiB.
 

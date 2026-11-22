@@ -29,6 +29,9 @@ def main() -> int:
     requeued = app.pipeline.requeue_obsolete_holds()
     if requeued:
         log.info("checking %d scan(s) again that an earlier version held", len(requeued))
+    retried = app.pipeline.retry_copies()
+    if retried:
+        log.info("building the searchable copy again for %d scan(s)", len(retried))
     # Each scan's work runs in a child process, so its memory goes back when it's done.
     service = Service(settings, app.store, app.pipeline, app.notifier, runner=SubprocessRunner())
     server = serve(Page(service, app.pipeline, settings), settings.web_port, settings.web_allowed_clients)
