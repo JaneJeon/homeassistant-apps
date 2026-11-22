@@ -30,7 +30,7 @@ from .page_order import OrderPlan
 
 # A page with fewer words than this follows the stack's rotation when the two disagree.
 STRONG_WORDS = 12
-# The stack "has" a rotation when this share of its strongly-worded text agrees.
+# The stack "has" a rotation when this share of its pages with plenty of text agree.
 STACK_AGREEMENT = 0.8
 
 FULL_ORDER = {"complete_numbering_in_order", "reorder_from_complete_numbering"}
@@ -45,19 +45,21 @@ def decide_rotations(readings: list[dict]) -> tuple[list[int], list[dict]]:
     down, and the odd sideways page. A page with little text follows the stack
     when the stack is clear about head-to-foot.
     """
-    weight = {0: 0, 180: 0}
+    # One vote per page with plenty of text. Counting words instead would let a single dense
+    # page, such as terms printed upside down on the back of a bill, speak for the whole stack.
+    votes = {0: 0, 180: 0}
     for reading in readings:
-        if reading["cardinal"] in weight and reading["words"] >= STRONG_WORDS:
-            weight[reading["cardinal"]] += reading["words"]
-    total = weight[0] + weight[180]
+        if reading["cardinal"] in votes and reading["words"] >= STRONG_WORDS:
+            votes[reading["cardinal"]] += 1
+    total = votes[0] + votes[180]
     stack = None
-    if total and max(weight.values()) >= STACK_AGREEMENT * total:
-        stack = 0 if weight[0] >= weight[180] else 180
+    if total and max(votes.values()) >= STACK_AGREEMENT * total:
+        stack = 0 if votes[0] >= votes[180] else 180
     turns, decisions = [], []
     for number, reading in enumerate(readings, 1):
         turn = reading["cardinal"]
         followed = False
-        if stack is not None and reading["words"] < STRONG_WORDS and turn in weight and turn != stack:
+        if stack is not None and reading["words"] < STRONG_WORDS and turn in votes and turn != stack:
             turn, followed = stack, True
         turns.append(turn)
         decisions.append({"sourcePage": number, **reading, "appliedCardinalClockwiseDegrees": turn,
@@ -77,6 +79,12 @@ def direction_votes(plan: OrderPlan, page_count: int) -> tuple[int, int]:
     the lower. A series with a single numbered page and a printed total equal
     to the page count votes by position: "Page 2 of 2" found first says reversed.
     Series with doubtful numbers (ambiguous, repeated, low confidence) don't vote.
+
+    One step casts no vote: down onto 1 in a series with no printed total
+    ("Page 2" then "Page 1"). A flipped stack looks like that, and so does a
+    correctly fed statement followed by an enclosure whose numbering starts
+    again. With a printed total ("2 of 5" then "1 of 5") a fresh start would
+    need a second document of the same length, so that step does vote.
     """
     forward = reverse = 0
     for series in _series(plan):
@@ -87,7 +95,7 @@ def direction_votes(plan: OrderPlan, page_count: int) -> tuple[int, int]:
         for (_, earlier), (_, later) in zip(pairs, pairs[1:]):
             if later > earlier:
                 forward += 1
-            elif later < earlier:
+            elif later < earlier and (later != 1 or series.get("total") is not None):
                 reverse += 1
         if len(pairs) == 1 and series.get("total") == page_count and page_count > 1:
             page, number = pairs[0]
@@ -117,4 +125,6 @@ def decide_order(plan: OrderPlan, page_count: int) -> dict:
         return {**base, "mapping": identity, "status": "partial_in_order", "verified": False}
     if forward and reverse:
         return {**base, "mapping": identity, "status": "unverified_mixed_evidence", "verified": False}
+    if any(series.get("sourcePageNumberPairs") for series in _series(plan)):
+        return {**base, "mapping": identity, "status": "unverified_numbers_inconclusive", "verified": False}
     return {**base, "mapping": identity, "status": "unknown_no_pagination_evidence", "verified": False}

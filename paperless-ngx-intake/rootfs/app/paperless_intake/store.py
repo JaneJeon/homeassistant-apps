@@ -22,7 +22,7 @@ from pathlib import Path
 
 # Where an item can be in its life.
 CAPTURED = "captured"          # claimed from the capture folder, nothing done yet
-READY = "ready"                # checks passed (or Jane chose original only); safe to commit
+READY = "ready"                # checks passed (or Jane chose to keep it as it is); safe to commit
 COMMITTING = "committing"      # upload under way; resume by looking Paperless up
 COMMITTED = "committed"
 COMMITTED_WARNING = "committed_warning"

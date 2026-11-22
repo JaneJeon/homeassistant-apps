@@ -29,19 +29,25 @@ def _series(plan) -> list[dict]:
 
 
 def missing_pages(plan, page_count: int) -> str | None:
-    """Return a plain description of pages the scan can't contain, or None.
+    """Return a plain description of pages the printed numbers say are missing, or None.
 
     With a printed total ("2 of 3"), every number from 1 to the total should be
     present. Without a total, only gaps between the lowest and highest printed
     numbers count, because an excerpt may legitimately start at page 5.
 
-    A printed number Google didn't read looks the same as a page that isn't
-    there. Only the page count can tell them apart: every scanned page without
-    a clean number from the series could be carrying one of the unread numbers.
-    So a scan is short only by the numbers left over after those pages are
-    counted. (Jane's document 34 is the real case: eight pages, a series "of 7"
-    with page 4 unread and one unnumbered insert. All of its paper was there.)
+    One allowance, and only one. Many letters print no number on their first
+    page and start at "Page 2 of 3". So when the only number missing is 1 and
+    the scan has a page with no page number of any kind, that page is taken to
+    be the first page. (A real two-page letter already in Paperless reads
+    that way: the only page number on it is "Page 2 of 2".)
+
+    Any other missing number holds the scan, even if an unnumbered page could
+    in principle be carrying it. A lost page can only be recovered from the
+    paper, so a doubt here is settled by Jane looking, not by the app assuming.
     """
+    numbered = {entry.get("sourcePage") for entry in plan.evidence
+                if isinstance(entry, dict) and entry.get("kind") == "marker"}
+    unnumbered_pages = page_count - len(numbered)
     gaps = []
     for series in _series(plan):
         pairs = series.get("sourcePageNumberPairs") or []
@@ -53,26 +59,15 @@ def missing_pages(plan, page_count: int) -> str | None:
             missing = sorted(set(range(1, int(total) + 1)) - set(numbers))
         else:
             missing = sorted(set(range(numbers[0], numbers[-1] + 1)) - set(numbers))
-        if not missing:
+        if not missing or (missing == [1] and unnumbered_pages > 0):
             continue
-        without_number = page_count - len({int(page) for page, _ in pairs})
-        absent = len(missing) - without_number
-        if absent <= 0:
-            continue
-        pages = "page" if page_count == 1 else "pages"
-        if total is not None and not without_number:
+        if total is not None:
             gaps.append(f"{'page' if len(missing) == 1 else 'pages'} {_list(missing)} of {total} "
                         f"{'is' if len(missing) == 1 else 'are'} missing "
-                        f"(the printed page numbers count to {total}; the scan has {page_count} {pages})")
-        elif total is not None:
-            gaps.append(f"at least {absent} of pages {_list(missing)} of {total} "
-                        f"{'is' if absent == 1 else 'are'} missing (the scan has {page_count} {pages}, "
-                        f"{without_number} without a readable page number)")
-        elif not without_number:
-            gaps.append(f"the printed page numbers skip {'page' if len(missing) == 1 else 'pages'} {_list(missing)}")
+                        f"(the printed page numbers count to {total}; the scan has {page_count} "
+                        f"page{'' if page_count == 1 else 's'})")
         else:
-            gaps.append(f"the printed page numbers skip {_list(missing)}, and the scan is at least "
-                        f"{absent} page{'' if absent == 1 else 's'} short of covering them")
+            gaps.append(f"the printed page numbers skip {'page' if len(missing) == 1 else 'pages'} {_list(missing)}")
     if not gaps:
         return None
     return "; ".join(dict.fromkeys(gaps))

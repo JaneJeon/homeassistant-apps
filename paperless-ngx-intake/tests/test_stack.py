@@ -14,6 +14,7 @@ from pypdf import PdfReader
 
 from paperless_intake import checks
 from paperless_intake.docai import glyphless, stack
+from paperless_intake.docai.google_backend import GoogleBackendError
 from paperless_intake.docai.page_order import plan_page_order
 from paperless_intake.docai.validation import inspect_source
 from paperless_intake.store import COMMITTED, COMMITTED_WARNING, HELD, WAITING
@@ -38,6 +39,14 @@ class RotationTests(unittest.TestCase):
         # A sheet printed with its back upside down: the stack is upright, this page isn't.
         turns, _ = stack.decide_rotations([reading(0, 200), reading(180, 120), reading(0, 180), reading(0, 150)])
         self.assertEqual(turns, [0, 180, 0, 0])
+
+    def test_one_dense_upside_down_page_doesnt_speak_for_the_stack(self):
+        # A bill with terms printed upside down on the back, and a short slip: the slip stays upright.
+        turns, _ = stack.decide_rotations([reading(0, 100), reading(180, 500), reading(0, 8)])
+        self.assertEqual(turns, [0, 180, 0])
+        turns, _ = stack.decide_rotations([reading(0, 120), reading(180, 600), reading(0, 90), reading(180, 600),
+                                           reading(0, 6)])
+        self.assertEqual(turns[-1], 0)
 
     def test_no_clear_stack_means_every_page_keeps_its_own(self):
         turns, decisions = stack.decide_rotations([reading(0, 100), reading(180, 100), reading(0, 4)])
@@ -83,7 +92,7 @@ class OrderTests(unittest.TestCase):
 
     def test_a_middle_page_says_nothing_by_position(self):
         _, order = order_of([line("text", y=0.5)], [line("Page 2 of 3")], [line("text", y=0.5)])
-        self.assertEqual(order["status"], "unknown_no_pagination_evidence")
+        self.assertEqual((order["mapping"], order["status"]), ([1, 2, 3], "unverified_numbers_inconclusive"))
 
     def test_partly_numbered_stack_running_backwards_is_reversed_whole(self):
         _, order = order_of([line("Page 4 of 4")], [line("An insert", y=0.5)], [line("Page 2 of 4")],
@@ -96,10 +105,26 @@ class OrderTests(unittest.TestCase):
         self.assertEqual((order["mapping"], order["status"]), ([1, 2, 3], "unverified_mixed_evidence"))
 
     def test_repeated_numbers_dont_vote(self):
-        # Two enclosures, each "1 of 2, 2 of 2", scanned flipped: which is which can't be told from the numbers.
-        _, order = order_of([line("Page 2 of 2")], [line("Page 1 of 2")], [line("Page 2 of 2")],
-                            [line("Page 1 of 2")])
-        self.assertEqual(order["mapping"], [1, 2, 3, 4])
+        # The same number on two pages means two documents share the series. Without this guard
+        # the one step down (2 to 1) would reverse the stack.
+        _, order = order_of([line("Page 2 of 2")], [line("Page 2 of 2")], [line("Page 1 of 2")])
+        self.assertEqual((order["mapping"], order["reverseVotes"]), ([1, 2, 3], 0))
+
+    def test_numbering_that_starts_again_is_not_a_flipped_stack(self):
+        # A statement whose first page has no number, then an enclosure starting at "Page 1". Fed correctly.
+        _, order = order_of([line("Statement", y=0.5)], [line("Page 2")], [line("Page 1")])
+        self.assertEqual((order["mapping"], order["status"]), ([1, 2, 3], "unverified_numbers_inconclusive"))
+
+    def test_a_step_down_onto_one_does_vote_when_a_total_is_printed(self):
+        _, order = order_of([line("An insert", y=0.5)], [line("Page 2 of 5")], [line("Page 1 of 5")])
+        self.assertEqual((order["mapping"], order["status"]), ([3, 2, 1], "reversed_stack_from_printed_numbers"))
+
+    def test_a_page_number_that_is_referred_to_is_not_that_pages_number(self):
+        plan, order = order_of([line("See page 4 for terms")], [line("Page 2")])
+        self.assertEqual(order["mapping"], [1, 2])
+        self.assertIsNone(checks.missing_pages(plan, 2))
+        _, order = order_of([line("Continued on page 2")], [line("Page 2")])
+        self.assertEqual(order["mapping"], [1, 2])
 
     def test_doubtful_numbers_dont_vote(self):
         _, order = order_of([line("Page 2 of 2", numeric_confidence=0.4)], [line("Page 1 of 2", numeric_confidence=0.4)])
@@ -176,7 +201,7 @@ class StackThroughThePipelineTests(unittest.TestCase):
                 self.assertTextSitsOnTheWords(scan, item, output_page=2, source_page=2)
 
     def test_partly_numbered_flipped_stack_is_reversed_and_says_why(self):
-        h, item = self.commit(numbered_letter(4, flipped=True, unnumbered=(2,)))
+        h, item = self.commit(numbered_letter(4, flipped=True, unnumbered=(1,)))      # numbered from "Page 2 of 4"
         self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
         self.assertEqual(item.state["page_order"], [4, 3, 2, 1])
         self.assertIn("ran backwards", h.paperless.docs[item.state["doc_id"]]["notes"][0])
@@ -191,8 +216,8 @@ class StackThroughThePipelineTests(unittest.TestCase):
 
     def test_a_page_google_cant_judge_alone_is_turned_with_the_stack(self):
         specs = [PageSpec([f"Synthetic account statement line {n}.{i} for testing purposes only" for i in range(1, 6)],
-                          footer=f"Page {n} of 3") for n in (1, 2)]
-        specs.append(PageSpec(["Thank you"], unturned=True))
+                          footer=f"Page {n} of 2") for n in (1, 2)]
+        specs.append(PageSpec(["Thank you"], unturned=True))          # a slip with two words and no page number
         scan = make_scan(specs, turn=180)
         h, item = self.commit(scan)
         self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
@@ -242,6 +267,76 @@ class StackThroughThePipelineTests(unittest.TestCase):
         alerts = [p for k, p in h.notifier.sent if k == "alert"]
         self.assertEqual([p["kind"] for p in alerts], ["warning"])
         self.assertIn("no Google text or upright copy", alerts[0]["gap"])
+
+    def test_arabic_and_hebrew_read_back_the_right_way_round(self):
+        body = ["Important notice about your coverage and language assistance services",
+                "ملحوظة: إذا كنت تتحدث اللغة العربية فإن خدمات المساعدة اللغوية متاحة",
+                "שים לב: אם אתה מדבר עברית שירותי סיוע בשפה זמינים"]
+        h, item = self.commit(make_scan([PageSpec(body)]))
+        # Committed without a warning means Paperless's text (pulled out with pdftotext) has Google's words.
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        read_back = [e for e in item.events() if e["event"] == "read_back"][0]
+        self.assertEqual(read_back["text_match"]["missing_words"], 0, read_back["text_match"])
+
+    def test_a_missing_page_still_holds_when_the_copy_cant_be_built(self):
+        h = Harness(self)
+
+        def broken(*args, **kwargs):
+            raise KeyError("a shape of Google answer the renderer never met")
+
+        h.pipeline.renderer.render = broken
+        h.drop(numbered_letter(3, missing=(2,)))
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, HELD)
+        self.assertIn("page 2 of 3 is missing", item.state["reason"])
+        self.assertEqual(h.paperless.docs, {})
+
+    def test_a_bad_google_setting_waits_and_says_so_at_once(self):
+        h = Harness(self)
+
+        def refused(item):
+            raise GoogleBackendError("pinned_ocr_version_in_allowed_project_us_required")
+
+        h.pipeline.backend_factory = refused
+        h.drop(numbered_letter(2))
+        h.settle()
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["reason_kind"]), (WAITING, "google"))
+        alerts = [p for k, p in h.notifier.sent if k == "alert"]
+        self.assertEqual([p["kind"] for p in alerts], ["waiting"])
+        self.assertIn("pinned_ocr_version", alerts[0]["gap"])
+
+    def test_an_unexpected_error_says_so_at_once_and_only_once(self):
+        h = Harness(self)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("something nobody planned for")
+
+        h.pipeline._plan = boom          # fails on every try, cached Google answer or not
+        h.drop(numbered_letter(2))
+        h.settle()
+        h.clock.advance(31 * 60)
+        h.settle()
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["reason_kind"]), (WAITING, "unexpected"))
+        self.assertEqual([p["kind"] for k, p in h.notifier.sent if k == "alert"], ["waiting"])
+
+    def test_a_damaged_local_copy_warns_instead_of_holding(self):
+        h = Harness(self)
+        scan = numbered_letter(2)
+        h.drop(scan)
+        h.service.claim_captures()
+        h.clock.advance(31)
+        h.service.claim_captures()
+        item = h.only_item()
+        h.pipeline.prepare(item)
+        item.searchable_path.write_bytes(b"%PDF-1.7 not the copy that was checked")
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING, item.state.get("reason"))
+        self.assertEqual([v["data"] for v in h.paperless.docs[item.state["doc_id"]]["versions"]], [scan.pdf])
+        self.assertIn("changed on disk", item.state["reason"])
 
     def test_a_defect_in_building_the_copy_cant_strand_a_scan(self):
         h = Harness(self)

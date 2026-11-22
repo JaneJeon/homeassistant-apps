@@ -63,6 +63,7 @@ ORDER_WORDS = {
                                            "backwards (the stack went in flipped)",
     "partial_in_order": "as scanned; the printed page numbers seen agree",
     "unverified_mixed_evidence": "as scanned; the printed page numbers disagree about the order, so it is unverified",
+    "unverified_numbers_inconclusive": "as scanned; the printed page numbers that were read don't settle the order",
     "unknown_no_pagination_evidence": "as scanned (no printed page numbers to check)",
 }
 
@@ -153,8 +154,10 @@ class Pipeline:
             self._wait(item, wait)
         except Exception as error:  # never lose an item to a bug: wait, keep evidence, retry
             log.exception("unexpected error on %s", item.sha[:12])
-            self._wait(item, Wait(f"unexpected error ({type(error).__name__})", "unexpected",
-                                  "commit" if item.status in {READY, COMMITTING} else "ocr"))
+            # Alerted once. An error nobody expected is likely to hit every scan the same way,
+            # and retrying it quietly for a day would leave them all outside Paperless unnoticed.
+            self._wait(item, Wait(f"an unexpected error in the app ({type(error).__name__})", "unexpected",
+                                  "commit" if item.status in {READY, COMMITTING} else "ocr", alert=True))
 
     # Stage 1: OCR, searchable copy, checks -------------------------------------------
 
@@ -199,9 +202,10 @@ class Pipeline:
 
         item.event("ocr_started", google_run=item.state.get("google_run", 1))
         work_dir = item.new_work_dir()
-        backend = self.backend_factory(item)
         try:
-            result = backend.process(source, work_dir)
+            # Building the backend checks the app's Google settings, and a bad setting
+            # must be reported the same way as Google refusing a request.
+            result = self.backend_factory(item).process(source, work_dir)
         except GoogleBackendError as error:
             if error.code in TRANSIENT_GOOGLE:
                 raise Wait(f"Google OCR didn't answer ({error.code})", "google", "ocr")
@@ -390,8 +394,13 @@ class Pipeline:
         try:
             doc_id = self._ensure_original(item, original, tag_ids)
             self._ensure_unowned(item, doc_id)
-            if mode == WITH_GOOGLE:
-                self._ensure_version(item, doc_id)
+            if mode == WITH_GOOGLE and not self._ensure_version(item, doc_id):
+                # The original is already safely in Paperless. A damaged local copy of the
+                # searchable version is a reason to say so, not a reason to hold the scan.
+                mode = ORIGINAL_ONLY
+                item.state.update(mode=ORIGINAL_ONLY,
+                                  no_google_copy_reason="the local searchable copy changed on disk before upload")
+                item.save()
             problems, warnings = self._read_back(item, doc_id, tag_ids, mode)
             if item.state.get("no_google_copy_reason"):
                 # Not a per-scan nuisance: if this happens, Google's part of the pipeline isn't
@@ -464,10 +473,11 @@ class Pipeline:
         self.paperless.set_owner(doc_id, None)
         item.event("owner_cleared", doc_id=doc_id)
 
-    def _ensure_version(self, item: Item, doc_id: int) -> None:
+    def _ensure_version(self, item: Item, doc_id: int) -> bool:
+        """Make sure version 2 is in Paperless. False when the local copy can no longer be trusted."""
         wanted = item.state["searchable_sha256"]
         if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
-            return
+            return True
         task_id = item.state.get("version_task")
         if task_id:
             try:
@@ -476,16 +486,20 @@ class Pipeline:
                 item.state["version_task"] = None
                 item.save()
             if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
-                return
-        data = item.searchable_path.read_bytes()
+                return True
+        try:
+            data = item.searchable_path.read_bytes()
+        except OSError:
+            return False
         if sha256(data) != wanted:
-            raise Hold("the local searchable copy changed on disk", "local_integrity")
+            return False
         stem = Path(item.state["original_name"]).stem
         task_id = self.paperless.update_version(doc_id, f"{stem}.searchable.pdf", data, label=self.version_label())
         item.event("uploaded_version", task=task_id)
         item.state["version_task"] = task_id
         item.save()
         self.paperless.wait_for_task(task_id)
+        return True
 
     def _read_back(self, item: Item, doc_id: int, tag_ids: list[int], mode: str) -> tuple[list[str], list[str]]:
         """Problems mean the original isn't safely in Paperless. Warnings concern version 2 only."""
@@ -566,7 +580,7 @@ class Pipeline:
             lines.append("Google found almost no text, so only the original was stored and Paperless did its own OCR.")
         else:
             lines.append("Only the original was stored.")
-        if state.get("jane_decision") == "keep":
+        if state.get("jane_decision") in {"keep", "keep_original"}:      # "keep_original" was 1.0's name for it
             lines.append(f"Kept as it is, by Jane's choice. Unresolved: {state.get('held_reason')}.")
         if warnings:
             lines.append("Read-back warnings: " + "; ".join(warnings) + ".")

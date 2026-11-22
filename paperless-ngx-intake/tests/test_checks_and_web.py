@@ -25,20 +25,39 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(checks.missing_pages(plan, 2),
                          "pages 2 and 3 of 4 are missing (the printed page numbers count to 4; the scan has 2 pages)")
 
-    def test_an_unread_page_number_is_not_a_missing_page(self):
-        # Shaped like Jane's document 34: every sheet is there, one footer wasn't read.
-        _, plan = plan_for(numbered_letter(4, unnumbered=(3,)))
-        self.assertIsNone(checks.missing_pages(plan, 4))
+    def test_a_first_page_without_a_number_is_not_a_missing_page(self):
+        # Many letters start numbering at "Page 2 of 3", with no number on the first page.
+        _, plan = plan_for(numbered_letter(3, unnumbered=(1,)))
+        self.assertIsNone(checks.missing_pages(plan, 3))
 
-    def test_an_unnumbered_insert_doesnt_hide_a_page_that_is_really_gone(self):
-        # Pages 1 and 4 of 4, plus one page with no number: at most one of 2 and 3 can be there.
+    def test_any_other_number_missing_holds_even_with_an_unnumbered_page_in_the_scan(self):
+        # The page may be there with its footer unread. Only Jane looking can tell, so it holds.
+        _, plan = plan_for(numbered_letter(4, unnumbered=(3,)))
+        self.assertEqual(checks.missing_pages(plan, 4),
+                         "page 3 of 4 is missing (the printed page numbers count to 4; the scan has 4 pages)")
+
+    def test_a_second_numbered_document_cant_stand_in_for_a_missing_page(self):
+        # Document A lost its page 2 in a double feed. Document B's pages carry their own numbers.
+        scan = make_scan([PageSpec(["Explanation of benefits, first page of three"], footer="Page 1 of 3"),
+                          PageSpec(["Explanation of benefits, last page of three"], footer="Page 3 of 3"),
+                          PageSpec(["A separate notice, first page of two"], footer="Page 1 of 2"),
+                          PageSpec(["A separate notice, last page of two"], footer="Page 2 of 2")])
+        _, plan = plan_for(scan)
+        self.assertIn("page 2 of 3 is missing", checks.missing_pages(plan, 4))
+
+    def test_a_cover_letter_cant_stand_in_for_a_missing_last_page(self):
+        scan = make_scan([PageSpec(["A cover letter with no page number on it at all"]),
+                          PageSpec(["The first page of a two page form"], footer="Page 1 of 2")])
+        _, plan = plan_for(scan)
+        self.assertIn("page 2 of 2 is missing", checks.missing_pages(plan, 2))
+
+    def test_an_unnumbered_insert_doesnt_hide_pages_that_are_really_gone(self):
         scan = make_scan([PageSpec(["Body text of the first page of this letter"], footer="Page 1 of 4"),
                           PageSpec(["An insert with no page number printed on it"]),
                           PageSpec(["Body text of the last page of this letter"], footer="Page 4 of 4")])
         _, plan = plan_for(scan)
         self.assertEqual(checks.missing_pages(plan, 3),
-                         "at least 1 of pages 2 and 3 of 4 is missing (the scan has 3 pages, "
-                         "1 without a readable page number)")
+                         "pages 2 and 3 of 4 are missing (the printed page numbers count to 4; the scan has 3 pages)")
 
     def test_complete_numbering_has_no_gap(self):
         _, plan = plan_for(numbered_letter(3))

@@ -29,6 +29,7 @@ from .validation import anchored_text
 _INLINE = re.compile(r"\b(?:page|pg)\.?\s*:?[ \t]*(?P<number>[0-9]+)(?:\s+of\s+(?P<total>[0-9]+))?(?![\w])", re.I)
 _BARE_OF = re.compile(r"\s*(?P<number>[0-9]+)\s+of\s+(?P<total>[0-9]+)\s*", re.I)
 _LABEL = re.compile(r"\s*(?:page|pg)\.?\s*:?\s*", re.I)
+_REFERS = re.compile(r"\b(?:see|on|to|at|from|in|refer|turn)\s*$", re.I)
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,8 @@ def _page_markers(page: dict, source_page: int, text: str) -> tuple[list[dict], 
         if not _band(node["box"]):
             continue
         for match in _INLINE.finditer(node["text"]):
+            if _REFERS.search(node["text"][:match.start()]):
+                continue    # "see page 4", "continued on page 2": a pointer to another page, not this page's number
             if re.match(r"\s*(?:of\b|[/.-]\s*[0-9])", node["text"][match.end():], re.I):
                 issues.append({"kind": "unsupported_marker", "sourcePage": source_page, "lineIndex": node["index"],
                                "reason": "An explicit Page/Pg marker has an unsupported or incomplete denominator/date-like suffix."})

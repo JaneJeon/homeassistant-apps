@@ -6,9 +6,11 @@ character, and the PDF's ToUnicode map says which character each code is.
 Tesseract and OCRmyPDF write their text layers the same way.
 
 Why it matters here: a font with letter shapes only covers some scripts. US
-mail routinely carries a block of other languages (Korean, Chinese, Thai and
-so on), and a text layer that depends on a font's coverage either fails on
-those pages or silently drops their text. This layer has no coverage to run out of.
+mail routinely carries a block of other languages (Korean, Chinese, Thai,
+Arabic and so on), and a text layer that depends on a font's coverage either
+fails on those pages or silently drops their text. This layer covers every
+character in Unicode's basic plane. The few beyond it (rare Chinese characters,
+emoji) are written as the replacement character.
 
 Each character is half an em wide. A run of text is stretched to span the box
 Google gave for it, so a word's selection sits on the printed word.
@@ -54,6 +56,34 @@ def clean(text: str) -> str:
         else:
             out.append(char)
     return "".join(out)
+
+
+_LEFT_TO_RIGHT = {"L", "EN", "AN"}
+_RIGHT_TO_LEFT = {"R", "AL"}
+
+
+def visual(text: str) -> str:
+    """A word as it must be stored so that it reads back in the right order.
+
+    A PDF holds text in the order it sits on the page, left to right. For Arabic
+    or Hebrew that is the reverse of the order the letters are read in, and text
+    extractors (pdftotext among them) turn such runs back around. A word stored
+    in reading order comes back reversed, and no search finds it. So a word with
+    right-to-left letters is stored turned around: its right-to-left stretches
+    letter by letter, and any digits or Latin letters inside it kept as they are.
+    Applying this twice gives the word back.
+    """
+    if not any(unicodedata.bidirectional(char) in _RIGHT_TO_LEFT for char in text):
+        return text
+    runs, current, current_ltr = [], "", None
+    for char in text:
+        ltr = unicodedata.bidirectional(char) in _LEFT_TO_RIGHT
+        if current and ltr != current_ltr:
+            runs.append((current, current_ltr))
+            current = ""
+        current, current_ltr = current + char, ltr
+    runs.append((current, current_ltr))
+    return "".join(run if ltr else run[::-1] for run, ltr in reversed(runs))
 
 
 def search_words(text: str) -> list[str]:

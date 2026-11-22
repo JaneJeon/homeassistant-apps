@@ -264,7 +264,8 @@ def page_runs(document: dict, google_page: dict, returned: tuple[int, int], proj
         if matrix is None:
             skipped += 1
             continue
-        runs.append({"text": text + (" " if _ends_a_word(raw_text, node) else ""), "matrix": matrix})
+        runs.append({"text": glyphless.visual(text) + (" " if _ends_a_word(raw_text, node) else ""),
+                     "matrix": matrix})
     return runs, {"level": level, "placed": len(runs), "leftOut": skipped}
 
 
@@ -371,7 +372,8 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
             if op == b"Tj":
                 raw = args[0]
                 data = raw.original_bytes if hasattr(raw, "original_bytes") else bytes(raw)
-                actual.update(glyphless.search_words(data.decode("utf-16-be", "replace")))
+                stored = data.decode("utf-16-be", "replace").strip()
+                actual.update(glyphless.search_words(glyphless.visual(stored)))
         total = sum(expected.values())
         missing = sum((expected - actual).values())
         checks.append({"outputPage": output_number, "sourcePage": record["sourcePage"],
@@ -424,7 +426,8 @@ def quality_notes(provenance: dict) -> list[str]:
     odd = [page["outputPage"] for page in pages if page.get("transformNote")]
     if odd:
         notes.append(f"Google's rotation data for page{'' if len(odd) == 1 else 's'} {', '.join(map(str, odd))} "
-                     f"couldn't be used, so text there is placed without it")
+                     f"couldn't be used, so {'that page' if len(odd) == 1 else 'those pages'} may not be upright "
+                     f"and the text there may be out of place")
     low = [check["outputPage"] for check in provenance.get("checks") or []
            if check["wordsExpected"] and check["wordMatch"] < POLICY["wordMatchYardstick"]]
     if low:
