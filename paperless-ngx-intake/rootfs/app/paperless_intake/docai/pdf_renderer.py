@@ -457,12 +457,21 @@ def page_runs(document: dict, google_page: dict, returned: tuple[int, int], proj
         if not text:
             continue
         points = polygon(layout, returned, projection)
-        matrix = glyphless.fit(points, len(text)) if points else None
+        # A word that is followed by a space on the paper gets a space cell inside its own box.
+        # pdftotext, which Paperless reads the text with, ignores a space character and decides
+        # where words end by the gap it measures. Google's boxes for neighbouring words often
+        # touch, and then the two words came out as one ("En Español" as "EnEspañol": about one
+        # word in twenty on the first real scans). With the space cell inside the box the letters
+        # stop short of the next word. Tesseract's own PDF output does the same.
+        gap = _ends_a_word(raw_text, node)
+        shown = glyphless.visual(text)
+        if gap:
+            shown = " " + shown if shown != text else shown + " "       # right-to-left words end on the left
+        matrix = glyphless.fit(points, len(shown)) if points else None
         if matrix is None:
             skipped += 1
             continue
-        runs.append({"text": glyphless.visual(text) + (" " if _ends_a_word(raw_text, node) else ""),
-                     "matrix": matrix})
+        runs.append({"text": shown, "matrix": matrix})
     return runs, {"level": level, "placed": len(runs), "leftOut": skipped}
 
 

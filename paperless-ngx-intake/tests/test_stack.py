@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import unittest
+import unittest.mock
 
 from pypdf import PdfReader
 
@@ -499,6 +500,63 @@ class WhatTheFirstRealScansShowedTests(unittest.TestCase):
         pages += [PageSpec(["Second document, with enough words on the page to count"] * 3, footer=f"Page {n} of 3") for n in (1, 3)]
         _, plan = plan_for(make_scan(pages))
         self.assertIn("page 2 of 3 is missing", checks.missing_pages(plan, 5))
+
+    def test_words_whose_boxes_touch_dont_run_together_in_paperless(self):
+        # Both real scans lost about one word in twenty this way: "En Español" read back as "EnEspañol".
+        for turn in (0, 180):
+            with self.subTest(turn=turn):
+                h, item = self.commit(make_scan(letter(3), turn=turn, flipped=bool(turn), touching=True))
+                self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+                read_back = [e for e in item.events() if e["event"] == "read_back"][0]
+                self.assertEqual((read_back["text_match"]["missing_words"], read_back["text_match"]["extra_words"]), (0, 0))
+
+    def test_a_stored_copy_that_read_back_badly_is_built_again_by_the_next_version(self):
+        from paperless_intake.docai import glyphless
+        h = Harness(self)
+        real_fit = glyphless.fit
+        scan = make_scan(letter(3), turn=180, flipped=True, touching=True)
+        h.drop(scan)
+        with unittest.mock.patch.object(glyphless, "fit", lambda points, cells: real_fit(points, max(1, cells - 1))):
+            h.settle()                                                      # as 1.1.2 laid the words out
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
+        self.assertIn("search text differs", item.state["reason"])
+        doc = h.paperless.docs[item.state["doc_id"]]
+        doc["owner"] = 7                                                    # Jane's since
+        self.assertEqual(alert_kinds(h), ["warning"])
+        self.assertEqual(h.pipeline.retry_copies(), [])                     # the version that built it leaves it
+        item.state["prepared_by"] = "1.1.2"
+        item.state.pop("copy_reads_badly", None)                            # 1.1.2 kept only the sentence
+        item.save()
+        h.build()
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual((len(doc["versions"]), len(doc["notes"]), doc["owner"]), (3, 2, 7))
+        self.assertIn("built again by a newer version", doc["notes"][1])
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
+        self.assertEqual(h.pipeline.retry_copies(), [])
+
+    def test_a_failed_try_at_a_better_copy_puts_back_what_was_recorded_about_the_stored_one(self):
+        from paperless_intake.docai import glyphless
+        h = Harness(self)
+        real_fit = glyphless.fit
+        h.drop(make_scan(letter(3), turn=180, flipped=True, touching=True))
+        with unittest.mock.patch.object(glyphless, "fit", lambda points, cells: real_fit(points, max(1, cells - 1))):
+            h.settle()
+        item = h.only_item()
+        before = {key: item.state.get(key) for key in ("status", "mode", "reason", "searchable_sha256", "page_order")}
+        item.state["prepared_by"] = "1.1.2"
+        item.save()
+        h.build()
+        h.google.fail = [503] * 200
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual({key: item.state.get(key) for key in before}, before)
+        self.assertEqual(before["mode"], "with_google")
+        self.assertEqual(alert_kinds(h), ["warning"])
 
     def test_a_scan_that_hasnt_finished_going_in_is_prepared_again_by_a_new_version(self):
         # Both real scans were waiting on Paperless when the fix for their page order was ready.
