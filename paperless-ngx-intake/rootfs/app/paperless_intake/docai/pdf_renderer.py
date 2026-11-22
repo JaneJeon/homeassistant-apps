@@ -145,6 +145,28 @@ def page_images(page) -> list[dict]:
     return found
 
 
+def describe_source(source_pdf_path: Path) -> str:
+    """The shape of each page of a scan, for the log: sizes, format names and drawing operators. No content.
+
+    Written when a copy can't be built, so the reason can be read from the log
+    without anyone opening the scan.
+    """
+    parts = []
+    for number, page in enumerate(PdfReader(source_pdf_path).pages, 1):
+        try:
+            box = [round(float(value), 2) for value in page.mediabox]
+            crop = "" if list(page.cropbox) == list(page.mediabox) else " cropped"
+            images = ", ".join(f"{image['format']} {image['colorSpace']} {image['bitsPerComponent']}-bit "
+                               f"{image['width']}x{image['height']}" for image in page_images(page)) or "no image"
+            contents = page.get_contents()
+            operators = [op.decode("latin-1") for _, op in contents.operations][:12] if contents is not None else []
+            extra = "".join(f" {key[1:]}" for key in ("/Annots", "/UserUnit", "/Group") if page.get(key) is not None)
+            parts.append(f"p{number} box {box}{crop} rotate {page.rotation}{extra}; {images}; draws {' '.join(operators)}")
+        except Exception as error:
+            parts.append(f"p{number} couldn't be described ({type(error).__name__})")
+    return " | ".join(parts)
+
+
 def _fingerprint(images: list[dict]) -> list[tuple[str, int, str]]:
     return sorted((image["format"], image["byteCount"], image["sha256"]) for image in images)
 

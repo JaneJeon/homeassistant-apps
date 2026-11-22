@@ -481,6 +481,23 @@ class PageImageFormatTests(unittest.TestCase):
         self.assertIn("JBIG2Decode 1-bit, image match not measured", line)
         self.assertNotIn("Statement", line)                           # numbers and format names, never text
 
+    def test_when_a_copy_cant_be_built_the_log_says_what_the_scanner_wrote(self):
+        from paperless_intake.docai.pdf_renderer import ReviewRequired
+        h = Harness(self)
+
+        def refuse(*args, **kwargs):
+            raise ReviewRequired("a page shape nobody has met yet")
+
+        h.pipeline.renderer.render = refuse
+        h.drop(make_scan(letter(2), encodings=["ccitt", "layered"]))
+        with self.assertLogs("paperless_intake.pipeline", "WARNING") as logs:
+            h.settle()
+        line = next(entry for entry in logs.output if "as the scanner wrote them" in entry)
+        self.assertIn("p1 box [0.0, 0.0, 612.0, 792.0] rotate 0; CCITTFaxDecode DeviceGray 1-bit 1275x1650; draws q cm Do Q", line)
+        self.assertIn("p2 box [0.0, 0.0, 612.0, 792.0] rotate 0; DCTDecode DeviceGray 8-bit 1275x1650, "
+                      "FlateDecode mask 1-bit 1275x1650; draws q cm Do Q q g cm Do Q", line)
+        self.assertNotIn("Statement", line)
+
     def test_only_jpeg_pages_are_remarked_on_against_the_jpeg_yardstick(self):
         from paperless_intake.docai import pdf_renderer
         provenance = {"pages": [
@@ -620,3 +637,68 @@ class RebuildTheCopyTests(unittest.TestCase):
         doc = h.paperless.docs[item.state["doc_id"]]
         self.assertEqual(len(doc["versions"]), 2)
         self.assertIn("Kept as it is, by Jane's choice", doc["notes"][-1])
+
+    # A document already in Paperless is safe. Trying to add its copy must never make it look otherwise.
+
+    def assertLeftAsItWas(self, h, item, doc_id):
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["doc_id"], item.state["mode"]), (COMMITTED_WARNING, doc_id, "original_only"))
+        self.assertIn("no Google text or upright copy", item.state["reason"])
+        self.assertEqual(alert_kinds(h), ["warning"])                       # the one from the first time, nothing new
+        doc = h.paperless.docs[doc_id]
+        self.assertEqual((len(doc["versions"]), len(doc["notes"])), (1, 1))
+        return item
+
+    def test_google_being_down_leaves_the_document_alone_and_tries_at_the_next_start(self):
+        h, item = self.committed_without_a_copy()
+        doc_id = item.state["doc_id"]
+        h.google.fail = [503] * 200
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = self.assertLeftAsItWas(h, item, doc_id)
+        h.clock.advance(26 * 3600)                                          # past the give-up time: still not held
+        h.settle()
+        self.assertLeftAsItWas(h, item, doc_id)
+        h.google.fail = []
+        h.build()                                                           # the next start of the same version
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(len(h.paperless.docs[doc_id]["versions"]), 2)
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
+
+    def test_a_damaged_local_scan_leaves_the_document_alone(self):
+        h, item = self.committed_without_a_copy()
+        doc_id = item.state["doc_id"]
+        item.source_path.write_bytes(b"not a PDF any more")
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        self.assertLeftAsItWas(h, item, doc_id)
+        self.assertEqual(h.pipeline.retry_copies(), [])                     # and this version doesn't try again
+
+    def test_paperless_being_down_for_a_day_never_holds_a_document_it_already_has(self):
+        h, item = self.committed_without_a_copy()
+        doc_id = item.state["doc_id"]
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.paperless.unreachable = True
+        for _ in range(60):                                                 # thirty hours of half-hourly tries
+            h.settle()
+            h.clock.advance(30 * 60)
+        h.paperless.unreachable = False
+        item = h.only_item()
+        self.assertNotIn(item.status, {HELD, WAITING})
+        self.assertEqual((item.status, item.state["doc_id"]), (COMMITTED_WARNING, doc_id))
+        self.assertNotIn("held", alert_kinds(h))
+
+    def test_an_unexpected_error_while_adding_the_copy_says_nothing_and_changes_nothing(self):
+        h, item = self.committed_without_a_copy()
+        doc_id = item.state["doc_id"]
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("something nobody planned for")
+
+        h.pipeline._plan = boom
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        self.assertLeftAsItWas(h, item, doc_id)

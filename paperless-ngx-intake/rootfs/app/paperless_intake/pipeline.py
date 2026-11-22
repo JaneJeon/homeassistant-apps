@@ -42,7 +42,7 @@ from .config import Settings
 from .docai.errors import ParserError
 from .docai.google_backend import GoogleBackendConfig, GoogleBackendError, GoogleDocumentAIBackend
 from .docai.page_order import plan_page_order
-from .docai.pdf_renderer import ReviewRequired
+from .docai.pdf_renderer import ReviewRequired, describe_source
 from .docai.renderer_adapter import StackRenderer
 from .docai.validation import assert_unchanged, document_for_renderer, inspect_source, ordered_text, validate_result
 from .notify import Notifier
@@ -242,6 +242,12 @@ class Pipeline:
             # still goes in. A defect here must never leave a scan stranded outside Paperless.
             expected = isinstance(error, (ReviewRequired, ParserError, ValueError))
             log.warning("%s: no searchable copy: %s", item.sha[:12], error, exc_info=not expected)
+            try:
+                shape = describe_source(source.path)
+            except Exception as failure:
+                shape = f"couldn't be read ({type(failure).__name__})"
+            record["source_shape"] = shape
+            log.warning("%s: the scan's pages as the scanner wrote them: %s", item.sha[:12], shape)
             why = str(error) if expected else f"an unexpected {type(error).__name__} in the app"
             self._ready_without_google(item, f"the searchable copy couldn't be built ({why})",
                                        checks_record={**record, "render_error": f"{type(error).__name__}: {error}"},
@@ -449,7 +455,8 @@ class Pipeline:
         said_before = bool(warnings) and item.state.get("copy_retry_previous_reason") == reason
         item.set(status, reason=reason, reason_kind="read_back" if warnings else None,
                  doc_id=doc_id, committed_at=iso(self.clock()), committed_at_unix=self.clock(),
-                 waiting_since_unix=None, alerted_reason_kind=None, copy_retry_previous_reason=None)
+                 waiting_since_unix=None, alerted_reason_kind=None, copy_retry_previous_reason=None,
+                 copy_retry_restore=None)
         self._tidy_after_commit(item)
         self._finish(item, alert_kind="warning" if warnings and not said_before else None)
 
@@ -679,10 +686,40 @@ class Pipeline:
         return item.state.get("captured_at") or ""
 
     def _hold(self, item: Item, reason: str, kind: str) -> None:
+        if item.state.get("copy_added_later"):
+            self._back_to_committed(item, reason)       # it is in Paperless; there is no paper to keep
+            return
         item.set(HELD, reason=reason, reason_kind=kind, held_reason=reason, held_at=iso(self.clock()))
         self._finish(item, alert_kind="held")
 
+    def _back_to_committed(self, item: Item, why: str, *, again: bool = False) -> None:
+        """A document already in Paperless couldn't be given its copy this time. Leave it as it was.
+
+        Adding the copy later is a favour to a document that is already safe. Whatever
+        goes wrong while trying must not turn that document into a held or waiting scan,
+        and must not tell Jane anything: she was told when it first went in without a copy.
+
+        again: the cause was outside the scan (Google unreachable, disk low), so the next
+        start of this same version may try once more.
+        """
+        was = item.state.get("copy_retry_restore") or {}
+        item.event("copy_retry_stopped", reason=why, again=again)
+        log.warning("%s: its searchable copy couldn't be added this time (%s); the document stays as it was",
+                    item.sha[:12], why)
+        item.set(was.get("status") or COMMITTED_WARNING, reason=was.get("reason"), reason_kind=was.get("reason_kind"),
+                 mode=ORIGINAL_ONLY, no_google_copy_reason=was.get("no_google_copy_reason"), copy_not_built=True,
+                 copy_added_later=False, copy_retry_previous_reason=None, copy_retry_restore=None,
+                 copy_retry_by=None if again else __version__,
+                 prepared_by=None if again else item.state.get("prepared_by"),
+                 # A new Google run for the next try, as a waiting scan gets: this run's retry budget is spent.
+                 google_run=int(item.state.get("google_run", 1)) + (1 if again else 0),
+                 waiting_since_unix=None, alerted_reason_kind=None)
+
     def _wait(self, item: Item, wait: Wait) -> None:
+        if item.state.get("copy_added_later") and wait.stage == "ocr":
+            # Nothing is waiting to get into Paperless here. See _back_to_committed.
+            self._back_to_committed(item, wait.reason, again=wait.kind != "unexpected")
+            return
         since = float(item.state.get("waiting_since_unix") or self.clock())
         if self.clock() - since > self.settings.retry_hours * 3600:
             item.state["waiting_since_unix"] = None
@@ -774,8 +811,10 @@ class Pipeline:
             if not (in_flight or committed) or not item.source_path.exists():
                 continue
             item.event("copy_retry", by=__version__, was=state.get("no_google_copy_reason"))
+            restore = {key: state.get(key) for key in ("reason", "reason_kind", "no_google_copy_reason")}
             item.set(CAPTURED, copy_retry_by=__version__, copy_added_later=committed,
                      copy_retry_previous_reason=state.get("reason") if committed else None,
+                     copy_retry_restore={"status": item.status, **restore} if committed else None,
                      waiting_since_unix=None, alerted_reason_kind=None)
             retried.append(item.sha)
             log.info("%s has no searchable copy from an earlier version (%s); building it again", item.sha[:12],
