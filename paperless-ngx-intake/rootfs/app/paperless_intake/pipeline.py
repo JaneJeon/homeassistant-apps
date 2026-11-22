@@ -30,6 +30,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import re
 import logging
 import shutil
 import time
@@ -69,6 +70,11 @@ ORDER_WORDS = {
 
 # Reasons version 1.0 held a scan for that no longer hold one. Scans still held for
 # them are put back through the checks once, when this version starts.
+def _kinds(reason: str | None) -> set[str]:
+    """The warnings in a reason, without the figures in brackets: what they are about, not how much."""
+    return {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
+
+
 COPY_RETRIES = 3            # tries per app version to add a copy an earlier version couldn't build
 # What the app records about the copy that is stored in Paperless. Put back if a later try at a better copy fails.
 RESTORED = ("reason", "reason_kind", "no_google_copy_reason", "mode", "copy_not_built", "copy_reads_badly",
@@ -356,6 +362,11 @@ class Pipeline:
         A later version of the app may do better, so it tries again (see retry_copies).
         """
         self._write_checks(item, {**(checks_record or {}), "mode": ORIGINAL_ONLY, "no_google_copy_reason": why})
+        if item.state.get("copy_added_later"):
+            # The document is already in Paperless, with or without an earlier copy. This try
+            # made nothing to add, so nothing about the document or its record changes.
+            self._back_to_committed(item, why)
+            return
         fields = dict(mode=ORIGINAL_ONLY, no_google_copy_reason=why, copy_not_built=ours, prepared_by=__version__,
                       quality_notes=[], short_text=False, waiting_since_unix=None, alerted_reason_kind=None)
         if gap and not self._settled(item):
@@ -471,8 +482,8 @@ class Pipeline:
             return
         status = COMMITTED_WARNING if warnings else COMMITTED
         reason = "; ".join(warnings) or None
-        # A copy that still can't be built after a retry has already been reported once.
-        said_before = bool(warnings) and item.state.get("copy_retry_previous_reason") == reason
+        # A warning Jane already has about this document isn't sent again because a number in it changed.
+        said_before = bool(warnings) and _kinds(reason) <= _kinds(item.state.get("copy_retry_previous_reason"))
         item.set(status, reason=reason, reason_kind="read_back" if warnings else None,
                  doc_id=doc_id, committed_at=iso(self.clock()), committed_at_unix=self.clock(),
                  waiting_since_unix=None, alerted_reason_kind=None, copy_retry_previous_reason=None,
@@ -629,7 +640,7 @@ class Pipeline:
             lines.append(f"Pages: {pages}. Page order: {order}.")
             turned = sum(1 for turn in state.get("rotations") or [] if turn)
             if turned:
-                sentence = f"{turned} of {pages} pages were turned upright in version 2"
+                sentence = f"{turned} of {pages} pages were turned upright in the searchable copy"
                 followed = int(state.get("rotations_from_stack") or 0)
                 if followed:
                     sentence += (f"; {followed} with too little text to judge alone "
@@ -752,7 +763,9 @@ class Pipeline:
     def _wait(self, item: Item, wait: Wait) -> None:
         if item.state.get("copy_added_later"):
             # Nothing is waiting to get into Paperless here, at either stage. See _back_to_committed.
-            self._back_to_committed(item, wait.reason, again=wait.kind != "unexpected")
+            # An unexpected error while committing may have come after the new copy was uploaded.
+            # Trying again at the next start finishes the job: the same copy is found, not uploaded twice.
+            self._back_to_committed(item, wait.reason, again=wait.kind != "unexpected" or wait.stage == "commit")
             return
         since = float(item.state.get("waiting_since_unix") or self.clock())
         if self.clock() - since > self.settings.retry_hours * 3600:
@@ -879,6 +892,7 @@ class Pipeline:
                          state.get("mode") == ORIGINAL_ONLY or (committed and reads_badly))),
                      copy_note_kind=state.get("copy_note_kind") if resumed else (
                          "added" if state.get("mode") == ORIGINAL_ONLY else "rebuilt"),
+                     copy_note_added=bool(state.get("copy_note_added")) if resumed else False,
                      copy_retry_previous_reason=state.get("reason") if committed else (
                          state.get("copy_retry_previous_reason") if resumed else None),
                      copy_retry_restore={"status": item.status, **restore} if committed else (

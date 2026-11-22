@@ -558,6 +558,84 @@ class WhatTheFirstRealScansShowedTests(unittest.TestCase):
         self.assertEqual(before["mode"], "with_google")
         self.assertEqual(alert_kinds(h), ["warning"])
 
+    def stored_with_a_copy_that_reads_badly(self, scan=None):
+        from paperless_intake.docai import glyphless
+        h = Harness(self)
+        real_fit = glyphless.fit
+        h.drop(scan or make_scan(letter(3), turn=180, flipped=True, touching=True))
+        with unittest.mock.patch.object(glyphless, "fit", lambda points, cells: real_fit(points, max(1, cells - 1))):
+            h.settle()
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["mode"]), (COMMITTED_WARNING, "with_google"))
+        item.state["prepared_by"] = "1.1.2"
+        item.save()
+        h.build()
+        return h, item
+
+    def test_a_better_copy_that_cant_be_built_leaves_the_stored_copy_and_its_record_alone(self):
+        # The renderer changes with every version, so this is the likeliest way for a rebuild to fail.
+        from paperless_intake.docai.pdf_renderer import ReviewRequired
+        h, item = self.stored_with_a_copy_that_reads_badly()
+        before = {key: item.state.get(key) for key in ("status", "mode", "reason", "searchable_sha256", "page_order")}
+
+        def refuse(*args, **kwargs):
+            raise ReviewRequired("a page shape nobody has met yet")
+
+        h.pipeline.renderer.render = refuse
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual({key: item.state.get(key) for key in before}, before)
+        self.assertIsNone(item.state.get("no_google_copy_reason"))
+        self.assertEqual(alert_kinds(h), ["warning"])
+        self.assertEqual(len(h.paperless.docs[item.state["doc_id"]]["versions"]), 2)
+        self.assertEqual(h.pipeline.retry_copies(), [])
+
+    def test_a_rebuilt_copy_that_still_reads_badly_isnt_reported_again(self):
+        from paperless_intake.docai import glyphless
+        h, item = self.stored_with_a_copy_that_reads_badly()
+        first = item.state["reason"]
+        real_fit = glyphless.fit
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        with unittest.mock.patch.object(glyphless, "fit", lambda points, cells: real_fit(points, max(1, cells - 1))
+                                        if cells % 2 else real_fit(points, cells)):
+            h.settle()                                                      # better, and still short of the mark
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
+        self.assertIn("search text differs", item.state["reason"])
+        self.assertNotEqual(item.state["reason"], first)                    # a different count
+        self.assertEqual(alert_kinds(h), ["warning"])
+
+    def test_an_error_after_the_new_copy_was_uploaded_is_finished_at_the_next_start(self):
+        h, item = self.stored_with_a_copy_that_reads_badly()
+        doc = h.paperless.docs[item.state["doc_id"]]
+        metadata = h.paperless.metadata
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("something nobody planned for")
+
+        h.paperless.metadata = boom
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        self.assertEqual((h.only_item().status, len(doc["versions"]), len(doc["notes"])), (COMMITTED_WARNING, 3, 1))
+        self.assertEqual(alert_kinds(h), ["warning"])
+        h.paperless.metadata = metadata
+        h.build()
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])             # the next start of the same version
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual((len(doc["versions"]), len(doc["notes"])), (3, 2))  # the copy wasn't uploaded twice
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
+
+    def test_short_hebrew_and_arabic_words_dont_run_together_either(self):
+        # A one-letter word, or one that reads the same both ways, looks no different stored right to left.
+        body = ["Language assistance notice for this account and its statements",
+                "שלום אבא ו שלום אבא ו שלום רבים", "ملحوظة باب و ملحوظة باب و ملحوظة"]
+        h, item = self.commit(make_scan([PageSpec(body)], touching=True))
+        read_back = [e for e in item.events() if e["event"] == "read_back"][0]
+        self.assertEqual(read_back["text_match"]["missing_words"], 0, read_back["text_match"])
+
     def test_a_scan_that_hasnt_finished_going_in_is_prepared_again_by_a_new_version(self):
         # Both real scans were waiting on Paperless when the fix for their page order was ready.
         h = Harness(self)

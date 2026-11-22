@@ -62,6 +62,11 @@ _LEFT_TO_RIGHT = {"L", "EN", "AN"}
 _RIGHT_TO_LEFT = {"R", "AL"}
 
 
+def right_to_left(text: str) -> bool:
+    """Whether the text has Hebrew or Arabic letters in it, which read from the right."""
+    return any(unicodedata.bidirectional(char) in _RIGHT_TO_LEFT for char in text)
+
+
 def visual(text: str) -> str:
     """A word as it must be stored so that it reads back in the right order.
 

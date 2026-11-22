@@ -465,8 +465,8 @@ def page_runs(document: dict, google_page: dict, returned: tuple[int, int], proj
         # stop short of the next word. Tesseract's own PDF output does the same.
         gap = _ends_a_word(raw_text, node)
         shown = glyphless.visual(text)
-        if gap:
-            shown = " " + shown if shown != text else shown + " "       # right-to-left words end on the left
+        if gap:     # a right-to-left word ends on its left, and so does a one-letter one that looks the same reversed
+            shown = " " + shown if glyphless.right_to_left(text) else shown + " "
         matrix = glyphless.fit(points, len(shown)) if points else None
         if matrix is None:
             skipped += 1
