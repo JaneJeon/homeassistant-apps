@@ -702,3 +702,131 @@ class RebuildTheCopyTests(unittest.TestCase):
         self.assertEqual(h.pipeline.retry_copies(), [item.sha])
         h.settle()
         self.assertLeftAsItWas(h, item, doc_id)
+
+    def test_a_scan_whose_first_note_was_already_written_gets_a_second_note(self):
+        # The app died after writing "only the original was stored" and before it recorded the commit.
+        from fake_paperless import Crash
+        h = Harness(self)
+        real = self.broken(h)
+        write_note = h.pipeline._ensure_note
+
+        def write_note_then_die(*args, **kwargs):
+            write_note(*args, **kwargs)
+            raise Crash("after the note was written and recorded")
+
+        h.pipeline._ensure_note = write_note_then_die
+        h.drop(make_scan(letter(2), encodings=["ccitt", "jpeg"]))
+        h.service.claim_captures()
+        h.clock.advance(31)
+        h.service.claim_captures()
+        item = h.only_item()
+        h.pipeline.prepare(item)
+        with self.assertRaises(Crash):
+            h.pipeline.commit(item)
+        self.assertEqual((item.status, item.state.get("note_added")), ("committing", True))
+        self.as_an_earlier_version_left_it(item)
+        h.pipeline.renderer.render = real
+        h.build()
+        h.pipeline.renderer.render = real
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        doc = h.paperless.docs[item.state["doc_id"]]
+        self.assertEqual((len(h.paperless.docs), len(doc["versions"]), len(doc["notes"])), (1, 2, 2))
+        self.assertIn("Only the original was stored", doc["notes"][0])
+        self.assertIn("Version 2 was added after the document was first stored", doc["notes"][1])
+
+    def test_what_jane_changed_on_the_document_since_is_left_alone(self):
+        h, item = self.committed_without_a_copy()
+        doc = h.paperless.docs[item.state["doc_id"]]
+        doc["owner"] = 3                                                    # she made it her own
+        doc["tags"] = [tag for tag in doc["tags"] if tag != h.paperless.tags["Mail intake"]]
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(doc["owner"], 3)
+        self.assertEqual(len(doc["versions"]), 2)
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
+
+    def test_a_stored_original_that_no_longer_matches_is_not_reported_as_a_failed_scan(self):
+        # Whatever happened to the document since it went in, it didn't happen in this try.
+        h, item = self.committed_without_a_copy()
+        h.paperless.docs[item.state["doc_id"]]["versions"][-1]["checksum"] = "f" * 64
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
+        self.assertEqual(alert_kinds(h), ["warning"])
+
+    def test_a_document_jane_deleted_is_tried_three_times_at_most_and_never_said_anything_about(self):
+        h, item = self.committed_without_a_copy()
+        del h.paperless.docs[item.state["doc_id"]]
+        for start in range(5):
+            h.build()
+            h.pipeline.retry_copies()
+            h.settle()
+            item = h.only_item()
+            self.assertEqual(item.status, COMMITTED_WARNING)
+        self.assertEqual(alert_kinds(h), ["warning"])
+        self.assertEqual(sum(1 for event in item.events() if event["event"] == "copy_retry"), 3)
+        self.assertEqual(h.paperless.docs, {})
+
+    def test_what_the_first_try_recorded_is_kept(self):
+        h, item = self.committed_without_a_copy()
+        first = (item.root / "checks.json").read_bytes()
+        self.assertIn(b"render_error", first)
+        h.pipeline.retry_copies()
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED)
+        self.assertEqual((item.root / "checks.by-earlier-version.json").read_bytes(), first)
+        self.assertNotIn(b"render_error", (item.root / "checks.json").read_bytes())
+
+
+class ImageCheckTests(unittest.TestCase):
+    """The hard check: a copied page carries exactly the images the scanner wrote."""
+
+    def images(self, encodings, **stack):
+        from paperless_intake.docai import pdf_renderer
+        scan = make_scan(letter(len(encodings)), encodings=encodings, **stack)
+        return [pdf_renderer.page_images(page) for page in PdfReader(io.BytesIO(scan.pdf)).pages]
+
+    def test_the_same_bytes_described_differently_are_not_the_same_image(self):
+        from paperless_intake.docai import pdf_renderer
+        (page,) = self.images(["ccitt"])
+        self.assertTrue(pdf_renderer._same_images(page, [dict(image) for image in page]))
+        flipped = [dict(image, described=image["described"].replace("('/BlackIs1', 'True')", "('/BlackIs1', 'False')"))
+                   for image in page]
+        self.assertNotEqual(flipped[0]["described"], page[0]["described"])
+        self.assertFalse(pdf_renderer._same_images(page, flipped))
+        self.assertFalse(pdf_renderer._same_images(page, [dict(page[0], sha256="0" * 64)]))
+        self.assertFalse(pdf_renderer._same_images(page, []))
+
+    def test_an_image_written_inline_is_counted(self):
+        from paperless_intake.docai import pdf_renderer
+        from pypdf import PdfWriter
+        from pypdf.generic import DecodedStreamObject, NameObject
+        writer = PdfWriter()
+        page = writer.add_blank_page(612, 792)
+        stream = DecodedStreamObject()
+        stream.set_data(b"q 612 0 0 792 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID \x00\xff\xff\x00 EI Q")
+        page[NameObject("/Contents")] = writer._add_object(stream)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        (found,) = pdf_renderer.page_images(PdfReader(io.BytesIO(buffer.getvalue())).pages[0])
+        self.assertEqual((found["format"], found["width"], found["height"], found["byteCount"]), ("inline", 2, 2, 4))
+
+    def test_a_copy_that_lost_a_drawing_instruction_is_refused(self):
+        from paperless_intake.docai import pdf_renderer
+        self.assertEqual(pdf_renderer._draws(PdfReader(io.BytesIO(
+            make_scan(letter(1), encodings=["layered"]).pdf)).pages[0]), 2)
+
+    def test_a_jpeg_whose_format_is_written_as_a_list_is_still_a_jpeg(self):
+        from paperless_intake.docai import pdf_renderer
+        scan = make_scan(letter(1))
+        pdf = scan.pdf.replace(b"/Filter /DCTDecode", b"/Filter [/DCTDecode]")
+        page = PdfReader(io.BytesIO(pdf)).pages[0]
+        image, kind = pdf_renderer.comparison_image(page)
+        self.assertEqual((kind, image.size), ("DCTDecode", (1275, 1650)))

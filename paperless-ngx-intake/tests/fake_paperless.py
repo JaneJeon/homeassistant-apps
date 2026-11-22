@@ -117,11 +117,15 @@ class FakePaperless:
 
     def versions(self, doc_id):
         self._check("versions")
+        if doc_id not in self.docs:
+            raise PaperlessError(f"Paperless GET /api/documents/{doc_id}/ returned HTTP 404")
         root_id = doc_id
         return [Version(v["id"], v["checksum"], v["label"], v["id"] == root_id) for v in self.docs[doc_id]["versions"]]
 
     def document(self, doc_id):
         self._check("document")
+        if doc_id not in self.docs:
+            raise PaperlessError(f"Paperless GET /api/documents/{doc_id}/ returned HTTP 404")
         doc = self.docs[doc_id]
         return {"id": doc_id, "tags": doc["tags"], "owner": doc["owner"], "content": doc["versions"][0]["content"],
                 "versions": [{"id": v["id"], "checksum": v["checksum"]} for v in doc["versions"]]}

@@ -106,6 +106,38 @@ def _resources(page):
     return {}
 
 
+def _plain(value, depth: int = 0):
+    """A PDF value in a form that compares equal before and after the page is copied.
+
+    Object numbers change when a page is copied, so references are followed, and a
+    stream (an ICC profile, JBIG2 globals) is stood for by a hash of its bytes.
+    """
+    value = value.get_object() if hasattr(value, "get_object") else value
+    if depth > 6:
+        return "deeper"
+    if hasattr(value, "_data") and hasattr(value, "items"):
+        return ("stream", digest(value._data), _plain({k: v for k, v in value.items() if k != "/Length"}, depth + 1))
+    if hasattr(value, "items"):
+        return tuple(sorted((str(key), _plain(item, depth + 1)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_plain(item, depth + 1) for item in value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return str(value)
+
+
+def _described(obj) -> str | None:
+    """How an image's bytes are to be read: size, depth, colours, decoding. None if it can't be put plainly."""
+    try:
+        keys = ("/Width", "/Height", "/BitsPerComponent", "/ColorSpace", "/Filter", "/DecodeParms", "/Decode",
+                "/ImageMask", "/Interpolate", "/Intent")
+        return repr(tuple((key, _plain(obj.get(key))) for key in keys if obj.get(key) is not None))
+    except Exception:
+        return None
+
+
 def _stored(obj) -> dict:
     data = obj._data
     space = obj.get("/ColorSpace")
@@ -115,14 +147,29 @@ def _stored(obj) -> dict:
     kind = "+".join(str(part) for part in kind) if isinstance(kind, list) else str(kind) if kind is not None else "none"
     return {"format": kind.replace("/", ""), "width": int(obj.get("/Width", 0)), "height": int(obj.get("/Height", 0)),
             "bitsPerComponent": int(obj.get("/BitsPerComponent", 1)), "colorSpace": (space or "mask").replace("/", ""),
-            "byteCount": len(data), "sha256": digest(data)}
+            "byteCount": len(data), "sha256": digest(data), "described": _described(obj)}
+
+
+def _inline(operands) -> dict:
+    """An image written straight into the page's drawing instructions instead of as its own object."""
+    settings = operands.get("settings") or {}
+    data = bytes(operands.get("data") or b"")
+    try:
+        described = repr(_plain(settings))
+    except Exception:
+        described = None
+    return {"format": "inline", "width": int(settings.get("/W", settings.get("/Width", 0)) or 0),
+            "height": int(settings.get("/H", settings.get("/Height", 0)) or 0),
+            "bitsPerComponent": int(settings.get("/BPC", settings.get("/BitsPerComponent", 1)) or 1),
+            "colorSpace": "inline", "byteCount": len(data), "sha256": digest(data), "described": described}
 
 
 def page_images(page) -> list[dict]:
     """Every image a page draws, as stored: its format, size and a hash of its stored bytes. Nothing is decoded.
 
-    Masks and images inside nested drawing objects are included, so a page a
-    scanner split into layers is covered too.
+    Masks, images inside nested drawing objects and images written inline in the
+    page's drawing instructions are included, so a page a scanner split into
+    layers is covered too.
     """
     found: list[dict] = []
 
@@ -142,7 +189,18 @@ def page_images(page) -> list[dict]:
                 visit(nested.get_object() if hasattr(nested, "get_object") else nested, depth + 1)
 
     visit(_resources(page), 0)
+    contents = page.get_contents()
+    if contents is not None:
+        for operands, operator in contents.operations:
+            if operator == b"INLINE IMAGE" and hasattr(operands, "get"):
+                found.append(_inline(operands))
     return found
+
+
+def _draws(page) -> int:
+    """How many times the page draws an image or other object by name."""
+    contents = page.get_contents()
+    return sum(1 for _, operator in contents.operations if operator == b"Do") if contents is not None else 0
 
 
 def describe_source(source_pdf_path: Path) -> str:
@@ -171,6 +229,22 @@ def _fingerprint(images: list[dict]) -> list[tuple[str, int, str]]:
     return sorted((image["format"], image["byteCount"], image["sha256"]) for image in images)
 
 
+def _same_images(before: list[dict], after: list[dict]) -> bool:
+    """Whether a copied page carries exactly the images the scanner wrote.
+
+    The stored bytes must match. So must the description that says how to read
+    them (size, depth, colours, decoding), wherever it could be put plainly on
+    both sides: the same bytes read as a different size or polarity would be a
+    different picture.
+    """
+    if _fingerprint(before) != _fingerprint(after):
+        return False
+    key = lambda image: (image["format"], image["byteCount"], image["sha256"], image.get("described") or "")
+    pairs = zip(sorted(before, key=key), sorted(after, key=key))
+    return all(a.get("described") == b.get("described") for a, b in pairs
+               if a.get("described") is not None and b.get("described") is not None)
+
+
 def comparison_image(page) -> tuple[Image.Image | None, str | None]:
     """The page as one picture, for measuring against Google's page image, or None and why not.
 
@@ -190,17 +264,20 @@ def comparison_image(page) -> tuple[Image.Image | None, str | None]:
         obj = reference.get_object()
         if obj.get("/Subtype") != "/Image" or obj.get("/SMask") or obj.get("/Mask") or obj.get("/ImageMask"):
             return None, "the page isn't a single plain image"
+        if obj.get("/Decode") is not None:
+            return None, "the image has its own decode rule"
         ops = page.get_contents().operations
         if [op for _, op in ops] != [b"q", b"cm", b"Do", b"Q"] or ops[2][0] != [name] or not np.allclose(
                 list(map(float, ops[1][0])), [width, 0, 0, height, 0, 0], rtol=0, atol=1e-6):
             return None, "the image doesn't exactly fill the page"
-        if obj.get("/Filter") == "/DCTDecode":
+        kind = _stored(obj)["format"]
+        if kind == "DCTDecode":
             image = Image.open(io.BytesIO(obj._data))
         else:
             image = page.images[0].image        # pypdf decodes CCITT, Flate and the like
         if image is None or image.size != (obj["/Width"], obj["/Height"]):
             return None, "the image's size and its description disagree"
-        return image, str(obj.get("/Filter")).replace("/", "")
+        return image, kind
     except Exception as error:      # a measure, never a reason to stop
         return None, f"the page image couldn't be decoded here ({type(error).__name__})"
 
@@ -406,6 +483,7 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
     for number, (page, google_page, clockwise) in enumerate(zip(reader.pages, document["pages"], cardinal_clockwise), 1):
         width, height = page_size(page)
         images = page_images(page)
+        draws = _draws(page)
         image, detail = comparison_image(page)
         T, transform_note = google_transform(google_page)
         returned = _returned_size(google_page)
@@ -426,7 +504,7 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
             evidence["rasterMapping"] = how
             evidence["registration"] = registration(image, google_page, T, (iw, ih), detail)
         expected = read_text(document["text"], (google_page.get("layout") or {}).get("textAnchor") or {})
-        records.append({"sourcePage": number, "images": images, "expectedText": expected, "runs": runs,
+        records.append({"sourcePage": number, "images": images, "draws": draws, "expectedText": expected, "runs": runs,
                         "outputSize": output_size, "evidence": {**evidence, "text": stats}})
 
     ordered = [records[n - 1] for n in page_order]
@@ -454,7 +532,7 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
         raise ReviewRequired("Output page count changed")
     checks = []
     for output_number, (page, record) in enumerate(zip(reopened.pages, ordered), 1):
-        if _fingerprint(page_images(page)) != _fingerprint(record["images"]):
+        if not _same_images(record["images"], page_images(page)) or _draws(page) != record["draws"]:
             raise ReviewRequired("A page image was not preserved byte-for-byte")
         if page.rotation != 0 or not np.allclose([float(page.mediabox.width), float(page.mediabox.height)],
                                                  record["outputSize"], atol=1e-8, rtol=0):
