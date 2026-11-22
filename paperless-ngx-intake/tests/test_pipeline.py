@@ -16,7 +16,7 @@ from paperless_intake.service import Service
 from paperless_intake.store import (COMMITTED, DISCARDED, HELD, READY, WAITING, Store)
 
 from fake_paperless import Crash, FakePaperless, RecordingNotifier
-from synth import FONT, FakeGoogle, PageSpec, make_scan, numbered_letter, token_provider
+from synth import FakeGoogle, PageSpec, make_scan, numbered_letter, token_provider
 
 VERSION = ("projects/paperlss-document-pipeline/locations/us/processors/unit/"
            "processorVersions/pretrained-ocr-v2.1-2024-08-07")
@@ -42,7 +42,7 @@ class Harness:
             processor_version=VERSION, physical_mail_tag="Physical Mail", intake_tag="Mail intake", ha_url="http://ha.invalid",
             webhook_started="s", webhook_finished="f", webhook_alert="a", daily_page_cap=200, min_free_mib=0,
             keep_local_copies_days=7, watchdog_minutes=45, capture_dir=self.root / "capture",
-            intake_dir=self.root / "intake", font_path=FONT, tested_paperless_version="3.3.4",
+            intake_dir=self.root / "intake", tested_paperless_version="3.3.4",
             stable_seconds=30, poll_seconds=0,
         )
         values.update(overrides)
@@ -169,24 +169,35 @@ class HoldTests(unittest.TestCase):
         self.assertNotIn("Synthetic", json.dumps(alerts))                       # no document text in alerts
         self.assertIn(("finished", item.sha), h.notifier.sent)
 
-    def test_keep_original_only_commits_version_one_with_the_gap_in_the_note(self):
+    def test_keep_as_it_is_commits_both_versions_with_the_gap_in_the_note(self):
         h = Harness(self)
         h.drop(numbered_letter(3, missing=(3,)))
         h.settle()
         item = h.only_item()
-        h.pipeline.keep_original_only(item)
+        h.pipeline.keep_as_it_is(item)
         self.assertEqual(item.status, READY)
         h.settle()
         item = h.only_item()
-        self.assertEqual(item.status, COMMITTED)
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
         doc = h.paperless.docs[item.state["doc_id"]]
-        self.assertEqual(len(doc["versions"]), 1)
+        self.assertEqual(len(doc["versions"]), 2)          # the searchable copy was already built; it goes in too
         self.assertIn("Jane's choice", doc["notes"][0])
         self.assertIn("page 3 of 3", doc["notes"][0])
         self.assertEqual([kind for kind, _ in h.notifier.sent].count("finished"), 1)
         alerts = [(p["kind"], p["gap"]) for k, p in h.notifier.sent if k == "alert"]
         self.assertEqual([kind for kind, _ in alerts], ["held", "resolved"])   # Home Assistant can clear the hold
         self.assertEqual(alerts[-1][1], "committed")
+
+    def test_keeping_a_scan_held_before_any_copy_commits_the_original_only(self):
+        h = Harness(self)
+        (h.settings.capture_dir / "photo.jpg").write_bytes(b"\xff\xd8\xff not really a pdf")
+        h.service.claim_captures()
+        h.clock.advance(400)
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.state["reason_kind"], "unsupported_file")
+        h.pipeline.keep_as_it_is(item)
+        self.assertEqual(item.state["mode"], "original_only")
 
     def test_discard_moves_the_record_aside(self):
         h = Harness(self)

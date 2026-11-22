@@ -30,7 +30,7 @@ from paperless_intake.service import Service
 from paperless_intake.store import COMMITTED, WAITING, Store
 
 from fake_paperless import RecordingNotifier
-from synth import FONT, FakeGoogle, PageSpec, make_scan, numbered_letter, token_provider
+from synth import FakeGoogle, PageSpec, make_scan, numbered_letter, token_provider
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = tested_paperless_version(ROOT / "rootfs" / "app" / "tested-paperless-version")
@@ -198,7 +198,7 @@ class PaperlessE2E(unittest.TestCase):
             processor_version=PROCESSOR, physical_mail_tag="Physical Mail", intake_tag="Mail intake", ha_url="http://ha.invalid",
             webhook_started="s", webhook_finished="f", webhook_alert="a", daily_page_cap=500, min_free_mib=0,
             keep_local_copies_days=7, watchdog_minutes=45, capture_dir=root / "capture", intake_dir=root / "intake",
-            font_path=FONT, tested_paperless_version=VERSION, stable_seconds=0, poll_seconds=0,
+            tested_paperless_version=VERSION, stable_seconds=0, poll_seconds=0,
         )
         values.update(overrides)
         settings = Settings(**values)
@@ -257,6 +257,40 @@ class PaperlessE2E(unittest.TestCase):
         time.sleep(5)
         self.assertEqual(self.hooks.paths()[before:], [])                        # no Paperless ingest webhooks fire
         self.assertEqual([k for k, _ in notifier.sent], ["started", "finished"])
+
+    def test_a_stack_put_in_flipped_turned_and_askew_reads_back_and_searches(self):
+        """The whole point, against real Paperless: any way the stack goes in, the same document comes out.
+
+        Also the two things version 1.0 held real scans for: a page a degree askew,
+        and text in a script the old text-layer font didn't cover.
+        """
+        settings, store, service, client, notifier = self.harness()
+        marker = "quokkaferry" + uuid.uuid4().hex[:6]
+        korean = "한국어를"
+        pages = [PageSpec([f"Synthetic account statement line {n}.{i} for testing purposes only" for i in range(1, 6)]
+                          + [f"Reference {marker}", f"주의: {korean} 사용하시는 경우 언어 지원 서비스를 무료로 이용하실 수 있습니다"],
+                          footer=f"Page {n} of 3") for n in (1, 2, 3)]
+        scan = make_scan(pages, flipped=True, turn=180, skew=1.3)
+        (settings.capture_dir / "20261122_100000_000600.pdf").write_bytes(scan.pdf)
+        self.run_until_quiet(service)
+        item = store.all()[0]
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(item.state["page_order"], [3, 2, 1])
+        self.assertEqual(item.state["rotations"], [180, 180, 180])
+        doc_id = item.state["doc_id"]
+        document = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
+        self.assertEqual(len(document["versions"]), 2)
+        self.assertIn(marker, document["content"])
+        self.assertIn(korean, document["content"])                               # Paperless pulled the Korean text out
+        self.assertLess(document["content"].index("line 1.1"), document["content"].index("line 3.1"))   # reading order
+        read_back = [e for e in item.events() if e["event"] == "read_back"][0]
+        self.assertFalse(read_back["version_has_archive"])
+        self.assertTrue(read_back["text_match"]["ok"], read_back["text_match"])
+        deadline = time.time() + 60
+        while time.time() < deadline and doc_id not in self.search(marker):
+            time.sleep(2)
+        self.assertIn(doc_id, self.search(marker))
+        self.assertEqual([k for k, _ in notifier.sent], ["started", "finished"])      # nothing for Jane to do
 
     def test_nearly_blank_scan_is_original_only(self):
         settings, store, service, client, _ = self.harness()

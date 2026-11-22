@@ -50,7 +50,6 @@ class Settings:
     watchdog_minutes: int
     capture_dir: Path
     intake_dir: Path
-    font_path: Path
     tested_paperless_version: str
     web_port: int = 8099
     # Only Supervisor's ingress proxy may reach the page in production.
@@ -116,7 +115,6 @@ def load(options_path: Path | None = None) -> Settings:
         watchdog_minutes=int(options.get("watchdog_minutes", 45)),
         capture_dir=Path(os.environ.get("INTAKE_CAPTURE_DIR", "/share/paperless/capture")),
         intake_dir=Path(os.environ.get("INTAKE_DIR", "/share/paperless/intake")),
-        font_path=Path(os.environ.get("INTAKE_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")),
         tested_paperless_version=tested_paperless_version(
             Path(os.environ.get("INTAKE_PIN_FILE", PIN_FILE)),
         ),

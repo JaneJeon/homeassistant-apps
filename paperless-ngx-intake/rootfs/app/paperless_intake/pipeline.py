@@ -1,5 +1,18 @@
 """What happens to one scan: OCR and checks, then commit and read-back.
 
+What can stop a scan, and why only this. A scan is held for Jane when
+something bears on whether the paper can be let go: printed page numbers show
+a page the scan doesn't have, or the file isn't a readable PDF. A lost page can
+only be recovered from the paper, so that question has to be answered first.
+
+Everything else is about the searchable copy: which way up a page is, what
+order the pages go in, where the invisible text sits, whether Google could
+read the scan at all. None of that can lose anything. The original scan goes
+into Paperless byte for byte either way, and a better copy can be made from it
+later. So those are decided as well as the evidence allows, recorded in the
+document's note, and never hold a scan. (Version 1.0 held on all of them, and
+held both of the first two real scans.)
+
 Every step records its state before and after it runs, so a restart resumes
 where it stopped:
 - Google responses are cached per item and attempt, so a restart never pays twice.
@@ -30,7 +43,7 @@ from .docai.errors import ParserError
 from .docai.google_backend import GoogleBackendConfig, GoogleBackendError, GoogleDocumentAIBackend
 from .docai.page_order import plan_page_order
 from .docai.pdf_renderer import ReviewRequired
-from .docai.renderer_adapter import AutomaticSourcePreservedRenderer
+from .docai.renderer_adapter import StackRenderer
 from .docai.validation import assert_unchanged, document_for_renderer, inspect_source, ordered_text, validate_result
 from .notify import Notifier
 from .paperless import Paperless, PaperlessError, PaperlessTaskFailed
@@ -46,9 +59,17 @@ ORIGINAL_ONLY = "original_only"
 ORDER_WORDS = {
     "complete_numbering_in_order": "as scanned, confirmed by the printed page numbers",
     "reorder_from_complete_numbering": "reordered to follow the printed page numbers",
+    "reversed_stack_from_printed_numbers": "reversed, because the printed page numbers that could be read ran "
+                                           "backwards (the stack went in flipped)",
     "partial_in_order": "as scanned; the printed page numbers seen agree",
+    "unverified_mixed_evidence": "as scanned; the printed page numbers disagree about the order, so it is unverified",
+    "unverified_numbers_inconclusive": "as scanned; the printed page numbers that were read don't settle the order",
     "unknown_no_pagination_evidence": "as scanned (no printed page numbers to check)",
 }
+
+# Reasons version 1.0 held a scan for that no longer hold one. Scans still held for
+# them are put back through the checks once, when this version starts.
+OBSOLETE_HOLD_KINDS = {"render_check", "google_rejected", "google_mismatch"}
 
 # Google backend failure codes worth retrying later rather than asking Jane.
 TRANSIENT_GOOGLE = {
@@ -61,6 +82,15 @@ AUTH_GOOGLE = {
     "authentication_refresh_failed_requires_configuration", "authentication_refresh_unavailable",
     "invalid_access_token", "adc_authentication_failed",
 }
+# Failures that belong to this one scan: Google can't take it, and asking again won't help.
+# The original goes into Paperless without a Google copy. Any other refusal (permission,
+# a retired processor version, a damaged local cache) is about the setup, so the scan
+# waits and Jane is told, because every later scan would fail the same way.
+THIS_SCAN_GOOGLE = {
+    "source_exceeds_40000000_bytes_no_cloud_fallback", "response_missing_document",
+    "response_document_validation_failed",
+}
+THIS_SCAN_HTTP = {400, 413, 422}
 
 
 def sha256(data: bytes) -> str:
@@ -93,6 +123,7 @@ class Pipeline:
         self.notifier = notifier
         self.token_provider = token_provider
         self.backend_factory = backend_factory or self._google_backend
+        self.renderer = StackRenderer()
         self.clock = clock
 
     # Dispatch -------------------------------------------------------------------
@@ -123,8 +154,10 @@ class Pipeline:
             self._wait(item, wait)
         except Exception as error:  # never lose an item to a bug: wait, keep evidence, retry
             log.exception("unexpected error on %s", item.sha[:12])
-            self._wait(item, Wait(f"unexpected error ({type(error).__name__})", "unexpected",
-                                  "commit" if item.status in {READY, COMMITTING} else "ocr"))
+            # Alerted once. An error nobody expected is likely to hit every scan the same way,
+            # and retrying it quietly for a day would leave them all outside Paperless unnoticed.
+            self._wait(item, Wait(f"an unexpected error in the app ({type(error).__name__})", "unexpected",
+                                  "commit" if item.status in {READY, COMMITTING} else "ocr", alert=True))
 
     # Stage 1: OCR, searchable copy, checks -------------------------------------------
 
@@ -169,15 +202,22 @@ class Pipeline:
 
         item.event("ocr_started", google_run=item.state.get("google_run", 1))
         work_dir = item.new_work_dir()
-        backend = self.backend_factory(item)
         try:
-            result = backend.process(source, work_dir)
+            # Building the backend checks the app's Google settings, and a bad setting
+            # must be reported the same way as Google refusing a request.
+            result = self.backend_factory(item).process(source, work_dir)
         except GoogleBackendError as error:
             if error.code in TRANSIENT_GOOGLE:
                 raise Wait(f"Google OCR didn't answer ({error.code})", "google", "ocr")
             if error.code in AUTH_GOOGLE:
                 raise Wait(f"Google refused the app's key ({error.code})", "auth", "ocr", alert=True)
-            raise Hold(f"Google couldn't process this scan ({error.code})", "google_rejected")
+            status = getattr(error, "http_status", None)
+            if error.code in THIS_SCAN_GOOGLE or (error.code == "post_http_error_fatal" and status in THIS_SCAN_HTTP):
+                detail = f"{error.code}, HTTP {status}" if status else error.code
+                self._ready_without_google(item, f"Google couldn't read this scan ({detail})")
+                return
+            detail = f"{error.code}, HTTP {status}" if status else error.code
+            raise Wait(f"Google OCR isn't working ({detail})", "google", "ocr", alert=True)
         cache_hits = int(result.provenance.get("cache_hits", 0))
         if cache_hits < len(result.chunks):
             self._count_pages(source.page_count)
@@ -186,23 +226,29 @@ class Pipeline:
             validate_result(result, source)
             document = document_for_renderer(result, source)
         except ParserError as error:
-            raise Hold(f"Google's answer didn't match the scan's pages ({error})", "google_mismatch")
+            self._ready_without_google(item, f"Google's answer didn't match the scan's pages ({error})")
+            return
 
-        plan = plan_page_order(document)
+        plan = self._plan(item, document)
         gap = checks.missing_pages(plan, source.page_count)
-        coverage = checks.coverage(document)
-        if gap:
-            self._write_checks(item, {"plan": plan.to_dict(), "missing_pages": gap, "coverage": coverage})
-            raise Hold(gap, "missing_page")
-
-        renderer = AutomaticSourcePreservedRenderer(font_path=self.settings.font_path)
+        record = {"plan": plan.to_dict(), "missing_pages": gap, "coverage": checks.coverage(document),
+                  "google": {"processor_version": self.settings.processor_version,
+                             "responses": [chunk.response_sha256 for chunk in result.chunks],
+                             "cache_hits": cache_hits}}
         try:
-            rendered = renderer.render(source, result, work_dir, produce_archive=True)
-        except (ReviewRequired, ParserError, ValueError) as error:
-            self._write_checks(item, {"plan": plan.to_dict(), "coverage": coverage, "render_error": str(error)})
-            raise Hold(self._plain_render_error(str(error)), "render_check")
+            rendered = self.renderer.render(source, result, work_dir, plan=plan)
+        except Exception as error:
+            # Whatever went wrong, it went wrong in making the copy. The scan itself is fine and
+            # still goes in. A defect here must never leave a scan stranded outside Paperless.
+            expected = isinstance(error, (ReviewRequired, ParserError, ValueError))
+            log.warning("%s: no searchable copy: %s", item.sha[:12], error, exc_info=not expected)
+            why = str(error) if expected else f"an unexpected {type(error).__name__} in the app"
+            self._ready_without_google(item, f"the searchable copy couldn't be built ({why})",
+                                       checks_record={**record, "render_error": f"{type(error).__name__}: {error}"},
+                                       gap=gap)
+            return
         assert_unchanged(source)
-        order = tuple(rendered.page_order or range(1, source.page_count + 1))
+        order = tuple(rendered.page_order)
         text = ordered_text(result, source, order)
         searchable = rendered.archive_path.read_bytes()
         write_atomic(item.searchable_path, searchable)
@@ -210,42 +256,86 @@ class Pipeline:
 
         mode = ORIGINAL_ONLY if checks.short_text(text) else WITH_GOOGLE
         provenance = rendered.provenance
+        decision = provenance.get("page_order_decision", {})
+        rotations = provenance.get("orientation_decisions") or []
+        notes = list(provenance.get("quality_notes") or [])
         self._write_checks(item, {
-            "plan": plan.to_dict(),
-            "missing_pages": None,
-            "coverage": coverage,
+            **record,
             "render_checks": provenance.get("checks"),
-            "orientation_decisions": provenance.get("orientation_decisions"),
-            "page_order_decision": provenance.get("page_order_decision", {}).get("status"),
-            "google": {
-                "processor_version": self.settings.processor_version,
-                "responses": [chunk.response_sha256 for chunk in result.chunks],
-                "cache_hits": cache_hits,
-            },
+            "render_pages": provenance.get("pages"),
+            "orientation_decisions": rotations,
+            "page_order_decision": decision,
+            "quality_notes": notes,
             "text_sha256": sha256(text.encode("utf-8")),
             "searchable_sha256": sha256(searchable),
             "mode": mode,
         })
-        item.set(READY, mode=mode, page_order=list(order),
-                 order_status=provenance.get("page_order_decision", {}).get("status"),
-                 rotations=list(provenance.get("cardinalClockwiseBySourcePage") or []),
-                 searchable_sha256=sha256(searchable),
-                 short_text=mode == ORIGINAL_ONLY,
-                 waiting_since_unix=None, alerted_reason_kind=None)
+        log.info("%s: order %s (forward votes %s, reverse votes %s); %s", item.sha[:12],
+                 decision.get("status"), decision.get("forwardVotes"), decision.get("reverseVotes"),
+                 "; ".join(notes) or "text layer placed without remarks")
+        log.info("%s: pages as scanned: %s", item.sha[:12], self._page_summary(provenance))
+        fields = dict(mode=mode, page_order=list(order), order_status=decision.get("status"),
+                      rotations=[r.get("appliedCardinalClockwiseDegrees", 0) for r in rotations],
+                      rotations_from_stack=sum(1 for r in rotations if r.get("followedStack")),
+                      quality_notes=notes, no_google_copy_reason=None,
+                      searchable_sha256=sha256(searchable), short_text=mode == ORIGINAL_ONLY,
+                      waiting_since_unix=None, alerted_reason_kind=None)
+        if gap:
+            # The searchable copy is ready, so "keep as it is" can commit both versions.
+            item.state.update(fields)
+            item.save()
+            raise Hold(gap, "missing_page")
+        item.set(READY, **fields)
 
     @staticmethod
-    def _plain_render_error(message: str) -> str:
-        if message.startswith("Page order needs review"):
-            return "the printed page numbers don't give one clear page order"
-        if "registration" in message or "raster" in message or "mapping" in message:
-            return "Google's text couldn't be lined up with the scanned page exactly"
-        if "JPEG" in message or "image" in message.lower() or "Source rotation" in message or "cropped" in message:
-            return "the scan's page format isn't one the app supports (expected one full-page image per page)"
-        if "Font does not cover" in message:
-            return "the scan has characters the app's font can't write into the searchable copy"
-        if "rotation" in message.lower():
-            return "a page is turned at an angle the app won't correct automatically"
-        return f"the searchable copy failed a check ({message})"
+    def _plan(item: Item, document: dict):
+        """The printed page numbers, read as evidence. A failure to read them is no evidence, not a stop."""
+        try:
+            return plan_page_order(document)
+        except Exception as error:
+            log.warning("%s: page numbers couldn't be read as evidence", item.sha[:12], exc_info=True)
+            from .docai.page_order import OrderPlan
+            pages = len(document.get("pages") or [])
+            return OrderPlan(tuple(range(1, pages + 1)), "needs_review", (),
+                             f"Planner failed with {type(error).__name__}; no pagination evidence was used.")
+
+    @staticmethod
+    def _page_summary(provenance: dict) -> str:
+        """One compact entry per source page: turn, where the turn came from, word count, skew, image match.
+
+        Numbers only, never document text. This is what lets a scan's handling be checked from the log.
+        """
+        by_source = {page.get("sourcePage"): page for page in provenance.get("pages") or []}
+        parts = []
+        for decision in provenance.get("orientation_decisions") or []:
+            number = decision.get("sourcePage")
+            page = by_source.get(number, {})
+            match = page.get("registration") or {}
+            text = page.get("text") or {}
+            entry = (f"p{number} turn {decision.get('appliedCardinalClockwiseDegrees')} "
+                     f"({'stack' if decision.get('followedStack') else decision.get('source')}), "
+                     f"{decision.get('words')} words, {text.get('placed', 0)} placed")
+            if text.get("leftOut"):
+                entry += f", {text['leftOut']} left out"
+            if decision.get("skewDegrees") is not None:
+                entry += f", skew {decision['skewDegrees']:+.2f}"
+            if match.get("measured"):
+                entry += f", image match {match['correlation']:.3f}"
+            entry += f", {page.get('rasterMapping', 'no mapping')}"
+            parts.append(entry)
+        return " | ".join(parts)
+
+    def _ready_without_google(self, item: Item, why: str, *, checks_record: dict | None = None,
+                              gap: str | None = None) -> None:
+        """No searchable copy can be made. The original still goes in, and Jane is told once it has."""
+        self._write_checks(item, {**(checks_record or {}), "mode": ORIGINAL_ONLY, "no_google_copy_reason": why})
+        fields = dict(mode=ORIGINAL_ONLY, no_google_copy_reason=why, quality_notes=[], short_text=False,
+                      waiting_since_unix=None, alerted_reason_kind=None)
+        if gap:
+            item.state.update(fields)
+            item.save()
+            raise Hold(gap, "missing_page")
+        item.set(READY, **fields)
 
     def _write_checks(self, item: Item, data: dict) -> None:
         data = {"at": iso(self.clock()), "google_run": item.state.get("google_run", 1), **data}
@@ -304,9 +394,19 @@ class Pipeline:
         try:
             doc_id = self._ensure_original(item, original, tag_ids)
             self._ensure_unowned(item, doc_id)
-            if mode == WITH_GOOGLE:
-                self._ensure_version(item, doc_id)
+            if mode == WITH_GOOGLE and not self._ensure_version(item, doc_id):
+                # The original is already safely in Paperless. A damaged local copy of the
+                # searchable version is a reason to say so, not a reason to hold the scan.
+                mode = ORIGINAL_ONLY
+                item.state.update(mode=ORIGINAL_ONLY,
+                                  no_google_copy_reason="the local searchable copy changed on disk before upload")
+                item.save()
             problems, warnings = self._read_back(item, doc_id, tag_ids, mode)
+            if item.state.get("no_google_copy_reason"):
+                # Not a per-scan nuisance: if this happens, Google's part of the pipeline isn't
+                # working, and silence would let every later scan go in without it.
+                warnings.insert(0, f"it has no Google text or upright copy, because "
+                                   f"{item.state['no_google_copy_reason']}")
             if not problems:
                 self._ensure_note(item, doc_id, mode, warnings)
         except PaperlessTaskFailed as error:
@@ -373,10 +473,11 @@ class Pipeline:
         self.paperless.set_owner(doc_id, None)
         item.event("owner_cleared", doc_id=doc_id)
 
-    def _ensure_version(self, item: Item, doc_id: int) -> None:
+    def _ensure_version(self, item: Item, doc_id: int) -> bool:
+        """Make sure version 2 is in Paperless. False when the local copy can no longer be trusted."""
         wanted = item.state["searchable_sha256"]
         if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
-            return
+            return True
         task_id = item.state.get("version_task")
         if task_id:
             try:
@@ -385,16 +486,20 @@ class Pipeline:
                 item.state["version_task"] = None
                 item.save()
             if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
-                return
-        data = item.searchable_path.read_bytes()
+                return True
+        try:
+            data = item.searchable_path.read_bytes()
+        except OSError:
+            return False
         if sha256(data) != wanted:
-            raise Hold("the local searchable copy changed on disk", "local_integrity")
+            return False
         stem = Path(item.state["original_name"]).stem
         task_id = self.paperless.update_version(doc_id, f"{stem}.searchable.pdf", data, label=self.version_label())
         item.event("uploaded_version", task=task_id)
         item.state["version_task"] = task_id
         item.save()
         self.paperless.wait_for_task(task_id)
+        return True
 
     def _read_back(self, item: Item, doc_id: int, tag_ids: list[int], mode: str) -> tuple[list[str], list[str]]:
         """Problems mean the original isn't safely in Paperless. Warnings concern version 2 only."""
@@ -444,25 +549,42 @@ class Pipeline:
     def _ensure_note(self, item: Item, doc_id: int, mode: str, warnings: list[str]) -> None:
         if item.state.get("note_added"):
             return
-        pages = item.state.get("page_count")
-        lines = [f"Scanned {item.state.get('captured_at')} and checked by paperless-intake {__version__}."]
+        self.paperless.add_note(doc_id, self.note_text(item, mode, warnings))
+        item.state["note_added"] = True
+        item.save()
+
+    def note_text(self, item: Item, mode: str, warnings: list[str]) -> str:
+        """What was decided for this scan and on what evidence, where Jane reads the document."""
+        state = item.state
+        pages = state.get("page_count")
+        lines = [f"Scanned {state.get('captured_at')} and checked by paperless-intake {__version__}."]
         if mode == WITH_GOOGLE:
             processor = self.settings.processor_version.rsplit("/", 1)[-1]
             lines.append(f"Google OCR ({processor}) is version 2; the original scan is version 1.")
-            order = ORDER_WORDS.get(item.state.get("order_status") or "", "as scanned")
+            order = ORDER_WORDS.get(state.get("order_status") or "", "as scanned")
             lines.append(f"Pages: {pages}. Page order: {order}.")
-            rotations = [r for r in item.state.get("rotations") or [] if r]
-            if rotations:
-                lines.append("Some pages were turned upright in the searchable copy.")
-        elif item.state.get("jane_decision") == "keep_original":
-            lines.append(f"Kept as the original only, by Jane's choice. Unresolved: {item.state.get('held_reason')}.")
-        else:
+            turned = sum(1 for turn in state.get("rotations") or [] if turn)
+            if turned:
+                sentence = f"{turned} of {pages} pages were turned upright in version 2"
+                followed = int(state.get("rotations_from_stack") or 0)
+                if followed:
+                    sentence += (f"; {followed} with too little text to judge alone "
+                                 f"{'was' if followed == 1 else 'were'} turned like the rest of the stack")
+                lines.append(sentence + ".")
+            if state.get("quality_notes"):
+                lines.append("Text layer: " + "; ".join(state["quality_notes"]) + ". The page images aren't affected.")
+        elif state.get("no_google_copy_reason"):
+            lines.append(f"Only the original was stored, because {state['no_google_copy_reason']}. "
+                         f"Paperless did its own OCR, and the pages are as the scanner saved them.")
+        elif state.get("short_text"):
             lines.append("Google found almost no text, so only the original was stored and Paperless did its own OCR.")
+        else:
+            lines.append("Only the original was stored.")
+        if state.get("jane_decision") in {"keep", "keep_original"}:      # "keep_original" was 1.0's name for it
+            lines.append(f"Kept as it is, by Jane's choice. Unresolved: {state.get('held_reason')}.")
         if warnings:
             lines.append("Read-back warnings: " + "; ".join(warnings) + ".")
-        self.paperless.add_note(doc_id, " ".join(lines))
-        item.state["note_added"] = True
-        item.save()
+        return " ".join(lines)
 
     def _tidy_after_commit(self, item: Item) -> None:
         """Keep Google's responses without the page images; drop raw responses and scratch."""
@@ -565,10 +687,33 @@ class Pipeline:
 
     # Jane's choices on the Mail intake page ---------------------------------------------
 
-    def keep_original_only(self, item: Item) -> None:
+    def keep_as_it_is(self, item: Item) -> None:
+        """Jane has judged the paper can go with this scan as it stands. Commit what there is.
+
+        A scan held for a missing page already has its searchable copy, so both
+        versions go in. A scan held before any copy could be made goes in as the original only.
+        """
         if item.status != HELD:
-            raise ValueError("only held scans can be kept as the original")
-        item.set(READY, mode=ORIGINAL_ONLY, jane_decision="keep_original")
+            raise ValueError("only held scans can be kept as they are")
+        has_copy = item.searchable_path.exists() and item.state.get("mode") == WITH_GOOGLE
+        item.set(READY, mode=WITH_GOOGLE if has_copy else ORIGINAL_ONLY, jane_decision="keep")
+
+    def requeue_obsolete_holds(self) -> list[str]:
+        """Put scans held for a reason this version no longer holds for back through the checks.
+
+        Version 1.0 held scans over the searchable copy. Their originals have been
+        waiting outside Paperless since. Google's saved answer is reused, so
+        nothing is sent to Google again unless that answer is gone.
+        """
+        requeued = []
+        for item in self.store.all():
+            if item.status == HELD and item.state.get("reason_kind") in OBSOLETE_HOLD_KINDS:
+                item.event("requeued", by=__version__, was_held_for=item.state.get("reason"))
+                item.set(CAPTURED, requeued_by=__version__, waiting_since_unix=None, alerted_reason_kind=None)
+                requeued.append(item.sha)
+                log.info("%s was held by an earlier version (%s); checking it again", item.sha[:12],
+                         item.state.get("held_reason"))
+        return requeued
 
     def can_retry(self, item: Item) -> bool:
         return item.status == WAITING or (item.status == HELD and item.state.get("reason_kind") == "gave_up")

@@ -1,8 +1,13 @@
 """Conservative, pure English-v1 pagination planner.
 
+What this plan is used for (since 1.1): a complete 1..N series is followed
+exactly. Any other outcome, including "needs_review", no longer stops a scan.
+stack.py then reads the series collected here as votes on whether the whole
+stack was flipped, and checks.py reads them for missing pages.
+
 Recognizes Page/Pg n [of m], or a standalone n of m next to a Page/Pg label.
-The complete marker must lie in the top or bottom 20% of the Google page, whose
-page layout must report PAGE_UP when evidence is used. Nearby means an
+The complete marker must lie in the top or bottom 20% of the Google page. A page
+whose layout doesn't report PAGE_UP gets no exact permutation. Nearby means an
 above/left label, at least 50% cross-axis overlap and no
 more than three text-heights of separation. Slash forms are unsupported.
 
@@ -24,6 +29,7 @@ from .validation import anchored_text
 _INLINE = re.compile(r"\b(?:page|pg)\.?\s*:?[ \t]*(?P<number>[0-9]+)(?:\s+of\s+(?P<total>[0-9]+))?(?![\w])", re.I)
 _BARE_OF = re.compile(r"\s*(?P<number>[0-9]+)\s+of\s+(?P<total>[0-9]+)\s*", re.I)
 _LABEL = re.compile(r"\s*(?:page|pg)\.?\s*:?\s*", re.I)
+_REFERS = re.compile(r"\b(?:see|on|to|at|from|in|refer|turn)\s*$", re.I)
 
 
 @dataclass(frozen=True)
@@ -176,13 +182,18 @@ def _marker(source_page: int, node: dict, match, tokens: list[dict], labels: lis
 def _page_markers(page: dict, source_page: int, text: str) -> tuple[list[dict], list[dict]]:
     nodes = [_node(line, page, text, index) for index, line in enumerate(page.get("lines", []))]
     tokens = [_node(token, page, text, index) for index, token in enumerate(page.get("tokens", []))]
-    nodes = [node for node in nodes if node["orientation"] in {None, "PAGE_UP", "ORIENTATION_UNSPECIFIED"}]
+    # Text that runs the same way as its page counts: a page reported upside down still has its
+    # footer in an outer band. Text at an angle to its own page (a sideways stamp) doesn't.
+    upright = {None, "PAGE_UP", "ORIENTATION_UNSPECIFIED", page.get("layout", {}).get("orientation")}
+    nodes = [node for node in nodes if node["orientation"] in upright]
     labels = [node for node in nodes if _LABEL.fullmatch(node["text"]) and _band(node["box"])]
     found, issues = [], []
     for node in nodes:
         if not _band(node["box"]):
             continue
         for match in _INLINE.finditer(node["text"]):
+            if _REFERS.search(node["text"][:match.start()]):
+                continue    # "see page 4", "continued on page 2": a pointer to another page, not this page's number
             if re.match(r"\s*(?:of\b|[/.-]\s*[0-9])", node["text"][match.end():], re.I):
                 issues.append({"kind": "unsupported_marker", "sourcePage": source_page, "lineIndex": node["index"],
                                "reason": "An explicit Page/Pg marker has an unsupported or incomplete denominator/date-like suffix."})

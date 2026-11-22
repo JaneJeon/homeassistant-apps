@@ -34,17 +34,19 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install the font and pinned dependencies
+      # The font draws the synthetic test scans. pdftotext is how Paperless pulls text out of a
+      # PDF, so the in-memory Paperless used by the unit tests pulls it out the same way.
+      - name: Install the test font, pdftotext and pinned dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core poppler-utils
           python -m pip install --require-hashes --no-deps -r rootfs/requirements.txt
 
       - name: Unit tests
         working-directory: paperless-ngx-intake/tests
         env:
           PYTHONPATH: ../rootfs/app:.
-        run: python -m unittest -v test_google_backend test_page_order test_checks_and_web test_pipeline test_worker
+        run: python -m unittest -v test_google_backend test_page_order test_stack test_checks_and_web test_pipeline test_worker
 
       - name: End-to-end tests against stock Paperless at the tested version
         working-directory: paperless-ngx-intake/tests

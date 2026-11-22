@@ -62,6 +62,8 @@ class Page:
         done = [i for i in items if i.status in {COMMITTED, COMMITTED_WARNING}]
         done.sort(key=lambda i: i.state.get("committed_at_unix", 0), reverse=True)
         parts = [f"<main><h1>Mail intake</h1><p class='muted'>Scans are checked here before they go into Paperless. "
+                 f"A scan is held when a page looks missing or the file can't be read, "
+                 f"or after a day of failed tries. "
                  f"Paperless {html.escape(self.settings.tested_paperless_version)} is the tested version. "
                  f"paperless-intake {__version__}.</p>"]
         parts.append("<h2>Held: keep these papers out of the shred tray</h2>")
@@ -93,7 +95,7 @@ class Page:
         gap = html.escape(state.get("reason") or "")
         buttons = [f"<a class='button' href='scan/{sha}' target='_blank' rel='noopener'>View scan</a>"]
         if item.status == HELD:
-            buttons.append(self._form(sha, "keep_original", "Keep original only", primary=False))
+            buttons.append(self._form(sha, "keep", "Keep as it is", primary=False))
             buttons.append(self._form(sha, "discard", "Discard, I'll rescan", primary=False))
         if item.status in {HELD, WAITING} and self.pipeline.can_retry(item):
             buttons.append(self._form(sha, "retry", "Retry now", primary=True))
@@ -111,8 +113,8 @@ class Page:
     def act(self, sha: str, action: str) -> None:
         with self.service.lock:
             item = self.service.store.load(sha)
-            if action == "keep_original":
-                self.pipeline.keep_original_only(item)
+            if action in {"keep", "keep_original"}:        # a page left open from 1.0 still posts the old name
+                self.pipeline.keep_as_it_is(item)
             elif action == "discard":
                 self.pipeline.discard(item)
             elif action == "retry":
@@ -168,7 +170,7 @@ def make_handler(page: Page, allowed_clients: tuple[str, ...]):
         def do_POST(self):
             if not self._allowed():
                 return
-            match = re.fullmatch(r"/action/([0-9a-f]{64})/(keep_original|discard|retry)", self.path)
+            match = re.fullmatch(r"/action/([0-9a-f]{64})/(keep|keep_original|discard|retry)", self.path)
             length = min(int(self.headers.get("Content-Length") or 0), 4096)
             form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
             if not match or form.get("token", [""])[0] != page.token:

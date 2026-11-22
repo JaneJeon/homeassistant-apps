@@ -25,6 +25,40 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(checks.missing_pages(plan, 2),
                          "pages 2 and 3 of 4 are missing (the printed page numbers count to 4; the scan has 2 pages)")
 
+    def test_a_first_page_without_a_number_is_not_a_missing_page(self):
+        # Many letters start numbering at "Page 2 of 3", with no number on the first page.
+        _, plan = plan_for(numbered_letter(3, unnumbered=(1,)))
+        self.assertIsNone(checks.missing_pages(plan, 3))
+
+    def test_any_other_number_missing_holds_even_with_an_unnumbered_page_in_the_scan(self):
+        # The page may be there with its footer unread. Only Jane looking can tell, so it holds.
+        _, plan = plan_for(numbered_letter(4, unnumbered=(3,)))
+        self.assertEqual(checks.missing_pages(plan, 4),
+                         "page 3 of 4 is missing (the printed page numbers count to 4; the scan has 4 pages)")
+
+    def test_a_second_numbered_document_cant_stand_in_for_a_missing_page(self):
+        # Document A lost its page 2 in a double feed. Document B's pages carry their own numbers.
+        scan = make_scan([PageSpec(["Explanation of benefits, first page of three"], footer="Page 1 of 3"),
+                          PageSpec(["Explanation of benefits, last page of three"], footer="Page 3 of 3"),
+                          PageSpec(["A separate notice, first page of two"], footer="Page 1 of 2"),
+                          PageSpec(["A separate notice, last page of two"], footer="Page 2 of 2")])
+        _, plan = plan_for(scan)
+        self.assertIn("page 2 of 3 is missing", checks.missing_pages(plan, 4))
+
+    def test_a_cover_letter_cant_stand_in_for_a_missing_last_page(self):
+        scan = make_scan([PageSpec(["A cover letter with no page number on it at all"]),
+                          PageSpec(["The first page of a two page form"], footer="Page 1 of 2")])
+        _, plan = plan_for(scan)
+        self.assertIn("page 2 of 2 is missing", checks.missing_pages(plan, 2))
+
+    def test_an_unnumbered_insert_doesnt_hide_pages_that_are_really_gone(self):
+        scan = make_scan([PageSpec(["Body text of the first page of this letter"], footer="Page 1 of 4"),
+                          PageSpec(["An insert with no page number printed on it"]),
+                          PageSpec(["Body text of the last page of this letter"], footer="Page 4 of 4")])
+        _, plan = plan_for(scan)
+        self.assertEqual(checks.missing_pages(plan, 3),
+                         "pages 2 and 3 of 4 are missing (the printed page numbers count to 4; the scan has 3 pages)")
+
     def test_complete_numbering_has_no_gap(self):
         _, plan = plan_for(numbered_letter(3))
         self.assertIsNone(checks.missing_pages(plan, 3))
@@ -46,6 +80,11 @@ class CheckTests(unittest.TestCase):
         result = checks.text_matches("one two\nthree four", "three   four one two")
         self.assertTrue(result["ok"])
         self.assertFalse(checks.text_matches("one two three four", "TESSERACT TEXT")["ok"])
+
+    def test_text_matches_sees_words_not_punctuation_spacing(self):
+        self.assertTrue(checks.text_matches("Total: $1,234.56 (due)", "Total : $ 1,234.56 ( due )")["ok"])
+        self.assertFalse(checks.text_matches("statement of account", "statem ent of account")["ok"])
+        self.assertTrue(checks.text_matches("주의: 한국어", "주 의 : 한 국 어")["ok"])
 
 
 class WebTests(unittest.TestCase):
@@ -73,7 +112,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status, 200)
         html = body.decode()
         self.assertIn("page 2 of 3 is missing", html)
-        self.assertIn("Keep original only", html)
+        self.assertIn("Keep as it is", html)
         status, headers, pdf = self.request(port, "GET", f"/scan/{item.sha}")
         self.assertEqual((status, headers["Content-Type"]), (200, "application/pdf"))
         self.assertTrue(pdf.startswith(b"%PDF"))

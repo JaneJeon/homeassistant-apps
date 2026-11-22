@@ -9,6 +9,9 @@ from __future__ import annotations
 import hashlib
 import io
 import itertools
+import shutil
+import subprocess
+import tempfile
 
 from pypdf import PdfReader
 
@@ -55,6 +58,15 @@ class FakePaperless:
 
     @staticmethod
     def _text(data: bytes) -> str:
+        """Pull text out the way Paperless does, with pdftotext -layout, when it is installed."""
+        if shutil.which("pdftotext"):
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+                handle.write(data)
+                handle.flush()
+                done = subprocess.run(["pdftotext", "-q", "-layout", "-enc", "UTF-8", handle.name, "-"],
+                                      capture_output=True, check=False)
+                if done.returncode == 0:
+                    return done.stdout.decode("utf-8", "replace")
         try:
             return "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(data)).pages)
         except Exception:

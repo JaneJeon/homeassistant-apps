@@ -1,10 +1,25 @@
-#!/usr/bin/env python3
-"""Narrow local PDF demonstrator: original JPEG streams plus projected OCR.
+"""Build the searchable copy: the scanner's own page images, turned upright and
+put in reading order, with Google's text laid invisibly on top.
 
-Only one full-page JPEG per source page is supported. Page order and clockwise
-cardinal rotations are explicit inputs. The inferred Google 4MP raster mapping
-must pass geometry AND actual returned-image registration checks. Unsupported
-geometry fails for review; there is no fallback to guessed placement.
+Three things here can damage a document, so they are checked hard. If one
+fails, ReviewRequired is raised and no searchable copy is made:
+
+- every source page appears in the output exactly once;
+- each page's image is the scanner's JPEG, byte for byte;
+- the added text is invisible.
+
+Everything else is about where the invisible text sits. That decides how well
+a search highlight lines up with the printed word, and nothing more: the page
+images are the scanner's either way, and the original scan is stored beside
+this copy. So placement is measured and recorded, and never stops a scan.
+Version 1.0 treated placement as a gate and held the first two real scans it
+saw, one over a character its font lacked and one over image alignment.
+
+How text gets from Google's frame to the page: Google returns each page as an
+upright, deskewed image, with text boxes in that image's frame, plus the
+transform it applied to get there. Inverting that transform takes a box back to
+the scanned page, and the quarter turn chosen for the page takes it to the
+output page.
 """
 from __future__ import annotations
 
@@ -15,61 +30,39 @@ import io
 import json
 import math
 from pathlib import Path
-import re
 import struct
-import unicodedata
 
 import numpy as np
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf.generic import RectangleObject
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas
 
-FONT_NAME = "SourcePreservedOCR"
+from . import glyphless
+
+# Measures recorded with every page. `registration` values are the limits the
+# 1.0 gates used; they are kept as a yardstick, not as gates.
 POLICY = {
-    "minimumImageCorrelation": 0.985,
-    "maximumMeanAbsoluteGrayDifferenceOutOf255": 6.0,
-    "maximumTransformedCanvasEdgeDifferencePixels": 0.5,
-    "maximumTransformedSourceMinimumDifferencePixels": 0.0002,
-    "maximumRotationResidualFromApprovedCardinalDegrees": 0.5,
-    "maximumEncodedTextMatrixDifference": 0.001,
-    "maximumAffineLineCornerErrorPoints": 0.15,
-    "maximumLinePolygonOutsidePagePoints": 0.1,
+    "registrationCorrelationYardstick": 0.985,
+    "registrationMeanAbsoluteGrayDifferenceYardstick": 6.0,
+    "rasterAgreementPixels": 1.5,
+    "wordMatchYardstick": 0.98,
 }
+ORIENTATION_TURNS = {"PAGE_UP": 0, "PAGE_RIGHT": 270, "PAGE_DOWN": 180, "PAGE_LEFT": 90}
 
 
 class ReviewRequired(ValueError):
-    """The narrowly supported geometry or validation contract was not met."""
+    """The searchable copy can't be built safely from this scan."""
 
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def normalized(text: str) -> str:
-    return " ".join(text.split())
-
-
 def anchored(text: str, anchor: dict) -> str:
-    # Standalone default mirrors the package's validated reader. The native
-    # adapter injects its canonical reader through render_document(text_reader=).
-    parts, previous_end, previous_segment_end = [], None, None
-    segments = anchor.get("textSegments", [])
-    if not isinstance(segments, list):
-        raise ReviewRequired("Text anchor segments must be a list")
-    for segment in segments:
-        try:
-            values = (segment.get("startIndex", 0), segment["endIndex"])
-            if any(type(value) is not int and not (isinstance(value, str) and value.isascii() and value.isdecimal()) for value in values):
-                raise ValueError("Non-integer anchor index")
-            start, end = map(int, values)
-        except (AttributeError, KeyError, TypeError, ValueError) as error:
-            raise ReviewRequired("Invalid text anchor indices") from error
-        if not 0 <= start <= end <= len(text) or (previous_segment_end is not None and start < previous_segment_end):
-            raise ReviewRequired("Text anchor is out of bounds, overlapping, or reversed")
-        previous_segment_end = end
+    """Default reader for a Google text anchor. The app passes its validated reader instead."""
+    parts, previous_end = [], None
+    for segment in anchor.get("textSegments", []) or []:
+        start, end = int(segment.get("startIndex", 0)), int(segment["endIndex"])
         if start == end:
             continue
         if previous_end is not None and start > previous_end:
@@ -80,12 +73,8 @@ def anchored(text: str, anchor: dict) -> str:
     return "".join(parts)
 
 
-def only_bidi_difference(expected: str, actual: str) -> bool:
-    strip_rtl = lambda text: "".join(c for c in text if unicodedata.bidirectional(c) not in {"R", "AL", "AN"})
-    return Counter(expected) == Counter(actual) and strip_rtl(expected) == strip_rtl(actual)
-
-
 def source_image(page) -> tuple[bytes, Image.Image]:
+    """The page's one full-page JPEG. Anything else is a scan format this renderer doesn't handle."""
     width, height = float(page.mediabox.width), float(page.mediabox.height)
     if list(page.mediabox) != [0, 0, width, height] or list(page.cropbox) != list(page.mediabox):
         raise ReviewRequired("Nonzero-origin or cropped source page")
@@ -111,8 +100,9 @@ def source_image(page) -> tuple[bytes, Image.Image]:
 
 
 def cardinal_matrix(degrees: int, width: float, height: float) -> tuple[np.ndarray, tuple[float, float]]:
+    """Clockwise quarter turn of a page, as a matrix on PDF points, and the turned page's size."""
     if degrees not in {0, 90, 180, 270}:
-        raise ReviewRequired("Only explicit clockwise cardinal rotations are allowed")
+        raise ReviewRequired("Only clockwise quarter turns are allowed")
     matrices = {
         0: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
         90: [[0, 1, 0], [-1, 0, width], [0, 0, 1]],
@@ -122,118 +112,169 @@ def cardinal_matrix(degrees: int, width: float, height: float) -> tuple[np.ndarr
     return np.array(matrices[degrees], dtype=float), ((height, width) if degrees in {90, 270} else (width, height))
 
 
-def google_rotation_matrix(google_page: dict) -> np.ndarray:
-    """Decode only the unit-scale, orientation-preserving Google transform."""
-    T = np.eye(3)
-    transforms = google_page.get("transforms", [])
+def google_transform(google_page: dict) -> tuple[np.ndarray, str | None]:
+    """The transform Google applied to the page image, or identity with a note when it can't be used."""
+    transforms = google_page.get("transforms") or []
+    if not transforms:
+        return np.eye(3), None
     if len(transforms) > 1:
-        raise ReviewRequired("Multiple Google transforms are not supported")
-    if transforms:
-        item = transforms[0]
+        return np.eye(3), "Google reported more than one transform"
+    item = transforms[0]
+    try:
         if (item["rows"], item["cols"], item["type"]) != (2, 3, 6):
-            raise ReviewRequired("Only 2x3 CV_64F Google transforms are supported")
+            return np.eye(3), "Google's transform isn't a 2x3 matrix of doubles"
+        T = np.eye(3)
         T[:2] = np.array(struct.unpack("<6d", base64.b64decode(item["data"], validate=True))).reshape(2, 3)
-    if not np.isfinite(T).all() or not np.allclose(T[:2, :2].T @ T[:2, :2], np.eye(2), atol=1e-6, rtol=0) or abs(np.linalg.det(T[:2, :2]) - 1) > 1e-6:
-        raise ReviewRequired("Google transform is not a unit-scale rotation")
-    return T
+    except (KeyError, TypeError, ValueError, struct.error):
+        return np.eye(3), "Google's transform couldn't be read"
+    linear = T[:2, :2]
+    if (not np.isfinite(T).all() or not np.allclose(linear.T @ linear, np.eye(2), atol=1e-3, rtol=0)
+            or abs(np.linalg.det(linear) - 1) > 1e-3):
+        return np.eye(3), "Google's transform isn't a plain rotation"
+    return T, None
 
 
-def derive_cardinal_clockwise(google_page: dict) -> tuple[int, dict]:
-    T = google_rotation_matrix(google_page)
-    angle = math.degrees(math.atan2(T[1, 0], T[0, 0]))
-    cardinal = int(round(angle / 90) * 90) % 360
-    residual = (angle - cardinal + 180) % 360 - 180
-    if abs(residual) > POLICY["maximumRotationResidualFromApprovedCardinalDegrees"]:
-        raise ReviewRequired("Google rotation is outside the cardinal residual gate")
-    return cardinal, {"decodedGoogleTransform": T.tolist(), "derivedCardinalClockwiseDegrees": cardinal,
-                      "rotationResidualDegrees": residual, "maximumResidualDegrees": POLICY["maximumRotationResidualFromApprovedCardinalDegrees"]}
+def read_rotation(google_page: dict) -> dict:
+    """Google's own reading of which way up this page is, and how much text it found.
+
+    The transform is the main source: it is the rotation Google applied to make
+    the page upright. Its nearest quarter turn is what the page needs; the rest
+    is the scan's own slight skew, which is kept. With no usable transform, the
+    page layout's orientation label is used.
+    """
+    T, note = google_transform(google_page)
+    words = len(google_page.get("tokens") or []) or len(google_page.get("lines") or [])
+    reading = {"words": words, "transformNote": note}
+    if google_page.get("transforms") and note is None:
+        angle = math.degrees(math.atan2(T[1, 0], T[0, 0]))
+        cardinal = int(round(angle / 90) * 90) % 360
+        reading.update(cardinal=cardinal, source="transform", googleAngleDegrees=angle,
+                       skewDegrees=(angle - cardinal + 180) % 360 - 180)
+        return reading
+    label = (google_page.get("layout") or {}).get("orientation")
+    if label in ORIENTATION_TURNS and label != "PAGE_UP":
+        reading.update(cardinal=ORIENTATION_TURNS[label], source="orientation_label", orientationLabel=label)
+        return reading
+    reading.update(cardinal=0, source="none")
+    return reading
 
 
-def validate_mapping(source_page, image: Image.Image, google_page: dict, clockwise: int) -> tuple[np.ndarray, dict]:
-    width, height = float(source_page.mediabox.width), float(source_page.mediabox.height)
-    returned = google_page["image"]
-    returned_image = Image.open(io.BytesIO(base64.b64decode(returned["content"], validate=True)))
-    if returned_image.size != (returned["width"], returned["height"]):
-        raise ReviewRequired("Returned image dimensions do not match metadata")
-    T = google_rotation_matrix(google_page)
-    transforms = google_page.get("transforms", [])
-    angle = math.degrees(math.atan2(T[1, 0], T[0, 0]))
-    residual = (angle - clockwise + 180) % 360 - 180
-    if abs(residual) > POLICY["maximumRotationResidualFromApprovedCardinalDegrees"]:
-        raise ReviewRequired("Google rotation differs from the explicitly approved cardinal correction")
+def raster_size(T: np.ndarray, returned: tuple[int, int], page_points: tuple[float, float]) -> tuple[float, float, str]:
+    """Size of the page raster Google rotated to make the image it returned.
+
+    The returned image is the box around that raster after rotation, so its
+    size and the rotation angle give the raster's size back. Google's rasters of
+    these scans have been about 4 megapixels; when that guess agrees with the
+    solved size it is used, as in version 1.0. Otherwise the solved size is.
+    """
+    gw, gh = returned
+    cos, sin = abs(float(T[0, 0])), abs(float(T[1, 0]))
+    determinant = cos * cos - sin * sin
+    if abs(determinant) < 0.1:
+        return float(gw), float(gh), "returned_image_size"
+    solved = ((cos * gw - sin * gh) / determinant, (cos * gh - sin * gw) / determinant)
+    if solved[0] <= 0 or solved[1] <= 0:
+        return float(gw), float(gh), "returned_image_size"
+    width, height = page_points
     scale = math.sqrt(4_000_000 / (width * height))
-    iw, ih = math.floor(width * scale), math.floor(height * scale)
-    if not transforms and (iw, ih) != returned_image.size:
-        raise ReviewRequired("Observed image does not support the inferred 4MP PDF raster mapping")
-    corners = np.array([[0, 0, 1], [iw, 0, 1], [iw, ih, 1], [0, ih, 1]])
-    mapped_corners = (T @ corners.T).T[:, :2]
-    minimum_error = float(np.max(np.abs(mapped_corners.min(axis=0))))
-    edge_error = float(np.max(np.abs(mapped_corners.max(axis=0) - returned_image.size)))
-    if minimum_error > POLICY["maximumTransformedSourceMinimumDifferencePixels"] or edge_error > POLICY["maximumTransformedCanvasEdgeDifferencePixels"]:
-        raise ReviewRequired("Returned canvas does not support inferred raster geometry")
-    H = T @ np.diag([iw / image.width, ih / image.height, 1])
-    inverse = np.linalg.inv(H)
-    predicted = image.convert("L").transform(returned_image.size, Image.Transform.AFFINE, tuple(inverse[:2].flatten()), Image.Resampling.BICUBIC, fillcolor=255)
-    factor = min(1, 1000 / max(returned_image.size))
-    compare_size = tuple(round(value * factor) for value in returned_image.size)
-    a = np.asarray(predicted.resize(compare_size, Image.Resampling.LANCZOS), dtype=float)[4:-4, 4:-4]
-    b = np.asarray(returned_image.convert("L").resize(compare_size, Image.Resampling.LANCZOS), dtype=float)[4:-4, 4:-4]
-    correlation = float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
-    mae = float(np.mean(np.abs(a - b)))
-    if not math.isfinite(correlation) or correlation < POLICY["minimumImageCorrelation"] or mae > POLICY["maximumMeanAbsoluteGrayDifferenceOutOf255"]:
-        raise ReviewRequired("Actual source-to-returned-image registration failed; projection needs review")
-    C, output_size = cardinal_matrix(clockwise, width, height)
-    raster_to_source_pdf = np.array([[width / iw, 0, 0], [0, -height / ih, height], [0, 0, 1]])
-    projection = C @ raster_to_source_pdf @ np.linalg.inv(T)
-    evidence = {
-        "originalImagePixels": list(image.size), "sourceMediaBoxPoints": [width, height],
-        "returnedImagePixels": list(returned_image.size), "returnedImageActualFormat": returned_image.format,
-        "inferredPreTransformRasterPixels": [iw, ih], "decodedGoogleTransform": T.tolist(),
-        "googleImageToOutputPdfMatrix": projection.tolist(), "approvedCardinalClockwiseDegrees": clockwise,
-        "retainedOriginalSkewDegrees": residual, "outputMediaBoxPoints": list(output_size),
-        "transformedSourceMinimumErrorPixels": minimum_error, "transformedCanvasEdgeErrorPixels": edge_error,
-        "registrationCorrelationAtMax1000Pixels": correlation, "registrationMeanAbsoluteGrayDifferenceOutOf255": mae,
-        "mappingStatus": "Sample-specific inferred raster mapping passed declared geometry and image-registration gates; not a vendor guarantee",
-    }
-    return projection, evidence
+    guess = (math.floor(width * scale), math.floor(height * scale))
+    if max(abs(guess[0] - solved[0]), abs(guess[1] - solved[1])) <= POLICY["rasterAgreementPixels"]:
+        return float(guess[0]), float(guess[1]), "four_megapixel_raster"
+    return float(solved[0]), float(solved[1]), "solved_from_returned_image"
 
 
-def polygon(layout: dict, google_page: dict, projection: np.ndarray) -> list[list[float]]:
-    box = layout["boundingPoly"]
-    if "normalizedVertices" in box:
-        w, h = google_page["image"]["width"], google_page["image"]["height"]
-        points = [[v.get("x", 0) * w, v.get("y", 0) * h, 1] for v in box["normalizedVertices"]]
-    else:
+def registration(image: Image.Image, google_page: dict, T: np.ndarray, raster: tuple[float, float]) -> dict:
+    """How closely the scan, pushed through the mapping, matches the image Google returned. A measure only."""
+    try:
+        returned = google_page["image"]
+        returned_image = Image.open(io.BytesIO(base64.b64decode(returned["content"], validate=True)))
+        H = T @ np.diag([raster[0] / image.width, raster[1] / image.height, 1])
+        inverse = np.linalg.inv(H)
+        predicted = image.convert("L").transform(returned_image.size, Image.Transform.AFFINE,
+                                                 tuple(inverse[:2].flatten()), Image.Resampling.BICUBIC, fillcolor=255)
+        factor = min(1, 1000 / max(returned_image.size))
+        compare_size = tuple(max(16, round(value * factor)) for value in returned_image.size)
+        a = np.asarray(predicted.resize(compare_size, Image.Resampling.LANCZOS), dtype=float)[4:-4, 4:-4]
+        b = np.asarray(returned_image.convert("L").resize(compare_size, Image.Resampling.LANCZOS), dtype=float)[4:-4, 4:-4]
+        correlation = float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
+        mae = float(np.mean(np.abs(a - b)))
+        if not math.isfinite(correlation):      # a page with no variation, such as a blank one
+            return {"measured": False, "reason": "no variation to compare"}
+        return {"measured": True, "correlation": correlation, "meanAbsoluteGrayDifference": mae,
+                "withinYardstick": correlation >= POLICY["registrationCorrelationYardstick"]
+                and mae <= POLICY["registrationMeanAbsoluteGrayDifferenceYardstick"]}
+    except Exception as error:      # a measure, never a reason to stop
+        return {"measured": False, "reason": type(error).__name__}
+
+
+def _returned_size(google_page: dict) -> tuple[int, int] | None:
+    for key in ("image", "dimension"):
+        block = google_page.get(key) or {}
+        width, height = block.get("width"), block.get("height")
+        if isinstance(width, (int, float)) and isinstance(height, (int, float)) and width > 0 and height > 0:
+            return int(round(width)), int(round(height))
+    return None
+
+
+def polygon(layout: dict, returned: tuple[int, int], projection: np.ndarray) -> list[list[float]] | None:
+    """A text box's four corners on the output page, or None when Google gave no usable box."""
+    box = layout.get("boundingPoly") or {}
+    if box.get("normalizedVertices"):
+        points = [[v.get("x", 0) * returned[0], v.get("y", 0) * returned[1], 1] for v in box["normalizedVertices"]]
+    elif box.get("vertices"):
         points = [[v.get("x", 0), v.get("y", 0), 1] for v in box["vertices"]]
+    else:
+        return None
     if len(points) != 4:
-        raise ReviewRequired("Line must have a four-corner polygon")
-    return (projection @ np.array(points).T).T[:, :2].tolist()
+        return None
+    try:
+        projected = (projection @ np.array(points, dtype=float).T).T[:, :2]
+    except (TypeError, ValueError):
+        return None
+    return projected.tolist() if np.isfinite(projected).all() else None
 
 
-def text_matrix(points: list, text: str) -> tuple[list[float], list[list[float]]]:
-    p0, p1, p2, p3 = np.array(points)
-    u, v = ((p1 - p0) + (p2 - p3)) / 2, ((p0 - p3) + (p1 - p2)) / 2
-    lower_left = np.mean(points, axis=0) - (u + v) / 2
-    advance = pdfmetrics.stringWidth(text.rstrip(), FONT_NAME, 1)
-    ascent, descent = pdfmetrics.getAscentDescent(FONT_NAME, 1)
-    if advance <= 0 or np.linalg.norm(u) <= 0 or np.linalg.norm(v) <= 0:
-        raise ReviewRequired("Degenerate OCR line")
-    a, b = u / advance
-    c, d = v / (ascent - descent)
-    e, f = lower_left - np.array([c, d]) * descent
-    matrix = list(map(float, [a, b, c, d, e, f]))
-    corners = [[a*x + c*y + e, b*x + d*y + f] for x, y in [(0, ascent), (advance, ascent), (advance, descent), (0, descent)]]
-    return matrix, corners
+def _ends_a_word(raw_text: str, node: dict) -> bool:
+    if raw_text[-1:].isspace():
+        return True
+    return (node.get("detectedBreak") or {}).get("type") in {"SPACE", "WIDE_SPACE", "HYPHEN"}
 
 
-def compose(cm, tm):
-    a, b, c, d, e, f = tm
-    A, B, C, D, E, F = cm
-    return [A*a+C*b, B*a+D*b, A*c+C*d, B*c+D*d, A*e+C*f+E, B*e+D*f+F]
+def page_runs(document: dict, google_page: dict, returned: tuple[int, int], projection: np.ndarray,
+              read_text) -> tuple[list[dict], dict]:
+    """One invisible run per word, each stretched over the box Google gave for it.
+
+    Words without a usable box or without text are left out and counted. Lines
+    are used when a page has no word-level results.
+    """
+    level = "tokens" if google_page.get("tokens") else "lines"
+    runs, skipped = [], 0
+    for node in google_page.get(level) or []:
+        layout = node.get("layout") or {}
+        try:
+            raw_text = read_text(document["text"], layout.get("textAnchor") or {})
+        except Exception:
+            skipped += 1
+            continue
+        text = glyphless.clean(raw_text)
+        if not text:
+            continue
+        points = polygon(layout, returned, projection)
+        matrix = glyphless.fit(points, len(text)) if points else None
+        if matrix is None:
+            skipped += 1
+            continue
+        runs.append({"text": glyphless.visual(text) + (" " if _ends_a_word(raw_text, node) else ""),
+                     "matrix": matrix})
+    return runs, {"level": level, "placed": len(runs), "leftOut": skipped}
+
+
+def _words(text: str) -> Counter:
+    return Counter(glyphless.search_words(text))
 
 
 def thumbnail(source_pdf_path: Path, work_dir: Path) -> Path:
-    """Local-only first-page thumbnail, without orientation inference or OCR."""
+    """Local first-page thumbnail, without orientation inference or OCR."""
     _, image = source_image(PdfReader(source_pdf_path).pages[0])
     work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     result = work_dir / "source-thumbnail.webp"
@@ -247,163 +288,149 @@ def thumbnail(source_pdf_path: Path, work_dir: Path) -> Path:
 
 
 def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, page_order: list[int],
-                    cardinal_clockwise: list[int], font_path: Path, prefix: str,
-                    produce_archive: bool = True, allow_bidi_difference_source_pages: tuple[int, ...] = (),
-                    text_reader=None) -> dict:
-    """Return local archive_path, thumbnail_path and provenance; no network IO.
+                    cardinal_clockwise: list[int], prefix: str, text_reader=None) -> dict:
+    """Write the searchable copy and return its path with what was measured. No network use.
 
-    cardinal_clockwise is indexed by SOURCE page. page_order is output-to-source.
-    An explicitly accepted bidi difference is recorded, never silently rewritten.
+    cardinal_clockwise is indexed by SOURCE page. page_order lists source pages in output order.
     """
     original_bytes = source_pdf_path.read_bytes()
     read_text = text_reader or anchored
     source_sha = digest(original_bytes)
     reader = PdfReader(io.BytesIO(original_bytes))
     count = len(reader.pages)
-    if sorted(page_order) != list(range(1, count + 1)) or len(page_order) != count or len(cardinal_clockwise) != count:
-        raise ReviewRequired("Page order must preserve every source page exactly once")
+    if sorted(page_order) != list(range(1, count + 1)) or len(cardinal_clockwise) != count:
+        raise ReviewRequired("Page order must contain every source page exactly once")
     if len(document["pages"]) != count or [p["pageNumber"] for p in document["pages"]] != list(range(1, count + 1)):
         raise ReviewRequired("Response does not exactly match source page numbering/count")
-    font = TTFont(FONT_NAME, str(font_path))
-    pdfmetrics.registerFont(font)
-    if any(not char.isspace() and ord(char) not in font.face.charToGlyph for char in document["text"]):
-        raise ReviewRequired("Font does not cover all OCR characters")
+
     records = []
-    for number, (page, gp, clockwise) in enumerate(zip(reader.pages, document["pages"], cardinal_clockwise), 1):
+    for number, (page, google_page, clockwise) in enumerate(zip(reader.pages, document["pages"], cardinal_clockwise), 1):
         image_bytes, image = source_image(page)
-        projection, evidence = validate_mapping(page, image, gp, clockwise)
-        lines = []
-        for line in gp.get("lines", []):
-            raw_text = read_text(document["text"], line["layout"]["textAnchor"])
-            if not raw_text.strip():
-                raise ReviewRequired("Whitespace-only line cannot be placed")
-            text = re.sub(r"\s", " ", raw_text)
-            points = polygon(line["layout"], gp, projection)
-            matrix, fitted = text_matrix(points, text)
-            affine_error = float(np.linalg.norm(np.array(fitted) - points, axis=1).max())
-            outside = max(float(np.maximum(0, -np.array(points)).max()), float(np.maximum(0, np.array(points) - evidence["outputMediaBoxPoints"]).max()))
-            if affine_error > POLICY["maximumAffineLineCornerErrorPoints"] or outside > POLICY["maximumLinePolygonOutsidePagePoints"]:
-                raise ReviewRequired("Projected line does not fit supported geometry")
-            lines.append({"text": text, "polygon": points, "matrix": matrix, "fittedPolygon": fitted, "affineErrorPoints": affine_error})
-        expected = read_text(document["text"], gp["layout"]["textAnchor"])
-        if normalized("".join(line["text"] for line in lines)) != normalized(expected):
-            raise ReviewRequired("Line anchors do not cover complete page text")
-        records.append({"sourcePage": number, "imageBytes": image_bytes, "expectedText": expected, "lines": lines, "evidence": evidence})
-    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    archive_path = out_dir / f"{prefix}.pdf"
-    thumb_path = out_dir / f"{prefix}-thumbnail.webp"
-    manifest_path = out_dir / f"{prefix}.manifest.json"
-    if any(path.exists() for path in (archive_path, thumb_path, manifest_path)):
-        raise FileExistsError("Output already exists; inspect before replacing")
-    writer = PdfWriter()
+        width, height = float(page.mediabox.width), float(page.mediabox.height)
+        T, transform_note = google_transform(google_page)
+        returned = _returned_size(google_page)
+        C, output_size = cardinal_matrix(clockwise, width, height)
+        evidence = {"sourcePage": number, "appliedCardinalClockwiseDegrees": clockwise,
+                    "sourceMediaBoxPoints": [width, height], "outputMediaBoxPoints": list(output_size),
+                    "transformNote": transform_note}
+        runs, stats = [], {"level": None, "placed": 0, "leftOut": 0}
+        if returned is None:
+            evidence["placement"] = "no text placed: Google gave no page size"
+        else:
+            iw, ih, how = raster_size(T, returned, (width, height))
+            raster_to_source_pdf = np.array([[width / iw, 0, 0], [0, -height / ih, height], [0, 0, 1]])
+            projection = C @ raster_to_source_pdf @ np.linalg.inv(T)
+            runs, stats = page_runs(document, google_page, returned, projection, read_text)
+            evidence["returnedImagePixels"] = list(returned)
+            evidence["rasterPixels"] = [iw, ih]
+            evidence["rasterMapping"] = how
+            evidence["registration"] = registration(image, google_page, T, (iw, ih))
+        expected = read_text(document["text"], (google_page.get("layout") or {}).get("textAnchor") or {})
+        records.append({"sourcePage": number, "imageBytes": image_bytes, "expectedText": expected, "runs": runs,
+                        "outputSize": output_size, "evidence": {**evidence, "text": stats}})
+
     ordered = [records[n - 1] for n in page_order]
-    for record in ordered:
+    text_layer = glyphless.overlay([(record["outputSize"], record["runs"]) for record in ordered])
+    writer = PdfWriter()
+    for record, overlay_page in zip(ordered, text_layer.pages):
         page = writer.add_page(reader.pages[record["sourcePage"] - 1])
         rotation = cardinal_clockwise[record["sourcePage"] - 1]
-        size = record["evidence"]["outputMediaBoxPoints"]
+        size = record["outputSize"]
         if rotation:
-            # Exact cardinal coefficients matter. transfer_rotation_to_content()
-            # produces tiny trig residuals, which changed Poppler resampling in
-            # the inspected cards. This matches a source /Rotate-only reference.
+            # Exact quarter-turn coefficients: no trigonometry, so no resampling drift in viewers.
             C, _ = cardinal_matrix(rotation, float(page.mediabox.width), float(page.mediabox.height))
             page.add_transformation(Transformation((C[0, 0], C[1, 0], C[0, 1], C[1, 1], C[0, 2], C[1, 2])))
             page.mediabox = RectangleObject([0, 0, *size])
             page.cropbox = RectangleObject([0, 0, *size])
-        stream = io.BytesIO()
-        overlay = canvas.Canvas(stream, pagesize=size, pageCompression=1, invariant=1)
-        for line in record["lines"]:
-            text = overlay.beginText()
-            text.setTextRenderMode(3)
-            text.setFont(FONT_NAME, 1)
-            text.setTextTransform(*line["matrix"])
-            text.textOut(line["text"])
-            overlay.drawText(text)
-        overlay.showPage()
-        overlay.save()
-        page.merge_page(PdfReader(io.BytesIO(stream.getvalue())).pages[0])
+        if record["runs"]:
+            page.merge_page(overlay_page)
     buffer = io.BytesIO()
     writer.write(buffer)
     output_bytes = buffer.getvalue()
+
+    # The three hard checks, on the bytes that will be stored.
     reopened = PdfReader(io.BytesIO(output_bytes))
+    if len(reopened.pages) != count:
+        raise ReviewRequired("Output page count changed")
     checks = []
     for output_number, (page, record) in enumerate(zip(reopened.pages, ordered), 1):
-        embedded = [obj.get_object() for obj in page["/Resources"]["/XObject"].values() if obj.get_object().get("/Subtype") == "/Image"]
+        embedded = [obj.get_object() for obj in page["/Resources"]["/XObject"].values()
+                    if obj.get_object().get("/Subtype") == "/Image"]
         if len(embedded) != 1 or embedded[0].get("/Filter") != "/DCTDecode" or embedded[0]._data != record["imageBytes"]:
             raise ReviewRequired("Original JPEG stream was not preserved byte-for-byte")
-        if page.rotation != 0 or not np.allclose([float(page.mediabox.width), float(page.mediabox.height)], record["evidence"]["outputMediaBoxPoints"], atol=1e-8, rtol=0):
+        if page.rotation != 0 or not np.allclose([float(page.mediabox.width), float(page.mediabox.height)],
+                                                 record["outputSize"], atol=1e-8, rtol=0):
             raise ReviewRequired("Output page orientation or size changed unexpectedly")
-        captured = []
-        def visit(text, cm, tm, font, size):
-            if text.strip():
-                matrix = compose(cm, tm)
-                if captured and captured[-1]["matrix"] == matrix and captured[-1]["size"] == size:
-                    captured[-1]["text"] += text
-                else:
-                    captured.append({"text": text, "matrix": matrix, "size": size})
-        actual = normalized(page.extract_text(visitor_text=visit))
-        expected = normalized(record["expectedText"])
-        accepted_bidi = record["sourcePage"] in allow_bidi_difference_source_pages
-        bidi_difference = actual != expected and accepted_bidi and only_bidi_difference(expected, actual)
-        if actual != expected and not bidi_difference:
-            raise ReviewRequired("Extracted page text changed")
-        if len(captured) != len(record["lines"]):
-            raise ReviewRequired("Line run count changed")
-        max_delta = 0.0
-        for run, line in zip(captured, record["lines"]):
-            observed_text, intended_text = normalized(run["text"]), normalized(line["text"])
-            if run["size"] != 1 or (observed_text != intended_text and not (accepted_bidi and only_bidi_difference(intended_text, observed_text))):
-                raise ReviewRequired("Line content or font size changed")
-            max_delta = max(max_delta, max(abs(a-b) for a, b in zip(run["matrix"], line["matrix"])))
-        if max_delta > POLICY["maximumEncodedTextMatrixDifference"]:
-            raise ReviewRequired("Encoded text matrix differs from projected position")
-        modes = [int(args[0]) for args, op in page.get_contents().operations if op == b"Tr"]
-        if not modes or any(mode != 3 for mode in modes):
+        operations = page.get_contents().operations
+        modes = [int(args[0]) for args, op in operations if op == b"Tr"]
+        if record["runs"] and (not modes or any(mode != 3 for mode in modes)):
             raise ReviewRequired("Text is not entirely invisible")
-        checks.append({"outputPage": output_number, "sourcePage": record["sourcePage"], "originalJpegStreamByteIdentical": True,
-                       "lineCount": len(record["lines"]), "maxEncodedTextMatrixDifference": max_delta,
-                       "normalizedTextMatches": actual == expected, "explicitlyAcceptedBidiDifference": bidi_difference,
-                       "expectedTextSha256": digest(expected.encode()), "extractedTextSha256": digest(actual.encode())})
+        # A measure: are the words Google gave for this page the words now stored in the layer?
+        # Read from the stored bytes themselves, so no text extractor's layout guesses come into it.
+        expected, actual = _words(record["expectedText"]), Counter()
+        for args, op in operations:
+            if op == b"Tj":
+                raw = args[0]
+                data = raw.original_bytes if hasattr(raw, "original_bytes") else bytes(raw)
+                stored = data.decode("utf-16-be", "replace").strip()
+                actual.update(glyphless.search_words(glyphless.visual(stored)))
+        total = sum(expected.values())
+        missing = sum((expected - actual).values())
+        checks.append({"outputPage": output_number, "sourcePage": record["sourcePage"],
+                       "originalJpegStreamByteIdentical": True, "wordsExpected": total, "wordsMissingFromLayer": missing,
+                       "wordMatch": round(1 - missing / total, 4) if total else 1.0})
     if digest(source_pdf_path.read_bytes()) != source_sha:
         raise ReviewRequired("Source PDF changed")
-    if produce_archive:
-        with archive_path.open("xb") as stream:
-            stream.write(output_bytes)
-        archive_path.chmod(0o600)
-    first = ordered[0]
-    thumb = Image.open(io.BytesIO(first["imageBytes"])).convert("RGB")
-    rot = cardinal_clockwise[first["sourcePage"] - 1]
-    transpose = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_90}
-    if rot:
-        thumb = thumb.transpose(transpose[rot])
-    thumb.thumbnail((640, 640), Image.Resampling.LANCZOS)
-    thumb.save(thumb_path, "WEBP", quality=90)
-    thumb_path.chmod(0o600)
+
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive_path = out_dir / f"{prefix}.pdf"
+    manifest_path = out_dir / f"{prefix}.manifest.json"
+    if archive_path.exists() or manifest_path.exists():
+        raise FileExistsError("Output already exists; inspect before replacing")
+    with archive_path.open("xb") as stream:
+        stream.write(output_bytes)
+    archive_path.chmod(0o600)
     provenance = {
-        "status": "local_demonstrator_passed_automated_gates_pending_visual_review",
-        "sourcePath": str(source_pdf_path), "sourceSha256": source_sha, "sourceByteCount": len(original_bytes),
-        "archivePath": str(archive_path) if produce_archive else None,
-        "archiveSha256": digest(output_bytes) if produce_archive else None, "archiveByteCount": len(output_bytes) if produce_archive else None,
-        "thumbnailPath": str(thumb_path), "pageMappingOutputToSource": page_order,
-        "cardinalClockwiseBySourcePage": cardinal_clockwise, "sourceUnchangedAfter": True,
+        "sourceSha256": source_sha, "sourceByteCount": len(original_bytes),
+        "archiveSha256": digest(output_bytes), "archiveByteCount": len(output_bytes),
+        "pageMappingOutputToSource": list(page_order),
+        "cardinalClockwiseBySourcePage": list(cardinal_clockwise),
         "policy": POLICY, "checks": checks,
-        "pages": [{"outputPage": index, "sourcePage": record["sourcePage"], "originalJpegSha256": digest(record["imageBytes"]),
-                   **record["evidence"], "lines": [{"textSha256": digest(line["text"].encode()), "polygon": line["polygon"], "fittedPolygon": line["fittedPolygon"],
-                     "matrix": line["matrix"], "affineErrorPoints": line["affineErrorPoints"]} for line in record["lines"]]}
+        "pages": [{"outputPage": index, "originalJpegSha256": digest(record["imageBytes"]), **record["evidence"]}
                   for index, record in enumerate(ordered, 1)],
-        "limitations": [
-            "Single full-page JPEG source pages only; all other source structures fail for review.",
-            "4MP PDF raster scaling is an empirical sample fit checked against returned geometry and actual image registration; not a Google API guarantee.",
-            "Global grayscale registration gates cannot prove every individual glyph or highlight is correct; visual field/edge checks remain necessary.",
-            "Only explicit page ordering and cardinal rotations were applied. Minor original skew is retained.",
-            "Original JPEG bitstreams are preserved; visible rendering still performs ordinary PDF raster sampling.",
-            "Invisible text is placed at line level; within-line word selection is approximate, not token-accurate.",
-            "OCR errors are retained, including explicitly recorded bidi extraction limitations where authorized.",
-            "No live Paperless or cloud writes were performed. This is not a general reliability proof.",
-        ],
     }
     with manifest_path.open("x") as stream:
         json.dump(provenance, stream, indent=2)
         stream.write("\n")
     manifest_path.chmod(0o600)
-    return {"archive_path": archive_path if produce_archive else None, "thumbnail_path": thumb_path,
-            "manifest_path": manifest_path, "provenance": provenance}
+    return {"archive_path": archive_path, "manifest_path": manifest_path, "provenance": provenance}
+
+
+def quality_notes(provenance: dict) -> list[str]:
+    """Plain remarks about the text layer, for the record. None of them concern the page images."""
+    notes = []
+    pages = provenance.get("pages") or []
+    left_out = sum((page.get("text") or {}).get("leftOut", 0) for page in pages)
+    if left_out:
+        notes.append(f"{left_out} word{'' if left_out == 1 else 's'} had no usable position and "
+                     f"{'was' if left_out == 1 else 'were'} left out of the text layer")
+    unplaced = [page["outputPage"] for page in pages if "placement" in page]
+    if unplaced:
+        notes.append(f"no text could be placed on page{'' if len(unplaced) == 1 else 's'} "
+                     f"{', '.join(map(str, unplaced))}")
+    off = [page["outputPage"] for page in pages
+           if (page.get("registration") or {}).get("measured") and not page["registration"]["withinYardstick"]]
+    if off:
+        notes.append(f"the text position on page{'' if len(off) == 1 else 's'} {', '.join(map(str, off))} "
+                     f"couldn't be confirmed against Google's page image, so highlights there may sit slightly off")
+    odd = [page["outputPage"] for page in pages if page.get("transformNote")]
+    if odd:
+        notes.append(f"Google's rotation data for page{'' if len(odd) == 1 else 's'} {', '.join(map(str, odd))} "
+                     f"couldn't be used, so {'that page' if len(odd) == 1 else 'those pages'} may not be upright "
+                     f"and the text there may be out of place")
+    low = [check["outputPage"] for check in provenance.get("checks") or []
+           if check["wordsExpected"] and check["wordMatch"] < POLICY["wordMatchYardstick"]]
+    if low:
+        notes.append(f"some of Google's words on page{'' if len(low) == 1 else 's'} {', '.join(map(str, low))} "
+                     f"didn't read back out of the text layer")
+    return notes
