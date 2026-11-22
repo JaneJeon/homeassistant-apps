@@ -16,7 +16,7 @@ from paperless_intake.store import WAITING
 from paperless_intake.wiring import build
 
 from fake_paperless import RecordingNotifier
-from synth import FONT, numbered_letter
+from synth import numbered_letter
 
 APP = Path(__file__).resolve().parent.parent / "rootfs" / "app"
 
@@ -31,7 +31,7 @@ class WorkerProcessTest(unittest.TestCase):
                                        "google_service_account": "-", "ha_url": "http://127.0.0.1:9",
                                        "webhook_alert": "a"}))
         self.env = dict(os.environ, INTAKE_OPTIONS=str(options), INTAKE_CAPTURE_DIR=str(self.root / "capture"),
-                        INTAKE_DIR=str(self.root / "intake"), INTAKE_FONT=str(FONT), INTAKE_STABLE_SECONDS="0",
+                        INTAKE_DIR=str(self.root / "intake"), INTAKE_STABLE_SECONDS="0",
                         PYTHONPATH=str(APP))
         saved = dict(os.environ)
         os.environ.update(self.env)

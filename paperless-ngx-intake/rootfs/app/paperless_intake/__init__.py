@@ -1,3 +1,3 @@
 """paperless-intake: check scans and commit them into stock Paperless-ngx."""
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"

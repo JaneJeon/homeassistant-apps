@@ -25,6 +25,21 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(checks.missing_pages(plan, 2),
                          "pages 2 and 3 of 4 are missing (the printed page numbers count to 4; the scan has 2 pages)")
 
+    def test_an_unread_page_number_is_not_a_missing_page(self):
+        # Shaped like Jane's document 34: every sheet is there, one footer wasn't read.
+        _, plan = plan_for(numbered_letter(4, unnumbered=(3,)))
+        self.assertIsNone(checks.missing_pages(plan, 4))
+
+    def test_an_unnumbered_insert_doesnt_hide_a_page_that_is_really_gone(self):
+        # Pages 1 and 4 of 4, plus one page with no number: at most one of 2 and 3 can be there.
+        scan = make_scan([PageSpec(["Body text of the first page of this letter"], footer="Page 1 of 4"),
+                          PageSpec(["An insert with no page number printed on it"]),
+                          PageSpec(["Body text of the last page of this letter"], footer="Page 4 of 4")])
+        _, plan = plan_for(scan)
+        self.assertEqual(checks.missing_pages(plan, 3),
+                         "at least 1 of pages 2 and 3 of 4 is missing (the scan has 3 pages, "
+                         "1 without a readable page number)")
+
     def test_complete_numbering_has_no_gap(self):
         _, plan = plan_for(numbered_letter(3))
         self.assertIsNone(checks.missing_pages(plan, 3))
@@ -46,6 +61,11 @@ class CheckTests(unittest.TestCase):
         result = checks.text_matches("one two\nthree four", "three   four one two")
         self.assertTrue(result["ok"])
         self.assertFalse(checks.text_matches("one two three four", "TESSERACT TEXT")["ok"])
+
+    def test_text_matches_sees_words_not_punctuation_spacing(self):
+        self.assertTrue(checks.text_matches("Total: $1,234.56 (due)", "Total : $ 1,234.56 ( due )")["ok"])
+        self.assertFalse(checks.text_matches("statement of account", "statem ent of account")["ok"])
+        self.assertTrue(checks.text_matches("주의: 한국어", "주 의 : 한 국 어")["ok"])
 
 
 class WebTests(unittest.TestCase):
@@ -73,7 +93,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status, 200)
         html = body.decode()
         self.assertIn("page 2 of 3 is missing", html)
-        self.assertIn("Keep original only", html)
+        self.assertIn("Keep as it is", html)
         status, headers, pdf = self.request(port, "GET", f"/scan/{item.sha}")
         self.assertEqual((status, headers["Content-Type"]), (200, "application/pdf"))
         self.assertTrue(pdf.startswith(b"%PDF"))

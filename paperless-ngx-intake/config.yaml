@@ -1,7 +1,7 @@
 name: Paperless Intake
-version: "1.0.1"
+version: "1.1.0"
 slug: paperless-intake
-description: Checks scans with Google OCR before committing them into Paperless-ngx
+description: Turns scans upright and into reading order with Google OCR, then commits them into Paperless-ngx
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/paperless-ngx-intake
 arch:
   - aarch64

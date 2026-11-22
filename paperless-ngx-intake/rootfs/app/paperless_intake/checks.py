@@ -1,7 +1,8 @@
 """Checks added on top of the October validation and renderer gates.
 
 - missing_pages: printed page numbers that reveal a page the scan doesn't have.
-  This one holds the scan.
+  This is the one check that holds a scan: a lost page can only be recovered
+  from the paper.
 - coverage: visible ink on a page that no OCR line accounts for. Measured and
   recorded only; it is not a gate yet (see the design doc for why).
 - short_text: whether Paperless would throw away Google's text and re-OCR.
@@ -15,6 +16,8 @@ import io
 import unicodedata
 from collections import Counter
 
+from .docai import glyphless
+
 # Paperless 3.3.4 treats normalized text of 50 characters or fewer as "no text"
 # (PDF_TEXT_MIN_LENGTH in paperless/parsers/utils.py) and re-OCRs it. We stay
 # well clear of that line because Paperless measures its own extraction, not ours.
@@ -26,11 +29,18 @@ def _series(plan) -> list[dict]:
 
 
 def missing_pages(plan, page_count: int) -> str | None:
-    """Return a plain description of the gap, or None when nothing is missing.
+    """Return a plain description of pages the scan can't contain, or None.
 
-    With a printed total ("2 of 3"), every number from 1 to the total must be
+    With a printed total ("2 of 3"), every number from 1 to the total should be
     present. Without a total, only gaps between the lowest and highest printed
     numbers count, because an excerpt may legitimately start at page 5.
+
+    A printed number Google didn't read looks the same as a page that isn't
+    there. Only the page count can tell them apart: every scanned page without
+    a clean number from the series could be carrying one of the unread numbers.
+    So a scan is short only by the numbers left over after those pages are
+    counted. (Jane's document 34 is the real case: eight pages, a series "of 7"
+    with page 4 unread and one unnumbered insert. All of its paper was there.)
     """
     gaps = []
     for series in _series(plan):
@@ -40,19 +50,29 @@ def missing_pages(plan, page_count: int) -> str | None:
             continue
         total = series.get("total")
         if total is not None:
-            expected = set(range(1, int(total) + 1))
-            missing = sorted(expected - set(numbers))
-            if missing:
-                gaps.append(f"{'page' if len(missing) == 1 else 'pages'} {_list(missing)} of {total} "
-                            f"{'is' if len(missing) == 1 else 'are'} missing "
-                            f"(the printed page numbers count to {total}; the scan has {page_count} "
-                            f"page{'' if page_count == 1 else 's'})")
-            elif int(total) > page_count:
-                gaps.append(f"the printed page numbers say {total} pages, but the scan has {page_count}")
+            missing = sorted(set(range(1, int(total) + 1)) - set(numbers))
         else:
             missing = sorted(set(range(numbers[0], numbers[-1] + 1)) - set(numbers))
-            if missing:
-                gaps.append(f"the printed page numbers skip {'page' if len(missing) == 1 else 'pages'} {_list(missing)}")
+        if not missing:
+            continue
+        without_number = page_count - len({int(page) for page, _ in pairs})
+        absent = len(missing) - without_number
+        if absent <= 0:
+            continue
+        pages = "page" if page_count == 1 else "pages"
+        if total is not None and not without_number:
+            gaps.append(f"{'page' if len(missing) == 1 else 'pages'} {_list(missing)} of {total} "
+                        f"{'is' if len(missing) == 1 else 'are'} missing "
+                        f"(the printed page numbers count to {total}; the scan has {page_count} {pages})")
+        elif total is not None:
+            gaps.append(f"at least {absent} of pages {_list(missing)} of {total} "
+                        f"{'is' if absent == 1 else 'are'} missing (the scan has {page_count} {pages}, "
+                        f"{without_number} without a readable page number)")
+        elif not without_number:
+            gaps.append(f"the printed page numbers skip {'page' if len(missing) == 1 else 'pages'} {_list(missing)}")
+        else:
+            gaps.append(f"the printed page numbers skip {_list(missing)}, and the scan is at least "
+                        f"{absent} page{'' if absent == 1 else 's'} short of covering them")
     if not gaps:
         return None
     return "; ".join(dict.fromkeys(gaps))
@@ -119,14 +139,19 @@ def normalized_words(text: str) -> list[str]:
     return unicodedata.normalize("NFKC", text or "").split()
 
 
+def search_words(text: str) -> list[str]:
+    return glyphless.search_words(text)
+
+
 def short_text(text: str) -> bool:
     return len(" ".join(normalized_words(text))) <= SHORT_TEXT_LIMIT
 
 
 def text_matches(google_text: str, paperless_text: str, *, tolerance: float = 0.02) -> dict:
-    """Compare as bags of words: order differs because Paperless extracts by layout."""
-    expected = Counter(normalized_words(google_text))
-    actual = Counter(normalized_words(paperless_text))
+    """Compare as bags of searchable words: order differs because Paperless extracts by layout,
+    and punctuation may attach differently, but a search sees neither."""
+    expected = Counter(search_words(google_text))
+    actual = Counter(search_words(paperless_text))
     total = sum(expected.values())
     missing = sum((expected - actual).values())
     extra = sum((actual - expected).values())

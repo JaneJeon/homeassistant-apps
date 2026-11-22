@@ -24,11 +24,11 @@ def main() -> int:
         return 1
     for folder in (settings.capture_dir, settings.intake_dir, settings.items_dir):
         folder.mkdir(parents=True, exist_ok=True)
-    if not settings.font_path.exists():
-        log.error("font not found at %s", settings.font_path)
-        return 1
 
     app = build(settings, announce=True)
+    requeued = app.pipeline.requeue_obsolete_holds()
+    if requeued:
+        log.info("checking %d scan(s) again that an earlier version held", len(requeued))
     # Each scan's work runs in a child process, so its memory goes back when it's done.
     service = Service(settings, app.store, app.pipeline, app.notifier, runner=SubprocessRunner())
     server = serve(Page(service, app.pipeline, settings), settings.web_port, settings.web_allowed_clients)
