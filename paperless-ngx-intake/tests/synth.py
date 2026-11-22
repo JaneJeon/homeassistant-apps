@@ -60,6 +60,7 @@ class Scan:
     report: str = "transform"                               # how the fake Google reports a turned page
     google_image: str = "faithful"                          # "inverted": Google's page image doesn't match
     line_labels: str = "as_page"                            # how Google labels a turned page's lines and the page
+    touching: bool = False                                  # Google's boxes for neighbouring words touch
 
     @property
     def sha256(self) -> str:
@@ -206,7 +207,7 @@ def _as_scanned(upright_jpeg: bytes, turn: int, skew: float) -> bytes:
 def make_scan(pages: list[PageSpec], *, scale: float = 1.0, turn: int = 0, flipped: bool = False,
               skew: float = 0.0, turns: list[int] | None = None, report: str = "transform",
               google_image: str = "faithful", encodings: list[str] | None = None,
-              line_labels: str = "as_page") -> Scan:
+              line_labels: str = "as_page", touching: bool = False) -> Scan:
     """A scan of `pages`, given in reading order.
 
     turn: the whole stack went in turned, so every page needs this clockwise quarter turn (180 = head to foot).
@@ -228,7 +229,7 @@ def make_scan(pages: list[PageSpec], *, scale: float = 1.0, turn: int = 0, flipp
         boxes.append(placed)
     size = (round(PIXELS[0] * scale), round(PIXELS[1] * scale))
     scan = Scan(_pdf(images, page_encodings), specs, images, boxes, size, page_turns, skew, report, google_image,
-                line_labels)
+                line_labels, touching)
     _REGISTRY[scan.sha256] = scan
     return scan
 
@@ -336,10 +337,15 @@ def google_response(scan: Scan, page_numbers: list[int]) -> dict:
         for line_text, box, words in scan.boxes[number - 1]:
             line_start = len(text)
             cursor = len(text)
+            if scan.touching:       # each box runs on to where the next word starts, as padded boxes do
+                words = [(word, (box[0], box[1], nxt[1][0] if nxt else box[2], box[3]))
+                         for (word, box), nxt in zip(words, [*words[1:], None])]
             for word, word_box in words:
                 tokens.append({"layout": {"textAnchor": _anchor(cursor, cursor + len(word)),
                                           "boundingPoly": _box(scan, source.size, turn, raster, T, canvas, word_box),
                                           "confidence": 0.99, "orientation": line_orientation}})
+                if scan.touching:   # as Google marks a word that a space follows
+                    tokens[-1]["detectedBreak"] = {"type": "SPACE"}
                 cursor += len(word) + 1
             text += line_text + "\n"
             lines.append({"layout": {"textAnchor": _anchor(line_start, len(text)),

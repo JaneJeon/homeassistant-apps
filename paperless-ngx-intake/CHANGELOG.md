@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.3
+
+Version 1.1.2 put both real scans into Paperless upright and in page order. Both came with a warning that about one word in twenty was missing from Paperless's search text.
+
+- **Neighbouring words no longer run together in Paperless's text.** Paperless reads the text with pdftotext, which ignores a space character and decides where words end by the gap it measures. Google's boxes for neighbouring words often touch, and then two words came out as one ("En Español" as "EnEspañol"). Each word that a space follows now keeps a space cell inside its own box, as Tesseract's PDF output does.
+- **A stored copy that Paperless couldn't read all the words of is built again** by the next version of the app, once, and added to the same document as a newer version with a second note. The earlier warning is closed if the new copy reads back well. If the try fails, everything recorded about the stored copy is put back.
+
 ## 1.1.2
 
 Version 1.1.1 put both waiting real scans through. Looking at the results showed four more things.
