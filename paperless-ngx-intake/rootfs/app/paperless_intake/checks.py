@@ -50,19 +50,23 @@ def missing_pages(plan, page_count: int) -> str | None:
     unnumbered_pages = page_count - len(numbered)
     # One document can print its page numbers at the top of some pages and the bottom of
     # others (a statement with inserts does). The planner keeps those apart, by band. For
-    # this check they are one series: a number counts as present wherever on a page it is.
-    with_total: dict[int, set[int]] = {}
-    without_total: list[set[int]] = []
+    # this check they are one series when they count to the same total and no number is
+    # printed in both places. A number printed in both places means two documents, each
+    # of which has to be complete by itself.
+    series_found: list[tuple[int | None, set[int]]] = []
     for series in _series(plan):
         numbers = {int(number) for _, number in series.get("sourcePageNumberPairs") or []}
         if not numbers:
             continue
-        if series.get("total") is not None:
-            with_total.setdefault(int(series["total"]), set()).update(numbers)
+        total = int(series["total"]) if series.get("total") is not None else None
+        same = next((found for other, found in series_found
+                     if total is not None and other == total and not (found & numbers)), None)
+        if same is not None:
+            same.update(numbers)
         else:
-            without_total.append(numbers)
+            series_found.append((total, numbers))
     gaps = []
-    for total, found in [*with_total.items(), *((None, numbers) for numbers in without_total)]:
+    for total, found in series_found:
         numbers = sorted(found)
         if total is not None:
             missing = sorted(set(range(1, total + 1)) - found)

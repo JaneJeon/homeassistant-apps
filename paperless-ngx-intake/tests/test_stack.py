@@ -493,6 +493,13 @@ class WhatTheFirstRealScansShowedTests(unittest.TestCase):
         _, plan = plan_for(make_scan(pages))
         self.assertIn("page 4 of 6 is missing", checks.missing_pages(plan, 5))
 
+    def test_two_documents_that_count_to_the_same_total_are_each_checked_by_themselves(self):
+        # Document A numbers its three pages at the top. Document B numbers at the bottom and lost its page 2.
+        pages = [PageSpec([f"Page {n} of 3"] + ["First document, with enough words on the page to count"] * 3) for n in (1, 2, 3)]
+        pages += [PageSpec(["Second document, with enough words on the page to count"] * 3, footer=f"Page {n} of 3") for n in (1, 3)]
+        _, plan = plan_for(make_scan(pages))
+        self.assertIn("page 2 of 3 is missing", checks.missing_pages(plan, 5))
+
     def test_a_scan_that_hasnt_finished_going_in_is_prepared_again_by_a_new_version(self):
         # Both real scans were waiting on Paperless when the fix for their page order was ready.
         h = Harness(self)
@@ -643,7 +650,7 @@ class RebuildTheCopyTests(unittest.TestCase):
         self.assertEqual(item.state["rotations"], [180] * 3)
         self.assertEqual(len(doc["notes"]), 2)
         self.assertIn("Only the original was stored", doc["notes"][0])
-        self.assertIn("Version 2 was added after the document was first stored", doc["notes"][1])
+        self.assertIn("The searchable copy was added after the document was first stored", doc["notes"][1])
         # The warning Jane got about this scan is closed.
         self.assertEqual(alert_kinds(h), ["warning", "resolved"])
 
@@ -825,7 +832,7 @@ class RebuildTheCopyTests(unittest.TestCase):
         doc = h.paperless.docs[item.state["doc_id"]]
         self.assertEqual((len(h.paperless.docs), len(doc["versions"]), len(doc["notes"])), (1, 2, 2))
         self.assertIn("Only the original was stored", doc["notes"][0])
-        self.assertIn("Version 2 was added after the document was first stored", doc["notes"][1])
+        self.assertIn("The searchable copy was added after the document was first stored", doc["notes"][1])
 
     def test_what_jane_changed_on_the_document_since_is_left_alone(self):
         h, item = self.committed_without_a_copy()
@@ -849,6 +856,33 @@ class RebuildTheCopyTests(unittest.TestCase):
         item = h.only_item()
         self.assertEqual(item.status, COMMITTED_WARNING)
         self.assertEqual(alert_kinds(h), ["warning"])
+
+    def test_an_unfinished_try_on_a_stored_document_is_still_that_after_another_update(self):
+        # The app was updated again while it was part way through adding a copy to a document
+        # that has been in Paperless for a while. Jane's owner and tags on it are still hers.
+        from fake_paperless import Crash
+        h, item = self.committed_without_a_copy()
+        doc = h.paperless.docs[item.state["doc_id"]]
+        h.paperless.crash_after.add("update_version")
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        item = h.only_item()
+        h.pipeline.prepare(item)
+        with self.assertRaises(Crash):                                      # the app dies part way through
+            h.pipeline.commit(item)
+        self.assertEqual(item.status, "committing")
+        doc["owner"] = 42
+        doc["tags"] = [tag for tag in doc["tags"] if tag != h.paperless.tags["Mail intake"]]
+        item.state["prepared_by"] = item.state["copy_retry_by"] = "an-earlier-version"
+        item.save()
+        h.build()
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(doc["owner"], 42)
+        self.assertEqual(len(doc["notes"]), 2)
+        self.assertIn("The searchable copy was added after the document was first stored", doc["notes"][1])
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
 
     def test_a_document_jane_deleted_is_tried_three_times_at_most_and_never_said_anything_about(self):
         h, item = self.committed_without_a_copy()
