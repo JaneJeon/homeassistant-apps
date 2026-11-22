@@ -59,6 +59,7 @@ class Scan:
     skew: float = 0.0                                       # feed skew in degrees, which Google removes
     report: str = "transform"                               # how the fake Google reports a turned page
     google_image: str = "faithful"                          # "inverted": Google's page image doesn't match
+    line_labels: str = "as_page"                            # how Google labels a turned page's lines and the page
 
     @property
     def sha256(self) -> str:
@@ -204,7 +205,8 @@ def _as_scanned(upright_jpeg: bytes, turn: int, skew: float) -> bytes:
 
 def make_scan(pages: list[PageSpec], *, scale: float = 1.0, turn: int = 0, flipped: bool = False,
               skew: float = 0.0, turns: list[int] | None = None, report: str = "transform",
-              google_image: str = "faithful", encodings: list[str] | None = None) -> Scan:
+              google_image: str = "faithful", encodings: list[str] | None = None,
+              line_labels: str = "as_page") -> Scan:
     """A scan of `pages`, given in reading order.
 
     turn: the whole stack went in turned, so every page needs this clockwise quarter turn (180 = head to foot).
@@ -225,7 +227,8 @@ def make_scan(pages: list[PageSpec], *, scale: float = 1.0, turn: int = 0, flipp
         images.append(_as_scanned(data, page_turn, skew))
         boxes.append(placed)
     size = (round(PIXELS[0] * scale), round(PIXELS[1] * scale))
-    scan = Scan(_pdf(images, page_encodings), specs, images, boxes, size, page_turns, skew, report, google_image)
+    scan = Scan(_pdf(images, page_encodings), specs, images, boxes, size, page_turns, skew, report, google_image,
+                line_labels)
     _REGISTRY[scan.sha256] = scan
     return scan
 
@@ -321,6 +324,10 @@ def google_response(scan: Scan, page_numbers: list[int]) -> dict:
             returned = Image.eval(returned.convert("L"), lambda value: 255 - value)
         canvas = returned.size
         orientation = "PAGE_UP" if scan.report == "transform" else LABELS[turn]
+        # On a real turned page Google's label for the lines and its label for the page disagreed.
+        # Which way round isn't known from here, so the fake can do either.
+        line_orientation = LABELS[turn] if scan.line_labels == "as_scanned" else orientation
+        page_orientation = LABELS[turn] if scan.line_labels == "page_as_scanned" else orientation
         spec = scan.pages[number - 1]
         buffer = io.BytesIO()
         returned.save(buffer, "PNG")
@@ -332,19 +339,19 @@ def google_response(scan: Scan, page_numbers: list[int]) -> dict:
             for word, word_box in words:
                 tokens.append({"layout": {"textAnchor": _anchor(cursor, cursor + len(word)),
                                           "boundingPoly": _box(scan, source.size, turn, raster, T, canvas, word_box),
-                                          "confidence": 0.99, "orientation": orientation}})
+                                          "confidence": 0.99, "orientation": line_orientation}})
                 cursor += len(word) + 1
             text += line_text + "\n"
             lines.append({"layout": {"textAnchor": _anchor(line_start, len(text)),
                                      "boundingPoly": _box(scan, source.size, turn, raster, T, canvas, box),
-                                     "confidence": 0.99, "orientation": orientation}})
+                                     "confidence": 0.99, "orientation": line_orientation}})
         page = {
             "pageNumber": number,
             "dimension": {"width": canvas[0], "height": canvas[1], "unit": "pixels"},
             "layout": {"textAnchor": _anchor(page_start, len(text)) if len(text) > page_start else {},
                        "boundingPoly": {"normalizedVertices": [{"x": 0, "y": 0}, {"x": 1, "y": 0},
                                                                {"x": 1, "y": 1}, {"x": 0, "y": 1}]},
-                       "orientation": orientation, "confidence": 0.99},
+                       "orientation": page_orientation, "confidence": 0.99},
             "lines": lines,
             "tokens": tokens,
             "image": {"content": base64.b64encode(buffer.getvalue()).decode(), "mimeType": "image/png",

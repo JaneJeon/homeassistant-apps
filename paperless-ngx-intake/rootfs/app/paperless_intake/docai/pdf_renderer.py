@@ -47,12 +47,15 @@ from pypdf.generic import RectangleObject
 
 from . import glyphless
 
-# Measures recorded with every page. `registration` values are the limits the
-# 1.0 gates used; they are kept as a yardstick, not as gates. They were set on
-# JPEG pages, so only JPEG pages are remarked on against them. Other formats
-# are measured and recorded without a remark.
+# Measures recorded with every page. The two `registration...Yardstick` values are
+# the limits the 1.0 gates used. They are recorded against, and nothing more: on the
+# first real scans, pages whose text sat exactly on the printed words (checked by eye
+# in Paperless) scored 0.83 to 0.999, so 0.985 says nothing about placement. A remark
+# is made only below `registrationCorrelationRemark`, which is where a page would
+# land if the mapping were plainly wrong (turned the wrong way scores near zero).
 POLICY = {
     "registrationCorrelationYardstick": 0.985,
+    "registrationCorrelationRemark": 0.6,
     "registrationMeanAbsoluteGrayDifferenceYardstick": 6.0,
     "rasterAgreementPixels": 1.5,
     "wordMatchYardstick": 0.98,
@@ -327,7 +330,11 @@ def read_rotation(google_page: dict) -> dict:
     """
     T, note = google_transform(google_page)
     words = len(google_page.get("tokens") or []) or len(google_page.get("lines") or [])
-    reading = {"words": words, "transformNote": note}
+    # How Google labelled the page and its lines. Recorded so the next surprise in how
+    # Google reports a turned page can be read from the log, not guessed at.
+    lines = Counter(str((line.get("layout") or {}).get("orientation")) for line in google_page.get("lines") or [])
+    reading = {"words": words, "transformNote": note,
+               "pageLabel": (google_page.get("layout") or {}).get("orientation"), "lineLabels": dict(lines)}
     if google_page.get("transforms") and note is None:
         angle = math.degrees(math.atan2(T[1, 0], T[0, 0]))
         cardinal = int(round(angle / 90) * 90) % 360
@@ -595,11 +602,11 @@ def quality_notes(provenance: dict) -> list[str]:
         notes.append(f"no text could be placed on page{'' if len(unplaced) == 1 else 's'} "
                      f"{', '.join(map(str, unplaced))}")
     off = [page["outputPage"] for page in pages
-           if (page.get("registration") or {}).get("measured") and page["registration"].get("yardstickApplies", True)
-           and not page["registration"]["withinYardstick"]]
+           if (page.get("registration") or {}).get("measured")
+           and page["registration"].get("correlation", 1.0) < POLICY["registrationCorrelationRemark"]]
     if off:
         notes.append(f"the text position on page{'' if len(off) == 1 else 's'} {', '.join(map(str, off))} "
-                     f"couldn't be confirmed against Google's page image, so highlights there may sit slightly off")
+                     f"doesn't match Google's page image, so the text there may be out of place")
     odd = [page["outputPage"] for page in pages if page.get("transformNote")]
     if odd:
         notes.append(f"Google's rotation data for page{'' if len(odd) == 1 else 's'} {', '.join(map(str, odd))} "
