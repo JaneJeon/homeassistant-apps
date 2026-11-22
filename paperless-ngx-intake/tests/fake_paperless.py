@@ -33,6 +33,8 @@ class FakePaperless:
         self.crash_after: set[str] = set()
         self.unreachable = False
         self.calls: list[str] = []
+        self.own_ocr = True          # False: Paperless's OCR mode is off, so a raw scan gets no text
+        self.archive_everything = False    # True: archive file generation is "always", even for a PDF with text
 
     def _check(self, name):
         self.calls.append(name)
@@ -72,7 +74,7 @@ class FakePaperless:
         except Exception:
             return ""
 
-    def post_document(self, filename, data, *, tag_ids):
+    def post_document(self, filename, data, *, tag_ids, created=None):
         self._check("post_document")
         sha = hashlib.sha256(data).hexdigest()
         task = f"t{next(self.task_ids)}"
@@ -80,9 +82,9 @@ class FakePaperless:
             self.tasks[task] = {"status": "failure", "result": "Not consuming: It is a duplicate"}
         else:
             doc_id = next(self.ids)
-            self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "owner": 7, "versions": [
-                {"id": doc_id, "checksum": sha, "label": None, "data": data, "archive": True,
-                 "content": "TESSERACT TEXT"}]}
+            self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "owner": 7, "created": created, "versions": [
+                {"id": doc_id, "checksum": sha, "label": None, "data": data, "archive": self.own_ocr,
+                 "content": "TESSERACT TEXT" if self.own_ocr else ""}]}
             self.tasks[task] = {"status": "success", "related_document": doc_id}
         if "post_document" in self.crash_after:
             self.crash_after.discard("post_document")
@@ -96,7 +98,7 @@ class FakePaperless:
         version_id = next(self.ids)
         self.docs[doc_id]["versions"].insert(0, {
             "id": version_id, "checksum": hashlib.sha256(data).hexdigest(), "label": label, "data": data,
-            "archive": short, "content": "TESSERACT TEXT" if short else text})
+            "archive": short or self.archive_everything, "content": "TESSERACT TEXT" if short else text})
         task = f"t{next(self.task_ids)}"
         self.tasks[task] = {"status": "success", "related_document": doc_id}
         if "update_version" in self.crash_after:

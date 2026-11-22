@@ -6,14 +6,15 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from paperless_intake.config import Settings
 from paperless_intake.docai.google_backend import GoogleBackendConfig, GoogleDocumentAIBackend
 from paperless_intake.docai.validation import inspect_source
-from paperless_intake.pipeline import Pipeline
+from paperless_intake.pipeline import Pipeline, scan_date
 from paperless_intake.service import Service
-from paperless_intake.store import (COMMITTED, DISCARDED, HELD, READY, WAITING, Store)
+from paperless_intake.store import (COMMITTED, COMMITTED_WARNING, DISCARDED, HELD, READY, WAITING, Store)
 
 from fake_paperless import Crash, FakePaperless, RecordingNotifier
 from synth import FakeGoogle, PageSpec, make_scan, numbered_letter, token_provider
@@ -129,6 +130,53 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
         self.assertEqual(item.state["mode"], "original_only")
         self.assertEqual(len(h.paperless.docs[item.state["doc_id"]]["versions"]), 1)
+        self.assertIn("Paperless did its own OCR", h.paperless.docs[item.state["doc_id"]]["notes"][0])
+
+    def test_with_paperless_ocr_off_the_original_only_note_does_not_say_paperless_read_it(self):
+        h = Harness(self)
+        h.paperless.own_ocr = False
+        h.drop(make_scan([PageSpec(["Hi"])]))
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        note = h.paperless.docs[item.state["doc_id"]]["notes"][0]
+        self.assertIn("no search text", note)
+        self.assertNotIn("did its own OCR", note)
+
+    def test_the_scan_date_goes_to_paperless_as_the_document_date(self):
+        h = Harness(self)
+        h.drop(numbered_letter(2))                       # dropped as 20261101_093000_000400.pdf
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(h.paperless.docs[item.state["doc_id"]]["created"], "2026-11-01")
+
+    def test_scan_date_is_the_scanners_file_name_or_else_the_day_it_was_picked_up(self):
+        picked_up = datetime(2026, 11, 22, 14, 45).timestamp()
+        self.assertEqual(scan_date("20261122_144510_000353.pdf", picked_up), "2026-11-22")
+        self.assertEqual(scan_date("20261109_211100_000349.pdf", picked_up), "2026-11-09")    # waited two weeks
+        self.assertEqual(scan_date("20261123_000500_000001.pdf", picked_up), "2026-11-23")    # a time zone apart
+        self.assertEqual(scan_date("letter.pdf", picked_up), "2026-11-22")
+        self.assertEqual(scan_date("20261340_144510_000353.pdf", picked_up), "2026-11-22")    # not a date
+        self.assertEqual(scan_date("20270301_090000_000001.pdf", picked_up), "2026-11-22")    # scanner clock is ahead
+        self.assertEqual(scan_date("2026112_144510.pdf", picked_up), "2026-11-22")
+        self.assertEqual(scan_date("", picked_up), "2026-11-22")
+
+    def test_paperless_making_its_own_archive_of_the_copy_is_reported(self):
+        """Paperless leaves the copy alone only while two of its settings stay as they are.
+
+        The app can't read those settings. It sees what Paperless did: an archive file on the
+        copy means Paperless re-saved it and shows its own file instead.
+        """
+        h = Harness(self)
+        h.paperless.archive_everything = True
+        h.drop(numbered_letter(3))
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING, item.state.get("reason"))
+        self.assertIn("made its own archive file of the searchable copy", item.state.get("reason") or "")
+        alerts = [payload for kind, payload in h.notifier.sent if kind == "alert"]
+        self.assertEqual(len(alerts), 1, h.notifier.sent)
 
     def test_file_is_not_claimed_until_it_stops_changing(self):
         h = Harness(self)

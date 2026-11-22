@@ -97,9 +97,12 @@ class Paperless:
 
     # Writes ---------------------------------------------------------------------
 
-    def post_document(self, filename: str, data: bytes, *, tag_ids: list[int]) -> str:
+    def post_document(self, filename: str, data: bytes, *, tag_ids: list[int], created: str | None = None) -> str:
         files = {"document": (filename, data, "application/pdf")}
         form = [("tags", str(tag)) for tag in tag_ids]
+        if created:
+            # Given a date, Paperless uses it and doesn't guess one from its own reading of the pages.
+            form.append(("created", created))
         response = self._request("POST", "/api/documents/post_document/", files=files, data=form)
         return str(response.json())
 

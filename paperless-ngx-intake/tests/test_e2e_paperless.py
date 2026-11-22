@@ -27,7 +27,7 @@ from paperless_intake.docai.google_backend import GoogleBackendConfig, GoogleDoc
 from paperless_intake.paperless import Paperless
 from paperless_intake.pipeline import Pipeline
 from paperless_intake.service import Service
-from paperless_intake.store import COMMITTED, WAITING, Store
+from paperless_intake.store import COMMITTED, COMMITTED_WARNING, WAITING, Store
 
 from fake_paperless import RecordingNotifier
 from synth import FakeGoogle, PageSpec, make_scan, numbered_letter, token_provider
@@ -42,6 +42,12 @@ PASSWORD = "synthetic-e2e-password"
 INTAKE_PERMISSIONS = ["add_document", "view_document", "change_document", "add_note", "view_note",
                       "view_tag", "view_paperlesstask"]
 E2E = os.environ.get("INTAKE_E2E") == "1"
+# Extra settings for the Paperless under test, as KEY=VALUE,KEY=VALUE. The suite runs against
+# stock settings and against Paperless with its own OCR and archive files switched off.
+PAPERLESS_ENV = [pair for pair in os.environ.get("INTAKE_E2E_PAPERLESS_ENV", "").split(",") if "=" in pair]
+OCR_OFF = "PAPERLESS_OCR_MODE=off" in PAPERLESS_ENV
+# Set when the Paperless under test is configured to re-save the searchable copy, which the app must notice.
+COPY_REWORKED = os.environ.get("INTAKE_E2E_EXPECT_COPY_REWORKED") == "1"
 
 
 def free_port() -> int:
@@ -110,6 +116,7 @@ class PaperlessE2E(unittest.TestCase):
             "-e", f"PAPERLESS_URL=http://localhost:{cls.port}",
             "-e", "PAPERLESS_WEBHOOKS_ALLOW_INTERNAL_REQUESTS=true", "-e", "PAPERLESS_TIME_ZONE=UTC",
             "-e", "PAPERLESS_CONSUMER_POLLING=2", "-e", f"PAPERLESS_SECRET_KEY={uuid.uuid4().hex}",
+            *[flag for pair in PAPERLESS_ENV for flag in ("-e", pair)],
             "-v", f"{cls.tmp}/data:/usr/src/paperless/data", "-v", f"{cls.tmp}/media:/usr/src/paperless/media",
             "-v", f"{cls.tmp}/consume:/usr/src/paperless/consume", "-v", f"{cls.tmp}/export:/usr/src/paperless/export",
             f"ghcr.io/paperless-ngx/paperless-ngx:{VERSION}",
@@ -234,13 +241,25 @@ class PaperlessE2E(unittest.TestCase):
         before = len(self.hooks.received)
         self.run_until_quiet(service)
         item = store.all()[0]
-        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(item.status, COMMITTED_WARNING if COPY_REWORKED else COMMITTED, item.state.get("reason"))
         doc_id = item.state["doc_id"]
         document = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
         self.assertEqual(len(document["versions"]), 2)
         self.assertIn(self.tag, document["tags"])
         self.assertIn(self.intake_tag, document["tags"])
         self.assertIsNone(document["owner"])                                     # like consume-folder scans
+        self.assertEqual(str(document["created"])[:10], "2026-11-01")            # the scan date, not Paperless's guess
+        if COPY_REWORKED:
+            # Paperless was told to archive every PDF. It re-saved the copy, and the app says so.
+            read_back = [e for e in item.events() if e["event"] == "read_back"][-1]
+            self.assertTrue(read_back["version_has_archive"])
+            self.assertIn("made its own archive file of the searchable copy", item.state.get("reason") or "")
+            self.assertIn("alert", [k for k, _ in notifier.sent])
+            return
+        # What Paperless made of the raw scan. With its own OCR and archive files off, nothing:
+        # version 1 is shown as the scanner saved it.
+        raw = self.api.get(f"{self.base}/api/documents/{doc_id}/metadata/", params={"version": doc_id}).json()
+        self.assertEqual(bool(raw["has_archive_version"]), not OCR_OFF)
         reader = requests.get(f"{self.base}/api/documents/{doc_id}/", timeout=10,
                               headers={"Authorization": f"Token {self.reader_token}"})
         self.assertEqual(reader.status_code, 200)                                # other users still see it
@@ -302,6 +321,10 @@ class PaperlessE2E(unittest.TestCase):
         item = store.all()[0]
         self.assertEqual((item.status, item.state["mode"]), (COMMITTED, "original_only"), item.state.get("reason"))
         self.assertEqual(len(client.versions(item.state["doc_id"])), 1)
+        note = self.api.get(f"{self.base}/api/documents/{item.state['doc_id']}/notes/").json()[0]["note"]
+        if OCR_OFF:
+            self.assertIn("no search text", note)                                # nobody read this one
+            self.assertNotIn("did its own OCR", note)
 
     def test_resume_after_losing_the_document_id_uploads_nothing_new(self):
         settings, store, service, client, _ = self.harness()

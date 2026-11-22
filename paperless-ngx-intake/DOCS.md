@@ -14,6 +14,8 @@ For each scan in `/share/paperless/capture`, the app:
 6. Commits to Paperless through the REST API: the untouched scan as version 1, the searchable copy as version 2. Then it reads both back and checks the bytes, the tags and the search text.
 7. Adds a note to the document saying what it decided. The evidence behind each decision is in the scan's `checks.json` (see Files).
 
+The document's date in Paperless is the day it was scanned. The app takes it from the scanner's file name (`20261122_144510_000353.pdf`), or uses the day it picked the file up. Paperless would otherwise guess a date from its own reading of the raw scan.
+
 ## Any way the stack goes in
 
 A mail piece goes into the feeder as one stack. It can go in correctly, turned head to foot, flipped over, or both. The app works out which, once per stack.
@@ -38,7 +40,7 @@ A held scan waits on the **Mail intake** page in the sidebar. From there it can 
 
 Nothing about the searchable copy holds a scan: not rotation, not page order, not where the invisible text sits, not the script the text is written in. Those can't lose a page, so the app decides as well as the evidence allows and writes the decision into the document's note. Version 1.0 held on all of them, and held the first two real scans it was given. When this version starts, it puts scans held for those reasons through the checks again.
 
-If Google can't read one particular scan, or the app can't build the searchable copy from Google's answer, the untouched scan still goes into Paperless, with Paperless's own OCR, and an alert says so. If Google refuses for a reason that would hit every scan (permission, a retired processor version, a wrong setting), scans wait and an alert says why.
+If Google can't read one particular scan, or the app can't build the searchable copy from Google's answer, the untouched scan still goes into Paperless and an alert says so. It then has whatever text Paperless's own OCR gives it, or none if that is switched off (see Paperless setup). If Google refuses for a reason that would hit every scan (permission, a retired processor version, a wrong setting), scans wait and an alert says why.
 
 A scan that hasn't finished going into Paperless when the app is updated is prepared again by the new version. When the app itself couldn't build the copy for a scan that is already in, the next version of the app tries once more, for as long as the local scan is kept (`keep_local_copies_days`). If it works, the copy is added to the same Paperless document as version 2, a second note says so, and the earlier warning is closed. If it doesn't, the document stays exactly as it was and nothing new is said. The app doesn't touch the document's owner or tags at that point; they are yours to have changed.
 
@@ -73,6 +75,15 @@ Scans are worked on one at a time, each in a short-lived worker process. On a sy
 
 - **Two tags:** `Physical Mail`, and `Mail intake`, which marks what this app uploaded. The app's user must be able to see both: on each tag, either leave the owner empty or give that user View permission. If either tag is missing or hidden, nothing commits, and scans wait with an alert.
 - **Owner.** Paperless makes an uploaded document its uploader's own, which hides it from other users who aren't superusers. The app clears that owner straight after upload, so its documents have no owner, like scans from the consume folder.
+- **Paperless's own OCR and archive files.** Paperless has its own OCR (Tesseract), page rotation and deskew. Two settings under Configuration, OCR Settings, decide what they touch:
+
+  | Mode | Archive file generation | What Paperless does |
+  | --- | --- | --- |
+  | `auto` | `auto` | The defaults. Paperless reads the raw scan itself and shows its own turned and cleaned rendition as version 1. It leaves the searchable copy alone, because the copy already has text. |
+  | `off` | `never` | Paperless reads nothing and re-saves nothing. Version 1 is shown exactly as the scanner saved it, and a scan lands in seconds, not minutes. A scan that goes in without its Google copy has no search text until the copy is built. So does anything added to Paperless some other way. |
+  | `redo`, `force` | or `always` | Paperless re-saves the searchable copy and shows its own file in its place. Don't use these. |
+
+  The end-to-end tests run against the first two rows, and against `always` to prove the third is noticed. The app can't read these settings. After every scan it checks what Paperless did: if the copy got an archive file, the scan's alert says so.
 - **The "document added" ingest workflow must skip the `Mail intake` tag.** Add the filter "Does not have these tags: Mail intake" to its trigger. The app already signals Home Assistant itself, so without the filter each scan counts as finished twice. The workflow's source filter can't do this: Paperless checks sources only on "consumption started" triggers. The end-to-end tests check both points.
 
 ## Options
