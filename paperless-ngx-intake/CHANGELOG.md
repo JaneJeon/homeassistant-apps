@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.2
+
+Version 1.1.1 put both waiting real scans through. Looking at the results showed four more things.
+
+- **Page numbers are read on a stack that went in upside down.** The first real scan went in turned and flipped. Its pages came out upright and in reverse, "Page 6 of 6" first, and the note said the order was unverified. Google had labelled the lines of each turned page one way and the page another, and the app threw every page number away. It now goes by how most of a page's lines run.
+- **A nearly empty page follows the stack even when Google reads it as sideways.** The second real scan ended with a back page that had one word on it, which Google read as turned a quarter. One word is not enough to turn a page on.
+- **Page numbers printed at the top of some pages and the bottom of others count as one series** for the missing-page check, when they count to the same total and no number is printed in both places. Kept apart, each place looked as if it had gaps. A number printed in both places means two documents, and each is still checked by itself.
+- **The image-match remark is made only when the match is plainly wrong** (below 0.6). Pages whose text sat exactly on the printed words, checked by eye in Paperless, scored 0.83 to 0.999, so the old 0.985 yardstick remarked on good pages.
+- **A scan that hasn't finished going into Paperless is prepared again by a new version** of the app. It costs nothing, because Google's answer is still saved.
+- The log line for each page now says how Google labelled the page and its lines.
+
 ## 1.1.1
 
 The first real scan 1.1.0 worked on went in without its searchable copy. The scanner had saved some of its pages as one-bit black and white images and the rest as JPEGs, and 1.1.0 built a copy only from JPEG pages. No test scan had a page like that.

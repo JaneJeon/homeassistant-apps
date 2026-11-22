@@ -179,12 +179,31 @@ def _marker(source_page: int, node: dict, match, tokens: list[dict], labels: lis
                               "boundingPoly": label["boundingPoly"], "textAnchor": label["textAnchor"]} for label in labels]}
 
 
+def _most_lines_run(nodes: list[dict]) -> str | None:
+    """PAGE_DOWN when most of a page's lines of text are labelled that way, else None.
+
+    Only head to foot counts. On a page whose text runs upside down, the header and
+    footer are still in the top and bottom bands this planner looks in. On a page whose
+    text runs sideways they are at the left and right edges, where it doesn't look.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for node in nodes:
+        if node["text"].strip() and node["orientation"] not in (None, "ORIENTATION_UNSPECIFIED"):
+            counts[node["orientation"]] += 1
+    most = max(counts, key=counts.get) if counts else None
+    return most if most == "PAGE_DOWN" else None
+
+
 def _page_markers(page: dict, source_page: int, text: str) -> tuple[list[dict], list[dict]]:
     nodes = [_node(line, page, text, index) for index, line in enumerate(page.get("lines", []))]
     tokens = [_node(token, page, text, index) for index, token in enumerate(page.get("tokens", []))]
-    # Text that runs the same way as its page counts: a page reported upside down still has its
-    # footer in an outer band. Text at an angle to its own page (a sideways stamp) doesn't.
-    upright = {None, "PAGE_UP", "ORIENTATION_UNSPECIFIED", page.get("layout", {}).get("orientation")}
+    # Text that runs the same way as its page counts. Text at an angle to its own page (a
+    # sideways stamp) doesn't. "Its page" is judged by how most of the page's own lines run,
+    # not only by the page's label: on a real scan that went in upside down, Google labelled
+    # the lines one way and the page another, and going by the label alone threw away every
+    # page number on all six pages (document 54, November 2026).
+    upright = {None, "PAGE_UP", "ORIENTATION_UNSPECIFIED", page.get("layout", {}).get("orientation"),
+               _most_lines_run(nodes)}
     nodes = [node for node in nodes if node["orientation"] in upright]
     labels = [node for node in nodes if _LABEL.fullmatch(node["text"]) and _band(node["box"])]
     found, issues = [], []

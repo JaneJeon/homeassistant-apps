@@ -43,7 +43,9 @@ def decide_rotations(readings: list[dict]) -> tuple[list[int], list[dict]]:
     {"cardinal": 0|90|180|270, "words": n, ...}. A page with plenty of text
     keeps Google's reading. That covers the sheet printed with its back upside
     down, and the odd sideways page. A page with little text follows the stack
-    when the stack is clear about head-to-foot.
+    when the stack is clear about head-to-foot, whatever Google read for it:
+    a real, nearly empty back page with one word on it was read as sideways
+    (November 2026), and one word is not enough to turn a page on.
     """
     # One vote per page with plenty of text. Counting words instead would let a single dense
     # page, such as terms printed upside down on the back of a bill, speak for the whole stack.
@@ -59,7 +61,7 @@ def decide_rotations(readings: list[dict]) -> tuple[list[int], list[dict]]:
     for number, reading in enumerate(readings, 1):
         turn = reading["cardinal"]
         followed = False
-        if stack is not None and reading["words"] < STRONG_WORDS and turn in votes and turn != stack:
+        if stack is not None and reading["words"] < STRONG_WORDS and turn != stack:
             turn, followed = stack, True
         turns.append(turn)
         decisions.append({"sourcePage": number, **reading, "appliedCardinalClockwiseDegrees": turn,

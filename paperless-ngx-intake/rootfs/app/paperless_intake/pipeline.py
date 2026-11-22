@@ -325,6 +325,10 @@ class Pipeline:
             entry = (f"p{number} turn {decision.get('appliedCardinalClockwiseDegrees')} "
                      f"({'stack' if decision.get('followedStack') else decision.get('source')}), "
                      f"{decision.get('words')} words, {text.get('placed', 0)} placed")
+            labels = "+".join(f"{count} {label}" for label, count in sorted((decision.get("lineLabels") or {}).items()))
+            entry += f", Google labels page {decision.get('pageLabel')} lines {labels or 'none'}"
+            if decision.get("followedStack"):
+                entry += f" (Google read {decision.get('cardinal')})"
             if text.get("leftOut"):
                 entry += f", {text['leftOut']} left out"
             if decision.get("skewDegrees") is not None:
@@ -614,7 +618,8 @@ class Pipeline:
         lines = [f"Scanned {state.get('captured_at')} and checked by paperless-intake {__version__}."]
         if mode == WITH_GOOGLE:
             processor = self.settings.processor_version.rsplit("/", 1)[-1]
-            lines.append(f"Google OCR ({processor}) is version 2; the original scan is version 1.")
+            lines.append(f"The newest version is the upright, searchable copy (Google OCR {processor}); "
+                         f"version 1 is the original scan.")
             order = ORDER_WORDS.get(state.get("order_status") or "", "as scanned")
             lines.append(f"Pages: {pages}. Page order: {order}.")
             turned = sum(1 for turn in state.get("rotations") or [] if turn)
@@ -635,7 +640,7 @@ class Pipeline:
         else:
             lines.append("Only the original was stored.")
         if state.get("copy_note_needed") and mode == WITH_GOOGLE:
-            lines.append("Version 2 was added after the document was first stored. An earlier note here says only "
+            lines.append("The searchable copy was added after the document was first stored. An earlier note here says only "
                          "the original was stored; that was true then.")
         if state.get("jane_decision") in {"keep", "keep_original"}:      # "keep_original" was 1.0's name for it
             lines.append(f"Kept as it is, by Jane's choice. Unresolved: {state.get('held_reason')}.")
@@ -803,7 +808,11 @@ class Pipeline:
         return requeued
 
     def retry_copies(self) -> list[str]:
-        """Try again to build the searchable copy for scans an earlier version couldn't build one for.
+        """Prepare again what an earlier version of the app prepared, where that can help.
+
+        Two cases. A scan that hasn't finished going into Paperless is prepared again by
+        every new version. A scan already in Paperless is prepared again only if the
+        earlier version couldn't build its searchable copy.
 
         The original scan is the evidence and the copy is made from it, so the copy can be
         made again for as long as the local scan is kept. A scan still on its way into
@@ -818,18 +827,21 @@ class Pipeline:
         retried = []
         for item in self.store.all():
             state = item.state
+            if __version__ in {state.get("prepared_by"), state.get("copy_retry_by")}:
+                continue
+            in_flight = item.status in {READY, COMMITTING} or (item.status == WAITING
+                                                                and state.get("retry_stage") == "commit")
             ours = state.get("copy_not_built") or str(state.get("no_google_copy_reason") or "").startswith(
                 "the searchable copy couldn't be built")            # 1.1.0 recorded only the sentence
-            if state.get("mode") != ORIGINAL_ONLY or not ours:
-                continue
-            if __version__ in {state.get("prepared_by"), state.get("copy_retry_by")}:
+            # A scan that hasn't finished going in is always prepared again by a new version, so it
+            # gets the newer handling. Google's saved answer is reused when there is one. A scan that
+            # is already in Paperless is touched only when it has no copy and the fault was the app's.
+            if not in_flight and (state.get("mode") != ORIGINAL_ONLY or not ours):
                 continue
             tries = state.get("copy_retries") or {}
             count = int(tries.get("count", 0)) if tries.get("version") == __version__ else 0
             if count >= COPY_RETRIES:
                 continue
-            in_flight = item.status in {READY, COMMITTING} or (item.status == WAITING
-                                                                and state.get("retry_stage") == "commit")
             committed = item.status in {COMMITTED, COMMITTED_WARNING} and bool(state.get("doc_id"))
             if not (in_flight or committed) or not item.source_path.exists():
                 continue
@@ -842,16 +854,26 @@ class Pipeline:
                 kept = item.root / f"{name.split('.')[0]}.by-{earlier}.{name.split('.', 1)[1]}"
                 if path.exists() and not kept.exists():
                     shutil.copy2(path, kept)
-            item.set(CAPTURED, copy_retry_by=__version__, copy_added_later=committed,
+            # An unfinished try to add a copy to a document that is already in Paperless (the app
+            # was restarted part way) is still that: it keeps what was recorded when it began.
+            resumed = not committed and bool(state.get("copy_added_later"))
+            item.set(CAPTURED, copy_retry_by=__version__, copy_added_later=committed or resumed,
                      copy_retries={"version": __version__, "count": count + 1},
                      # A first note already says only the original was stored, so the copy needs its own.
-                     copy_note_needed=bool(state.get("note_added")),
-                     copy_retry_previous_reason=state.get("reason") if committed else None,
-                     copy_retry_restore={"status": item.status, **restore} if committed else None,
+                     copy_note_needed=bool(state.get("copy_note_needed")) or (
+                         bool(state.get("note_added")) and state.get("mode") == ORIGINAL_ONLY),
+                     copy_retry_previous_reason=state.get("reason") if committed else (
+                         state.get("copy_retry_previous_reason") if resumed else None),
+                     copy_retry_restore={"status": item.status, **restore} if committed else (
+                         state.get("copy_retry_restore") if resumed else None),
                      waiting_since_unix=None, alerted_reason_kind=None)
             retried.append(item.sha)
-            log.info("%s has no searchable copy from an earlier version (%s); building it again", item.sha[:12],
-                     state.get("no_google_copy_reason"))
+            if state.get("no_google_copy_reason"):
+                log.info("%s has no searchable copy from an earlier version (%s); building it again", item.sha[:12],
+                         state.get("no_google_copy_reason"))
+            else:
+                log.info("%s was prepared by an earlier version and hasn't finished going in; preparing it again",
+                         item.sha[:12])
         return retried
 
     def can_retry(self, item: Item) -> bool:

@@ -22,6 +22,7 @@ from paperless_intake.store import COMMITTED, COMMITTED_WARNING, HELD, WAITING
 from synth import PageSpec, make_scan, numbered_letter
 from test_page_order import document, line
 from test_pipeline import Harness
+from test_checks_and_web import plan_for
 
 
 def reading(cardinal, words):
@@ -53,9 +54,18 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(turns, [0, 180, 0])
         self.assertIsNone(decisions[2]["stackHeadToFoot"])
 
-    def test_a_sideways_page_is_never_overruled_by_head_to_foot(self):
-        turns, _ = stack.decide_rotations([reading(180, 200), reading(90, 5), reading(180, 100)])
+    def test_a_sideways_page_with_plenty_of_text_keeps_its_own_turn(self):
+        turns, _ = stack.decide_rotations([reading(180, 200), reading(90, 150), reading(180, 100)])
         self.assertEqual(turns, [180, 90, 180])
+
+    def test_a_nearly_empty_page_follows_the_stack_even_when_google_reads_it_as_sideways(self):
+        # The second real scan: three upright pages and a back page with one word on it,
+        # which Google read as turned 270. One word is not enough to turn a page on.
+        turns, decisions = stack.decide_rotations([reading(0, 337), reading(0, 79), reading(0, 357), reading(270, 1)])
+        self.assertEqual(turns, [0, 0, 0, 0])
+        self.assertTrue(decisions[3]["followedStack"])
+        turns, _ = stack.decide_rotations([reading(180, 200), reading(90, 5), reading(180, 100)])
+        self.assertEqual(turns, [180, 180, 180])
 
     def test_only_weak_pages_keep_what_google_said(self):
         turns, _ = stack.decide_rotations([reading(180, 5), reading(0, 2)])
@@ -249,7 +259,7 @@ class StackThroughThePipelineTests(unittest.TestCase):
         h, item = self.commit(numbered_letter(2, google_image="inverted"))
         self.assertEqual(item.status, COMMITTED, item.state.get("reason"))       # 1.0 held this scan
         note = h.paperless.docs[item.state["doc_id"]]["notes"][0]
-        self.assertIn("couldn't be confirmed against Google's page image", note)
+        self.assertIn("doesn't match Google's page image", note)
         self.assertIn("The page images aren't affected", note)
         self.assertEqual([p["kind"] for k, p in h.notifier.sent if k == "alert"], [])     # a remark, not an alert
 
@@ -436,6 +446,87 @@ def letter(count: int) -> list[PageSpec]:
             for n in range(1, count + 1)]
 
 
+class WhatTheFirstRealScansShowedTests(unittest.TestCase):
+    """Two real scans went through on 2026-11-22. Each showed something no made-up scan had."""
+
+    def commit(self, scan):
+        h = Harness(self)
+        h.drop(scan)
+        h.settle()
+        return h, h.only_item()
+
+    def test_page_numbers_are_read_on_a_turned_stack_however_google_labels_it(self):
+        # The first real scan went in turned and flipped. Its pages came out upright, and in
+        # reverse: "Page 6 of 6" first. Every page number had been thrown away, because Google
+        # labelled the lines of a turned page one way and the page another.
+        for labels in ("as_page", "as_scanned", "page_as_scanned"):
+            with self.subTest(labels=labels):
+                scan = make_scan(letter(6), turn=180, flipped=True, line_labels=labels,
+                                 encodings=["jpeg", "jpeg", "ccitt", "ccitt", "ccitt", "jpeg"])
+                h, item = self.commit(scan)
+                self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+                self.assertEqual(item.state["page_order"], [6, 5, 4, 3, 2, 1])
+                self.assertEqual(item.state["rotations"], [180] * 6)
+                self.assertIn(item.state["order_status"],
+                              {"reorder_from_complete_numbering", "reversed_stack_from_printed_numbers"})
+
+    def test_page_numbers_at_the_top_of_some_pages_and_the_bottom_of_others_are_one_series(self):
+        # A statement with inserts prints them in different places. Kept apart, each place looks gappy.
+        pages = [PageSpec(["Statement page with enough words on it to count as text"] * 3,
+                          footer=None if n in (3, 4, 5) else f"Page {n} of 6") for n in range(1, 7)]
+        for n in (3, 4, 5):
+            pages[n - 1].lines.insert(0, f"Page {n} of 6")
+        scan = make_scan(pages, turn=180, flipped=True, line_labels="as_scanned")
+        _, plan = plan_for(scan)
+        self.assertGreater(len([e for e in plan.evidence if e.get("kind") == "series"]), 1)   # two bands, as on paper
+        self.assertIsNone(checks.missing_pages(plan, 6))
+        h, item = self.commit(scan)
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(item.state["page_order"], [6, 5, 4, 3, 2, 1])
+
+    def test_a_page_really_missing_from_such_a_document_still_holds(self):
+        pages = [PageSpec(["Statement page with enough words on it to count as text"] * 3,
+                          footer=None if n in (3, 4, 5) else f"Page {n} of 6") for n in (1, 2, 3, 5, 6)]
+        for page, n in zip(pages, (1, 2, 3, 5, 6)):
+            if n in (3, 5):
+                page.lines.insert(0, f"Page {n} of 6")
+        _, plan = plan_for(make_scan(pages))
+        self.assertIn("page 4 of 6 is missing", checks.missing_pages(plan, 5))
+
+    def test_two_documents_that_count_to_the_same_total_are_each_checked_by_themselves(self):
+        # Document A numbers its three pages at the top. Document B numbers at the bottom and lost its page 2.
+        pages = [PageSpec([f"Page {n} of 3"] + ["First document, with enough words on the page to count"] * 3) for n in (1, 2, 3)]
+        pages += [PageSpec(["Second document, with enough words on the page to count"] * 3, footer=f"Page {n} of 3") for n in (1, 3)]
+        _, plan = plan_for(make_scan(pages))
+        self.assertIn("page 2 of 3 is missing", checks.missing_pages(plan, 5))
+
+    def test_a_scan_that_hasnt_finished_going_in_is_prepared_again_by_a_new_version(self):
+        # Both real scans were waiting on Paperless when the fix for their page order was ready.
+        h = Harness(self)
+        scan = make_scan(letter(3), turn=180, flipped=True)
+        h.paperless.unreachable = True
+        h.drop(scan)
+        h.settle()
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["retry_stage"], item.state["mode"]), (WAITING, "commit", "with_google"))
+        asked = h.google.calls
+        self.assertEqual(h.pipeline.retry_copies(), [])                     # the same version leaves it alone
+        item.state["prepared_by"] = "1.1.1-earlier"
+        item.state["page_order"] = [1, 2, 3]                                # as the earlier version left it
+        item.save()
+        h.paperless.unreachable = False
+        h.build()
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(item.state["page_order"], [3, 2, 1])
+        self.assertEqual(h.google.calls, asked)                             # Google's saved answer was reused
+        doc = h.paperless.docs[item.state["doc_id"]]
+        self.assertEqual((len(h.paperless.docs), len(doc["notes"])), (1, 1))
+        self.assertNotIn("added after", doc["notes"][0])
+
+
 class PageImageFormatTests(unittest.TestCase):
     """A scanner that detects colour saves colour pages as JPEG and black and white pages as
     one-bit images, in the same file. 1.1.0 built a copy only from JPEG pages, and the first
@@ -477,6 +568,7 @@ class PageImageFormatTests(unittest.TestCase):
             self.commit(scan)
         line = next(entry for entry in logs.output if "pages as scanned" in entry)
         self.assertIn("DCTDecode 8-bit, image match 1.000", line)
+        self.assertIn("Google labels page PAGE_UP lines 4 PAGE_UP", line)
         self.assertIn("CCITTFaxDecode 1-bit, image match 0.9", line)
         self.assertIn("JBIG2Decode 1-bit, image match not measured", line)
         self.assertNotIn("Statement", line)                           # numbers and format names, never text
@@ -498,15 +590,17 @@ class PageImageFormatTests(unittest.TestCase):
                       "FlateDecode mask 1-bit 1275x1650; draws q cm Do Q q g cm Do Q", line)
         self.assertNotIn("Statement", line)
 
-    def test_only_jpeg_pages_are_remarked_on_against_the_jpeg_yardstick(self):
+    def test_a_page_is_remarked_on_only_when_its_image_match_is_plainly_wrong(self):
+        # Real pages whose text sat exactly on the printed words scored 0.83 to 0.999.
         from paperless_intake.docai import pdf_renderer
         provenance = {"pages": [
-            {"outputPage": 1, "registration": {"measured": True, "withinYardstick": False, "yardstickApplies": True}},
-            {"outputPage": 2, "registration": {"measured": True, "withinYardstick": False, "yardstickApplies": False}},
-            {"outputPage": 3, "registration": {"measured": False, "reason": "the page isn't a single image"}}]}
+            {"outputPage": 1, "registration": {"measured": True, "correlation": 0.957, "withinYardstick": False}},
+            {"outputPage": 2, "registration": {"measured": True, "correlation": 0.830, "withinYardstick": False}},
+            {"outputPage": 3, "registration": {"measured": True, "correlation": 0.12, "withinYardstick": False}},
+            {"outputPage": 4, "registration": {"measured": False, "reason": "the page isn't a single image"}}]}
         notes = pdf_renderer.quality_notes(provenance)
         self.assertEqual(len(notes), 1)
-        self.assertIn("on page 1 couldn't be confirmed", notes[0])
+        self.assertIn("on page 3 doesn't match Google's page image", notes[0])
 
 
 class RebuildTheCopyTests(unittest.TestCase):
@@ -556,7 +650,7 @@ class RebuildTheCopyTests(unittest.TestCase):
         self.assertEqual(item.state["rotations"], [180] * 3)
         self.assertEqual(len(doc["notes"]), 2)
         self.assertIn("Only the original was stored", doc["notes"][0])
-        self.assertIn("Version 2 was added after the document was first stored", doc["notes"][1])
+        self.assertIn("The searchable copy was added after the document was first stored", doc["notes"][1])
         # The warning Jane got about this scan is closed.
         self.assertEqual(alert_kinds(h), ["warning", "resolved"])
 
@@ -597,7 +691,7 @@ class RebuildTheCopyTests(unittest.TestCase):
         h.build()                                                           # a restart of the same version
         self.assertEqual(h.pipeline.retry_copies(), [])
 
-    def test_a_scan_google_refused_is_not_asked_again(self):
+    def test_a_scan_google_refused_and_already_in_paperless_is_not_asked_again(self):
         h = Harness(self)
         scan = make_scan(letter(2))
         h.drop(scan)
@@ -606,6 +700,9 @@ class RebuildTheCopyTests(unittest.TestCase):
         h.service.claim_captures()
         item = h.only_item()
         h.pipeline._ready_without_google(item, "Google couldn't read this scan (PAGE_LIMIT_EXCEEDED, HTTP 400)")
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
         item.state.pop("prepared_by", None)
         item.save()
         self.assertEqual(h.pipeline.retry_copies(), [])
@@ -735,7 +832,7 @@ class RebuildTheCopyTests(unittest.TestCase):
         doc = h.paperless.docs[item.state["doc_id"]]
         self.assertEqual((len(h.paperless.docs), len(doc["versions"]), len(doc["notes"])), (1, 2, 2))
         self.assertIn("Only the original was stored", doc["notes"][0])
-        self.assertIn("Version 2 was added after the document was first stored", doc["notes"][1])
+        self.assertIn("The searchable copy was added after the document was first stored", doc["notes"][1])
 
     def test_what_jane_changed_on_the_document_since_is_left_alone(self):
         h, item = self.committed_without_a_copy()
@@ -759,6 +856,33 @@ class RebuildTheCopyTests(unittest.TestCase):
         item = h.only_item()
         self.assertEqual(item.status, COMMITTED_WARNING)
         self.assertEqual(alert_kinds(h), ["warning"])
+
+    def test_an_unfinished_try_on_a_stored_document_is_still_that_after_another_update(self):
+        # The app was updated again while it was part way through adding a copy to a document
+        # that has been in Paperless for a while. Jane's owner and tags on it are still hers.
+        from fake_paperless import Crash
+        h, item = self.committed_without_a_copy()
+        doc = h.paperless.docs[item.state["doc_id"]]
+        h.paperless.crash_after.add("update_version")
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        item = h.only_item()
+        h.pipeline.prepare(item)
+        with self.assertRaises(Crash):                                      # the app dies part way through
+            h.pipeline.commit(item)
+        self.assertEqual(item.status, "committing")
+        doc["owner"] = 42
+        doc["tags"] = [tag for tag in doc["tags"] if tag != h.paperless.tags["Mail intake"]]
+        item.state["prepared_by"] = item.state["copy_retry_by"] = "an-earlier-version"
+        item.save()
+        h.build()
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(doc["owner"], 42)
+        self.assertEqual(len(doc["notes"]), 2)
+        self.assertIn("The searchable copy was added after the document was first stored", doc["notes"][1])
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
 
     def test_a_document_jane_deleted_is_tried_three_times_at_most_and_never_said_anything_about(self):
         h, item = self.committed_without_a_copy()

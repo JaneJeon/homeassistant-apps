@@ -18,7 +18,7 @@ For each scan in `/share/paperless/capture`, the app:
 
 A mail piece goes into the feeder as one stack. It can go in correctly, turned head to foot, flipped over, or both. The app works out which, once per stack.
 
-- **Turned head to foot.** Every image is upside down. A page with plenty of text keeps Google's own reading of which way up it is. A page with little text (a nearly empty back side) follows the rest of the stack, because a few words aren't enough to tell. A page printed sideways, or a back printed upside down, has plenty of text and is turned by itself.
+- **Turned head to foot.** Every image is upside down. A page with plenty of text keeps Google's own reading of which way up it is. A page with little text (a nearly empty back side) follows the rest of the stack whatever Google read for it, because a few words aren't enough to tell. A page printed sideways, or a back printed upside down, has plenty of text and is turned by itself.
 - **Flipped over.** The whole page sequence comes out reversed, backs included: three double-sided sheets come out 6 5 4 3 2 1. So one reversal fixes single-sided and double-sided stacks alike, and the app doesn't need to know which sheets were double-sided.
   - With a complete printed series (`Page 1 of 4` to `Page 4 of 4`), pages follow the printed numbers exactly.
   - With only some numbers readable, the ones that were read vote: if they run backwards, the whole stack is reversed. A step down onto page 1 counts only when a total is printed (`Page 1 of 5`), because numbering that starts again at 1 usually means a second document. A number that is only referred to (`see page 4`) isn't counted.
@@ -40,7 +40,7 @@ Nothing about the searchable copy holds a scan: not rotation, not page order, no
 
 If Google can't read one particular scan, or the app can't build the searchable copy from Google's answer, the untouched scan still goes into Paperless, with Paperless's own OCR, and an alert says so. If Google refuses for a reason that would hit every scan (permission, a retired processor version, a wrong setting), scans wait and an alert says why.
 
-When the app itself couldn't build the copy, the next version of the app tries once more, for as long as the local scan is kept (`keep_local_copies_days`). If it works, the copy is added to the same Paperless document as version 2, a second note says so, and the earlier warning is closed. If it doesn't, the document stays exactly as it was and nothing new is said. The app doesn't touch the document's owner or tags at that point; they are yours to have changed.
+A scan that hasn't finished going into Paperless when the app is updated is prepared again by the new version. When the app itself couldn't build the copy for a scan that is already in, the next version of the app tries once more, for as long as the local scan is kept (`keep_local_copies_days`). If it works, the copy is added to the same Paperless document as version 2, a second note says so, and the earlier warning is closed. If it doesn't, the document stays exactly as it was and nothing new is said. The app doesn't touch the document's owner or tags at that point; they are yours to have changed.
 
 The invisible text covers the characters almost all mail uses (Unicode's basic plane, which includes Korean, Chinese, Japanese, Thai, Arabic and Hebrew). Arabic and Hebrew words are stored so they read back in the right order. Rarer characters outside that range are left out of the text layer, and the note says so.
 
