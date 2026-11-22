@@ -5,8 +5,16 @@ Three things here can damage a document, so they are checked hard. If one
 fails, ReviewRequired is raised and no searchable copy is made:
 
 - every source page appears in the output exactly once;
-- each page's image is the scanner's JPEG, byte for byte;
+- every image on a page is the scanner's own, byte for byte;
 - the added text is invisible.
+
+The copy is made from the scanner's pages as they are, whatever is on them.
+A scanner set to detect colour saves a colour page as a JPEG and a black and
+white page as a one-bit image in another format, in the same file. Version
+1.1.0 built a copy only from JPEG pages and refused the first real scan it met
+that had another kind. Nothing here needs to decode a page image to build the
+copy. One measure does (how well the scan lines up with Google's page image),
+and a page it can't decode simply goes unmeasured.
 
 Everything else is about where the invisible text sits. That decides how well
 a search highlight lines up with the printed word, and nothing more: the page
@@ -40,7 +48,9 @@ from pypdf.generic import RectangleObject
 from . import glyphless
 
 # Measures recorded with every page. `registration` values are the limits the
-# 1.0 gates used; they are kept as a yardstick, not as gates.
+# 1.0 gates used; they are kept as a yardstick, not as gates. They were set on
+# JPEG pages, so only JPEG pages are remarked on against them. Other formats
+# are measured and recorded without a remark.
 POLICY = {
     "registrationCorrelationYardstick": 0.985,
     "registrationMeanAbsoluteGrayDifferenceYardstick": 6.0,
@@ -73,30 +83,104 @@ def anchored(text: str, anchor: dict) -> str:
     return "".join(parts)
 
 
-def source_image(page) -> tuple[bytes, Image.Image]:
-    """The page's one full-page JPEG. Anything else is a scan format this renderer doesn't handle."""
+def page_size(page) -> tuple[float, float]:
+    """The page's size in points. Raises when the page isn't the plain, unturned kind a scanner writes."""
     width, height = float(page.mediabox.width), float(page.mediabox.height)
     if list(page.mediabox) != [0, 0, width, height] or list(page.cropbox) != list(page.mediabox):
         raise ReviewRequired("Nonzero-origin or cropped source page")
     if page.rotation != 0 or float(page.get("/UserUnit", 1)) != 1 or page.get("/Annots"):
         raise ReviewRequired("Source rotation, user unit, or annotations require separate handling")
-    objects = page["/Resources"].get("/XObject", {})
-    if len(objects) != 1:
-        raise ReviewRequired("Exactly one full-page image is required")
-    name, reference = next(iter(objects.items()))
-    obj = reference.get_object()
-    if obj.get("/Subtype") != "/Image" or obj.get("/Filter") != "/DCTDecode" or obj.get("/SMask") or obj.get("/Mask"):
-        raise ReviewRequired("Only a direct JPEG image without masks is supported")
-    ops = page.get_contents().operations
-    if [op for _, op in ops] != [b"q", b"cm", b"Do", b"Q"]:
-        raise ReviewRequired("Source must contain only one image and its full-page placement")
-    if not np.allclose(list(map(float, ops[1][0])), [width, 0, 0, height, 0, 0], rtol=0, atol=1e-9) or ops[2][0] != [name]:
-        raise ReviewRequired("Image does not exactly fill the source page")
+    return width, height
+
+
+def _resources(page):
+    """The page's resources, looked up through its parents if it has none of its own."""
+    node = page
+    for _ in range(32):
+        if "/Resources" in node:
+            return node["/Resources"].get_object()
+        parent = node.get("/Parent")
+        if parent is None:
+            break
+        node = parent.get_object()
+    return {}
+
+
+def _stored(obj) -> dict:
     data = obj._data
-    image = Image.open(io.BytesIO(data))
-    if image.format != "JPEG" or image.size != (obj["/Width"], obj["/Height"]):
-        raise ReviewRequired("JPEG bytes and image metadata disagree")
-    return data, image
+    space = obj.get("/ColorSpace")
+    space = space.get_object() if hasattr(space, "get_object") else space
+    space = str(space[0]) if isinstance(space, list) and space else str(space) if space is not None else None
+    kind = obj.get("/Filter")
+    kind = "+".join(str(part) for part in kind) if isinstance(kind, list) else str(kind) if kind is not None else "none"
+    return {"format": kind.replace("/", ""), "width": int(obj.get("/Width", 0)), "height": int(obj.get("/Height", 0)),
+            "bitsPerComponent": int(obj.get("/BitsPerComponent", 1)), "colorSpace": (space or "mask").replace("/", ""),
+            "byteCount": len(data), "sha256": digest(data)}
+
+
+def page_images(page) -> list[dict]:
+    """Every image a page draws, as stored: its format, size and a hash of its stored bytes. Nothing is decoded.
+
+    Masks and images inside nested drawing objects are included, so a page a
+    scanner split into layers is covered too.
+    """
+    found: list[dict] = []
+
+    def visit(resources, depth: int) -> None:
+        objects = (resources or {}).get("/XObject") or {}
+        for reference in objects.get_object().values() if hasattr(objects, "get_object") else objects.values():
+            obj = reference.get_object()
+            if obj.get("/Subtype") == "/Image":
+                found.append(_stored(obj))
+                for key in ("/SMask", "/Mask"):
+                    extra = obj.get(key)
+                    extra = extra.get_object() if hasattr(extra, "get_object") else extra
+                    if hasattr(extra, "_data") and hasattr(extra, "get"):
+                        found.append(_stored(extra))
+            elif obj.get("/Subtype") == "/Form" and depth < 4:
+                nested = obj.get("/Resources")
+                visit(nested.get_object() if hasattr(nested, "get_object") else nested, depth + 1)
+
+    visit(_resources(page), 0)
+    return found
+
+
+def _fingerprint(images: list[dict]) -> list[tuple[str, int, str]]:
+    return sorted((image["format"], image["byteCount"], image["sha256"]) for image in images)
+
+
+def comparison_image(page) -> tuple[Image.Image | None, str | None]:
+    """The page as one picture, for measuring against Google's page image, or None and why not.
+
+    The second value is the reason when there is no picture, and the image's format when there is.
+
+    Only a page that is exactly one image filling the page can be compared this
+    way. A format this code can't decode (JBIG2, for one) is not an error: the
+    measure is skipped and the copy is built all the same.
+    """
+    try:
+        width, height = float(page.mediabox.width), float(page.mediabox.height)
+        objects = _resources(page).get("/XObject") or {}
+        objects = objects.get_object() if hasattr(objects, "get_object") else objects
+        if len(objects) != 1:
+            return None, "the page isn't a single image"
+        name, reference = next(iter(objects.items()))
+        obj = reference.get_object()
+        if obj.get("/Subtype") != "/Image" or obj.get("/SMask") or obj.get("/Mask") or obj.get("/ImageMask"):
+            return None, "the page isn't a single plain image"
+        ops = page.get_contents().operations
+        if [op for _, op in ops] != [b"q", b"cm", b"Do", b"Q"] or ops[2][0] != [name] or not np.allclose(
+                list(map(float, ops[1][0])), [width, 0, 0, height, 0, 0], rtol=0, atol=1e-6):
+            return None, "the image doesn't exactly fill the page"
+        if obj.get("/Filter") == "/DCTDecode":
+            image = Image.open(io.BytesIO(obj._data))
+        else:
+            image = page.images[0].image        # pypdf decodes CCITT, Flate and the like
+        if image is None or image.size != (obj["/Width"], obj["/Height"]):
+            return None, "the image's size and its description disagree"
+        return image, str(obj.get("/Filter")).replace("/", "")
+    except Exception as error:      # a measure, never a reason to stop
+        return None, f"the page image couldn't be decoded here ({type(error).__name__})"
 
 
 def cardinal_matrix(degrees: int, width: float, height: float) -> tuple[np.ndarray, tuple[float, float]]:
@@ -183,8 +267,14 @@ def raster_size(T: np.ndarray, returned: tuple[int, int], page_points: tuple[flo
     return float(solved[0]), float(solved[1]), "solved_from_returned_image"
 
 
-def registration(image: Image.Image, google_page: dict, T: np.ndarray, raster: tuple[float, float]) -> dict:
-    """How closely the scan, pushed through the mapping, matches the image Google returned. A measure only."""
+def registration(image: Image.Image | None, google_page: dict, T: np.ndarray, raster: tuple[float, float],
+                 detail: str | None = None) -> dict:
+    """How closely the scan, pushed through the mapping, matches the image Google returned. A measure only.
+
+    detail is the image's format, or the reason there is no image to compare.
+    """
+    if image is None:
+        return {"measured": False, "reason": detail or "no page image to compare"}
     try:
         returned = google_page["image"]
         returned_image = Image.open(io.BytesIO(base64.b64decode(returned["content"], validate=True)))
@@ -201,6 +291,7 @@ def registration(image: Image.Image, google_page: dict, T: np.ndarray, raster: t
         if not math.isfinite(correlation):      # a page with no variation, such as a blank one
             return {"measured": False, "reason": "no variation to compare"}
         return {"measured": True, "correlation": correlation, "meanAbsoluteGrayDifference": mae,
+                "yardstickApplies": detail in (None, "DCTDecode"),
                 "withinYardstick": correlation >= POLICY["registrationCorrelationYardstick"]
                 and mae <= POLICY["registrationMeanAbsoluteGrayDifferenceYardstick"]}
     except Exception as error:      # a measure, never a reason to stop
@@ -273,20 +364,6 @@ def _words(text: str) -> Counter:
     return Counter(glyphless.search_words(text))
 
 
-def thumbnail(source_pdf_path: Path, work_dir: Path) -> Path:
-    """Local first-page thumbnail, without orientation inference or OCR."""
-    _, image = source_image(PdfReader(source_pdf_path).pages[0])
-    work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    result = work_dir / "source-thumbnail.webp"
-    if result.exists():
-        raise FileExistsError(result)
-    image = image.convert("RGB")
-    image.thumbnail((640, 640), Image.Resampling.LANCZOS)
-    image.save(result, "WEBP", quality=90)
-    result.chmod(0o600)
-    return result
-
-
 def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, page_order: list[int],
                     cardinal_clockwise: list[int], prefix: str, text_reader=None) -> dict:
     """Write the searchable copy and return its path with what was measured. No network use.
@@ -305,14 +382,15 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
 
     records = []
     for number, (page, google_page, clockwise) in enumerate(zip(reader.pages, document["pages"], cardinal_clockwise), 1):
-        image_bytes, image = source_image(page)
-        width, height = float(page.mediabox.width), float(page.mediabox.height)
+        width, height = page_size(page)
+        images = page_images(page)
+        image, detail = comparison_image(page)
         T, transform_note = google_transform(google_page)
         returned = _returned_size(google_page)
         C, output_size = cardinal_matrix(clockwise, width, height)
         evidence = {"sourcePage": number, "appliedCardinalClockwiseDegrees": clockwise,
                     "sourceMediaBoxPoints": [width, height], "outputMediaBoxPoints": list(output_size),
-                    "transformNote": transform_note}
+                    "transformNote": transform_note, "images": images}
         runs, stats = [], {"level": None, "placed": 0, "leftOut": 0}
         if returned is None:
             evidence["placement"] = "no text placed: Google gave no page size"
@@ -324,9 +402,9 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
             evidence["returnedImagePixels"] = list(returned)
             evidence["rasterPixels"] = [iw, ih]
             evidence["rasterMapping"] = how
-            evidence["registration"] = registration(image, google_page, T, (iw, ih))
+            evidence["registration"] = registration(image, google_page, T, (iw, ih), detail)
         expected = read_text(document["text"], (google_page.get("layout") or {}).get("textAnchor") or {})
-        records.append({"sourcePage": number, "imageBytes": image_bytes, "expectedText": expected, "runs": runs,
+        records.append({"sourcePage": number, "images": images, "expectedText": expected, "runs": runs,
                         "outputSize": output_size, "evidence": {**evidence, "text": stats}})
 
     ordered = [records[n - 1] for n in page_order]
@@ -354,10 +432,8 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
         raise ReviewRequired("Output page count changed")
     checks = []
     for output_number, (page, record) in enumerate(zip(reopened.pages, ordered), 1):
-        embedded = [obj.get_object() for obj in page["/Resources"]["/XObject"].values()
-                    if obj.get_object().get("/Subtype") == "/Image"]
-        if len(embedded) != 1 or embedded[0].get("/Filter") != "/DCTDecode" or embedded[0]._data != record["imageBytes"]:
-            raise ReviewRequired("Original JPEG stream was not preserved byte-for-byte")
+        if _fingerprint(page_images(page)) != _fingerprint(record["images"]):
+            raise ReviewRequired("A page image was not preserved byte-for-byte")
         if page.rotation != 0 or not np.allclose([float(page.mediabox.width), float(page.mediabox.height)],
                                                  record["outputSize"], atol=1e-8, rtol=0):
             raise ReviewRequired("Output page orientation or size changed unexpectedly")
@@ -377,7 +453,7 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
         total = sum(expected.values())
         missing = sum((expected - actual).values())
         checks.append({"outputPage": output_number, "sourcePage": record["sourcePage"],
-                       "originalJpegStreamByteIdentical": True, "wordsExpected": total, "wordsMissingFromLayer": missing,
+                       "pageImagesByteIdentical": True, "wordsExpected": total, "wordsMissingFromLayer": missing,
                        "wordMatch": round(1 - missing / total, 4) if total else 1.0})
     if digest(source_pdf_path.read_bytes()) != source_sha:
         raise ReviewRequired("Source PDF changed")
@@ -396,7 +472,7 @@ def render_document(source_pdf_path: Path, document: dict, out_dir: Path, *, pag
         "pageMappingOutputToSource": list(page_order),
         "cardinalClockwiseBySourcePage": list(cardinal_clockwise),
         "policy": POLICY, "checks": checks,
-        "pages": [{"outputPage": index, "originalJpegSha256": digest(record["imageBytes"]), **record["evidence"]}
+        "pages": [{"outputPage": index, **record["evidence"]}
                   for index, record in enumerate(ordered, 1)],
     }
     with manifest_path.open("x") as stream:
@@ -419,7 +495,8 @@ def quality_notes(provenance: dict) -> list[str]:
         notes.append(f"no text could be placed on page{'' if len(unplaced) == 1 else 's'} "
                      f"{', '.join(map(str, unplaced))}")
     off = [page["outputPage"] for page in pages
-           if (page.get("registration") or {}).get("measured") and not page["registration"]["withinYardstick"]]
+           if (page.get("registration") or {}).get("measured") and page["registration"].get("yardstickApplies", True)
+           and not page["registration"]["withinYardstick"]]
     if off:
         notes.append(f"the text position on page{'' if len(off) == 1 else 's'} {', '.join(map(str, off))} "
                      f"couldn't be confirmed against Google's page image, so highlights there may sit slightly off")

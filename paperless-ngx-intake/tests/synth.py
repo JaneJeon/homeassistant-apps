@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import zlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -102,9 +103,48 @@ def _draw_line(draw, font, text, x, y):
     return text, box, words
 
 
-def _pdf(images: list[bytes]) -> bytes:
-    """Hand-written PDF: each page is exactly `q W 0 0 H 0 0 cm /Im0 Do Q`. Wide images get a landscape page."""
+def _bits(data: bytes):
+    """The page as a one-bit image, the way a scanner stores a black and white page."""
+    return Image.open(io.BytesIO(data)).convert("L").point(lambda value: 255 if value > 160 else 0).convert("1")
+
+
+def _image_object(data: bytes, encoding: str) -> bytes:
+    """One page image as a PDF object body, in the format a scanner would have chosen for it."""
+    width, height = Image.open(io.BytesIO(data)).size
+    head = b"<< /Type /XObject /Subtype /Image /Width %d /Height %d " % (width, height)
+    if encoding == "jpeg":
+        body, rest = data, b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode"
+    elif encoding == "flate":
+        body = zlib.compress(_bits(data).tobytes())
+        rest = b"/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode"
+    elif encoding == "ccitt":
+        buffer = io.BytesIO()
+        _bits(data).save(buffer, "TIFF", compression="group4", tiffinfo={278: height})   # all rows in one strip
+        tiff = Image.open(io.BytesIO(buffer.getvalue()))
+        offsets, counts = tiff.tag_v2[273], tiff.tag_v2[279]
+        assert len(offsets) == 1, "the fax data must be one strip to be one PDF stream"
+        body = buffer.getvalue()[offsets[0]:offsets[0] + counts[0]]
+        rest = (b"/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode "
+                b"/DecodeParms << /K -1 /Columns %d /Rows %d /BlackIs1 true >>" % (width, height))
+    elif encoding == "jbig2":
+        # Not real JBIG2 data. Nothing that builds the copy may need to decode a page image,
+        # and this is the stand-in for every format the app has no decoder for.
+        body = b"not decodable here " + hashlib.sha256(data).digest() * 8
+        rest = b"/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode"
+    else:
+        raise ValueError(encoding)
+    return head + rest + b" /Length %d >>\nstream\n" % len(body) + body + b"\nendstream"
+
+
+def _pdf(images: list[bytes], encodings: list[str] | None = None) -> bytes:
+    """Hand-written PDF: each page is exactly `q W 0 0 H 0 0 cm /Im0 Do Q`. Wide images get a landscape page.
+
+    encodings gives each page's image format. "layered" is the exception to the one-image
+    shape: a JPEG background with a one-bit stencil drawn over it, as high-compression
+    scanner modes write.
+    """
     objects: list[bytes] = []
+    encodings = encodings or ["jpeg"] * len(images)
 
     def add(body: bytes) -> int:
         objects.append(body)
@@ -113,16 +153,23 @@ def _pdf(images: list[bytes]) -> bytes:
     catalog = add(b"")  # placeholder 1
     pages_obj = add(b"")  # placeholder 2
     kids = []
-    for data in images:
+    for data, encoding in zip(images, encodings):
         width, height = Image.open(io.BytesIO(data)).size
-        image_obj = add(b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray "
-                        b"/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n" % (width, height, len(data))
-                        + data + b"\nendstream")
         page_w, page_h = (792, 612) if width > height else (612, 792)
         content = b"q %d 0 0 %d 0 0 cm /Im0 Do Q" % (page_w, page_h)
+        if encoding == "layered":
+            image_obj = add(_image_object(data, "jpeg"))
+            stencil = zlib.compress(bytes(255 - b for b in _bits(data).tobytes()))        # 1 paints, 0 leaves alone
+            mask_obj = add(b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ImageMask true "
+                           b"/BitsPerComponent 1 /Filter /FlateDecode /Length %d >>\nstream\n"
+                           % (width, height, len(stencil)) + stencil + b"\nendstream")
+            content += b" q 0 g %d 0 0 %d 0 0 cm /Im1 Do Q" % (page_w, page_h)
+            xobjects = b"/Im0 %d 0 R /Im1 %d 0 R" % (image_obj, mask_obj)
+        else:
+            xobjects = b"/Im0 %d 0 R" % add(_image_object(data, encoding))
         content_obj = add(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
-        page_obj = add(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /XObject << /Im0 %d 0 R >> >> "
-                       b"/Contents %d 0 R >>" % (page_w, page_h, image_obj, content_obj))
+        page_obj = add(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /XObject << " % (page_w, page_h)
+                       + xobjects + b" >> >> /Contents %d 0 R >>" % content_obj)
         kids.append(page_obj)
     objects[catalog - 1] = b"<< /Type /Catalog /Pages 2 0 R >>"
     objects[pages_obj - 1] = (b"<< /Type /Pages /Kids [" + b" ".join(b"%d 0 R" % k for k in kids)
@@ -157,25 +204,28 @@ def _as_scanned(upright_jpeg: bytes, turn: int, skew: float) -> bytes:
 
 def make_scan(pages: list[PageSpec], *, scale: float = 1.0, turn: int = 0, flipped: bool = False,
               skew: float = 0.0, turns: list[int] | None = None, report: str = "transform",
-              google_image: str = "faithful") -> Scan:
+              google_image: str = "faithful", encodings: list[str] | None = None) -> Scan:
     """A scan of `pages`, given in reading order.
 
     turn: the whole stack went in turned, so every page needs this clockwise quarter turn (180 = head to foot).
     flipped: the stack went in flipped over, so the pages come out in reverse.
     turns: a turn per page (in reading order) instead of one for the stack.
     skew: every page is this many degrees askew, and Google's transform removes it.
+    encodings: the image format of each page (in reading order): "jpeg", "flate" or "ccitt" (one-bit
+        black and white), "jbig2" (a format the app can't decode) or "layered" (two images on the page).
     """
     specs = list(pages)
     page_turns = list(turns) if turns is not None else [turn] * len(specs)
+    page_encodings = list(encodings) if encodings is not None else ["jpeg"] * len(specs)
     if flipped:
-        specs, page_turns = specs[::-1], page_turns[::-1]
+        specs, page_turns, page_encodings = specs[::-1], page_turns[::-1], page_encodings[::-1]
     images, boxes = [], []
     for spec, page_turn in zip(specs, page_turns):
         data, placed = _draw_page(spec, scale)
         images.append(_as_scanned(data, page_turn, skew))
         boxes.append(placed)
     size = (round(PIXELS[0] * scale), round(PIXELS[1] * scale))
-    scan = Scan(_pdf(images), specs, images, boxes, size, page_turns, skew, report, google_image)
+    scan = Scan(_pdf(images, page_encodings), specs, images, boxes, size, page_turns, skew, report, google_image)
     _REGISTRY[scan.sha256] = scan
     return scan
 

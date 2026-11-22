@@ -9,7 +9,7 @@ For each scan in `/share/paperless/capture`, the app:
 1. Picks it up once it has stopped changing for 30 seconds and opens as a complete PDF.
 2. Sends it to Google Document AI for OCR, using the pinned processor version.
 3. Decides, for the stack as a whole, which way up it is and whether it went in flipped (next section).
-4. Builds the searchable copy. The page images are the scanner's own, byte for byte. Pages are turned upright and put in reading order. Google's text sits invisibly on top, word by word.
+4. Builds the searchable copy. The page images are the scanner's own, byte for byte, in whatever format the scanner chose for each page (a scanner that detects colour mixes JPEG pages with one-bit black and white ones). Pages are turned upright and put in reading order. Google's text sits invisibly on top, word by word.
 5. Checks that the printed page numbers don't reveal a missing page.
 6. Commits to Paperless through the REST API: the untouched scan as version 1, the searchable copy as version 2. Then it reads both back and checks the bytes, the tags and the search text.
 7. Adds a note to the document saying what it decided. The evidence behind each decision is in the scan's `checks.json` (see Files).
@@ -39,6 +39,8 @@ A held scan waits on the **Mail intake** page in the sidebar. From there it can 
 Nothing about the searchable copy holds a scan: not rotation, not page order, not where the invisible text sits, not the script the text is written in. Those can't lose a page, so the app decides as well as the evidence allows and writes the decision into the document's note. Version 1.0 held on all of them, and held the first two real scans it was given. When this version starts, it puts scans held for those reasons through the checks again.
 
 If Google can't read one particular scan, or the app can't build the searchable copy from Google's answer, the untouched scan still goes into Paperless, with Paperless's own OCR, and an alert says so. If Google refuses for a reason that would hit every scan (permission, a retired processor version, a wrong setting), scans wait and an alert says why.
+
+When the app itself couldn't build the copy, the next version of the app tries once more, for as long as the local scan is kept (`keep_local_copies_days`). If it works, the copy is added to the same Paperless document as version 2, a second note says so, and the earlier warning is closed.
 
 The invisible text covers the characters almost all mail uses (Unicode's basic plane, which includes Korean, Chinese, Japanese, Thai, Arabic and Hebrew). Arabic and Hebrew words are stored so they read back in the right order. Rarer characters outside that range are left out of the text layer, and the note says so.
 

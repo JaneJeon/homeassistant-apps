@@ -262,7 +262,9 @@ class PaperlessE2E(unittest.TestCase):
         """The whole point, against real Paperless: any way the stack goes in, the same document comes out.
 
         Also the two things version 1.0 held real scans for: a page a degree askew,
-        and text in a script the old text-layer font didn't cover.
+        and text in a script the old text-layer font didn't cover. And the thing 1.1.0
+        refused a real scan for: black and white pages saved as one-bit images beside
+        a JPEG page, as a scanner that detects colour writes them.
         """
         settings, store, service, client, notifier = self.harness()
         marker = "quokkaferry" + uuid.uuid4().hex[:6]
@@ -270,7 +272,7 @@ class PaperlessE2E(unittest.TestCase):
         pages = [PageSpec([f"Synthetic account statement line {n}.{i} for testing purposes only" for i in range(1, 6)]
                           + [f"Reference {marker}", f"주의: {korean} 사용하시는 경우 언어 지원 서비스를 무료로 이용하실 수 있습니다"],
                           footer=f"Page {n} of 3") for n in (1, 2, 3)]
-        scan = make_scan(pages, flipped=True, turn=180, skew=1.3)
+        scan = make_scan(pages, flipped=True, turn=180, skew=1.3, encodings=["jpeg", "ccitt", "flate"])
         (settings.capture_dir / "20261122_100000_000600.pdf").write_bytes(scan.pdf)
         self.run_until_quiet(service)
         item = store.all()[0]

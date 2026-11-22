@@ -417,3 +417,206 @@ class RequeueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def alert_kinds(h) -> list[str]:
+    return [payload["kind"] for kind, payload in h.notifier.sent if kind == "alert"]
+
+
+def stored_images(pdf: bytes) -> list[list[tuple[str, int, str]]]:
+    """Per page, every image as stored: format, byte count and hash."""
+    from paperless_intake.docai import pdf_renderer
+    return [pdf_renderer._fingerprint(pdf_renderer.page_images(page)) for page in PdfReader(io.BytesIO(pdf)).pages]
+
+
+def letter(count: int) -> list[PageSpec]:
+    return [PageSpec([f"Statement page {n} with enough words on it to judge which way up it is",
+                      "A second line of ordinary text for this page of the test letter",
+                      "And a third so the page counts as one with plenty of text"], footer=f"Page {n} of {count}")
+            for n in range(1, count + 1)]
+
+
+class PageImageFormatTests(unittest.TestCase):
+    """A scanner that detects colour saves colour pages as JPEG and black and white pages as
+    one-bit images, in the same file. 1.1.0 built a copy only from JPEG pages, and the first
+    real scan it met had another kind. The copy must not depend on what a page image is."""
+
+    def commit(self, scan):
+        h = Harness(self)
+        h.drop(scan)
+        h.settle()
+        return h, h.only_item()
+
+    def test_colour_and_black_and_white_pages_in_one_scan(self):
+        scan = make_scan(letter(4), turn=180, flipped=True, encodings=["jpeg", "ccitt", "flate", "jpeg"])
+        h, item = self.commit(scan)
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual((item.state["page_order"], item.state["rotations"]), ([4, 3, 2, 1], [180] * 4))
+        self.assertEqual(alert_kinds(h), [])
+        versions = h.paperless.docs[item.state["doc_id"]]["versions"]
+        self.assertEqual(len(versions), 2)
+        # Every page image in the copy is the scanner's own, byte for byte, in its own format.
+        original, copy = stored_images(scan.pdf), stored_images(versions[0]["data"])
+        self.assertEqual(copy, original[::-1])
+        self.assertEqual([page[0][0] for page in original], ["DCTDecode", "FlateDecode", "CCITTFaxDecode", "DCTDecode"])
+
+    def test_a_format_the_app_cant_decode_and_a_page_in_layers(self):
+        # Nothing that builds the copy may need to decode a page image.
+        scan = make_scan(letter(3), turn=180, encodings=["jbig2", "layered", "jpeg"])
+        h, item = self.commit(scan)
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(item.state["rotations"], [180] * 3)
+        self.assertEqual(item.state["quality_notes"], [])
+        versions = h.paperless.docs[item.state["doc_id"]]["versions"]
+        self.assertEqual(stored_images(versions[0]["data"]), stored_images(scan.pdf))
+        self.assertEqual(len(stored_images(scan.pdf)[1]), 2)          # the layered page has two images
+
+    def test_the_log_line_names_each_pages_format_and_says_what_wasnt_measured(self):
+        scan = make_scan(letter(3), encodings=["jpeg", "ccitt", "jbig2"])
+        with self.assertLogs("paperless_intake.pipeline", "INFO") as logs:
+            self.commit(scan)
+        line = next(entry for entry in logs.output if "pages as scanned" in entry)
+        self.assertIn("DCTDecode 8-bit, image match 1.000", line)
+        self.assertIn("CCITTFaxDecode 1-bit, image match 0.9", line)
+        self.assertIn("JBIG2Decode 1-bit, image match not measured", line)
+        self.assertNotIn("Statement", line)                           # numbers and format names, never text
+
+    def test_only_jpeg_pages_are_remarked_on_against_the_jpeg_yardstick(self):
+        from paperless_intake.docai import pdf_renderer
+        provenance = {"pages": [
+            {"outputPage": 1, "registration": {"measured": True, "withinYardstick": False, "yardstickApplies": True}},
+            {"outputPage": 2, "registration": {"measured": True, "withinYardstick": False, "yardstickApplies": False}},
+            {"outputPage": 3, "registration": {"measured": False, "reason": "the page isn't a single image"}}]}
+        notes = pdf_renderer.quality_notes(provenance)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("on page 1 couldn't be confirmed", notes[0])
+
+
+class RebuildTheCopyTests(unittest.TestCase):
+    """The copy is made from the original, so a copy an earlier version couldn't build can be
+    built by a later one: before the scan reaches Paperless, or after."""
+
+    def broken(self, h):
+        from paperless_intake.docai.pdf_renderer import ReviewRequired
+
+        def refuse(*args, **kwargs):
+            raise ReviewRequired("Only a direct JPEG image without masks is supported")
+
+        real = h.pipeline.renderer.render
+        h.pipeline.renderer.render = refuse
+        return real
+
+    @staticmethod
+    def as_an_earlier_version_left_it(item):
+        """1.1.0 recorded the reason as a sentence and nothing else."""
+        for key in ("prepared_by", "copy_not_built"):
+            item.state.pop(key, None)
+        item.save()
+
+    def committed_without_a_copy(self, scan=None):
+        h = Harness(self)
+        real = self.broken(h)
+        h.drop(scan or make_scan(letter(3), turn=180, encodings=["jpeg", "ccitt", "jpeg"]))
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
+        self.assertEqual(len(h.paperless.docs[item.state["doc_id"]]["versions"]), 1)
+        self.assertEqual(alert_kinds(h), ["warning"])
+        self.as_an_earlier_version_left_it(item)
+        h.pipeline.renderer.render = real
+        return h, item
+
+    def test_a_scan_already_in_paperless_gets_its_copy_as_a_new_version(self):
+        h, item = self.committed_without_a_copy()
+        doc_id = item.state["doc_id"]
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertEqual(item.state["doc_id"], doc_id)                      # the same document
+        doc = h.paperless.docs[doc_id]
+        self.assertEqual(len(doc["versions"]), 2)
+        self.assertEqual(item.state["rotations"], [180] * 3)
+        self.assertEqual(len(doc["notes"]), 2)
+        self.assertIn("Only the original was stored", doc["notes"][0])
+        self.assertIn("Version 2 was added after the document was first stored", doc["notes"][1])
+        # The warning Jane got about this scan is closed.
+        self.assertEqual(alert_kinds(h), ["warning", "resolved"])
+
+    def test_a_scan_still_on_its_way_in_goes_back_one_step(self):
+        h = Harness(self)
+        real = self.broken(h)
+        h.drop(make_scan(letter(2), encodings=["ccitt", "jpeg"]))
+        h.service.claim_captures()
+        h.clock.advance(31)
+        h.service.claim_captures()
+        item = h.only_item()
+        h.pipeline.prepare(item)                                            # stopped here, as the update did
+        self.assertEqual((item.status, item.state["mode"]), ("ready", "original_only"))
+        self.as_an_earlier_version_left_it(item)
+        h.pipeline.renderer.render = real
+        asked = h.google.calls
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        doc = h.paperless.docs[item.state["doc_id"]]
+        self.assertEqual((len(doc["versions"]), len(doc["notes"])), (2, 1))
+        self.assertNotIn("added after", doc["notes"][0])
+        self.assertEqual(alert_kinds(h), [])
+        self.assertEqual(h.google.calls, asked)                             # Google's saved answer was reused
+
+    def test_each_version_tries_once_and_doesnt_repeat_itself(self):
+        h, item = self.committed_without_a_copy()
+        self.broken(h)                                                      # this version can't build it either
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
+        doc = h.paperless.docs[item.state["doc_id"]]
+        self.assertEqual((len(doc["versions"]), len(doc["notes"])), (1, 1))
+        self.assertEqual(alert_kinds(h), ["warning"])      # said once, not again
+        self.assertEqual(h.pipeline.retry_copies(), [])
+        h.build()                                                           # a restart of the same version
+        self.assertEqual(h.pipeline.retry_copies(), [])
+
+    def test_a_scan_google_refused_is_not_asked_again(self):
+        h = Harness(self)
+        scan = make_scan(letter(2))
+        h.drop(scan)
+        h.service.claim_captures()
+        h.clock.advance(31)
+        h.service.claim_captures()
+        item = h.only_item()
+        h.pipeline._ready_without_google(item, "Google couldn't read this scan (PAGE_LIMIT_EXCEEDED, HTTP 400)")
+        item.state.pop("prepared_by", None)
+        item.save()
+        self.assertEqual(h.pipeline.retry_copies(), [])
+
+    def test_nothing_is_tried_once_the_local_scan_is_gone(self):
+        h, item = self.committed_without_a_copy()
+        item.source_path.unlink()
+        self.assertEqual(h.pipeline.retry_copies(), [])
+        self.assertEqual(h.only_item().status, COMMITTED_WARNING)
+
+    def test_a_scan_jane_kept_with_a_page_missing_isnt_held_again(self):
+        h = Harness(self)
+        real = self.broken(h)
+        h.drop(numbered_letter(3, missing=(2,)))
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, HELD)
+        h.pipeline.keep_as_it_is(item)
+        h.settle()
+        item = h.only_item()
+        self.assertEqual(item.status, COMMITTED_WARNING)
+        self.as_an_earlier_version_left_it(item)
+        h.pipeline.renderer.render = real
+        self.assertEqual(h.pipeline.retry_copies(), [item.sha])
+        h.settle()
+        item = h.only_item()
+        self.assertIn(item.status, {COMMITTED, COMMITTED_WARNING})
+        self.assertNotEqual(item.status, HELD)
+        doc = h.paperless.docs[item.state["doc_id"]]
+        self.assertEqual(len(doc["versions"]), 2)
+        self.assertIn("Kept as it is, by Jane's choice", doc["notes"][-1])
