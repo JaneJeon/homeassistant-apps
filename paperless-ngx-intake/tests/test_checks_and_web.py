@@ -126,21 +126,32 @@ class WebTests(unittest.TestCase):
         self.assertEqual(headers["Location"], "/api/hassio_ingress/abc/")
         self.assertEqual(h.store.all(), [])
 
-    def test_the_page_says_what_was_done_about_documents_that_came_another_way(self):
+    def test_the_page_says_what_was_done_about_scans_stored_before_the_app(self):
         from synth import PageSpec, make_scan
         h = Harness(self)
         page = Page(h.service, h.pipeline, h.settings)
         self.assertIn("None looked at yet", page.render())
-        body = ["A letter uploaded on the web page, with enough words to read",
+        body = ["A letter scanned before the app existed, with enough words to read",
                 "and a second line so that the page counts as one with plenty of text"]
-        h.paperless.add_foreign(make_scan([PageSpec(body)]).pdf)
-        h.paperless.add_foreign(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="<b>photo</b>.png")
+        h.paperless.add_old_scan(make_scan([PageSpec(body)]).pdf)
+        h.paperless.add_old_scan(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="<b>photo</b>.png")
+        h.paperless.add_foreign(make_scan([PageSpec(body)]).pdf, name="no tag.pdf")     # not the app's: not counted
+        h.settle()
+        untagged_later = h.paperless.add_old_scan(make_scan([PageSpec(body)]).pdf)
+        h.google.fail = [503] * 200                                     # its first try waits for Google
+        h.clock.advance(301)
+        h.settle()
+        h.google.fail = []
+        h.paperless.docs[untagged_later]["tags"].remove(h.paperless.tags["Physical Mail"])
+        h.clock.advance(3600)
         h.settle()
         html = page.render()
-        self.assertIn("Other documents in Paperless", html)
-        self.assertIn("2 looked at. 1 given a searchable version.", html)
-        self.assertIn("1 left for the next release of the app.", html)
-        self.assertIn("Document 2: it isn&#x27;t a PDF, and this release reads only PDFs", html)
+        self.assertIn("Scans stored before this app", html)
+        self.assertIn("3 looked at. 1 given a searchable version.", html)
+        self.assertIn("0 left for the next release of the app. 1 can't be done.", html)
+        self.assertIn("1 let go, because the tag was taken off.", html)
+        self.assertIn("Document 2: it isn&#x27;t a PDF. The scanner saves PDFs", html)
+        self.assertIn(f"Document {untagged_later}: it doesn&#x27;t carry the Physical Mail tag", html)
         self.assertNotIn("<b>photo", html)
 
     def test_a_scan_whose_copy_a_later_release_mended_says_so(self):
@@ -164,6 +175,10 @@ class WebTests(unittest.TestCase):
         item.save()
         h.settle()
         self.assertIn("has since given it a searchable version that reads back right", page.render())
+        record = h.documents.load(item.state["doc_id"])
+        record.set("let_go", reason="it doesn't carry the Physical Mail tag")
+        self.assertIn("The Physical Mail tag has since been taken off, so the app has let the document go",
+                      page.render())
 
     def test_only_the_ingress_proxy_may_connect(self):
         h = Harness(self)
