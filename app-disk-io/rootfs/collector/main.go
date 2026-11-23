@@ -99,6 +99,7 @@ func upload(ctx context.Context, client *http.Client, endpoint string, batch [][
 }
 
 func run(ctx context.Context, endpoint string) {
+	catalog := newNameCatalog(os.Getenv("SUPERVISOR_TOKEN"))
 	client := &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -138,6 +139,7 @@ func run(ctx context.Context, endpoint string) {
 			dropped++
 		}
 		sample := render(snap, at, !sourceProblem)
+		sample = catalog.appendSample(ctx, sample, at)
 		sample = fmt.Appendf(sample, "ha_container_io_dropped_samples_total %d %d\n", dropped, at.UnixMilli())
 		pending = append(pending, sample)
 		if err := upload(ctx, client, endpoint, pending); err != nil {

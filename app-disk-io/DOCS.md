@@ -16,6 +16,8 @@ Linux charges these reads and writes to a container across **all its block devic
 
 The `container_name` label matches VictoriaLogs, for example `app_core_samba`. Each counter also includes the full Docker `container_id` so replacement containers keep distinct histories. Calculate rates before summing by name.
 
+The metric `ha_container_io_name_info` maps Docker container names to the app names in Supervisor. It includes installed apps that are stopped and Home Assistant’s system containers. The recorder refreshes the app list in the background every ten minutes, so adding or renaming an app supplies its display name automatically. The numeric counters keep their original labels and history. If two installed apps share a title, the catalog adds their slugs to distinguish them. `ha_container_io_catalog_last_success_timestamp_seconds` records the last successful name refresh.
+
 ## Check coverage
 
 Compare `ha_container_io_discovered` with `ha_container_io_accounted` and `ha_container_io_named`. A scope can disappear during a sample. Names come from the host journal in the background, up to four new lookups per minute. While a name is unavailable, the counters are recorded with the container ID and an empty name. Short-lived containers can start and exit between samples. Host processes outside Docker also use the disk.
@@ -24,4 +26,4 @@ Compare `ha_container_io_discovered` with `ha_container_io_accounted` and `ha_co
 
 ## Configuration
 
-`metrics_url` is the VictoriaMetrics Prometheus import URL. It defaults to the VictoriaMetrics app in this repository. The recorder opens no listening ports. It reads systemd’s resource accounting over the host D-Bus and looks up container names in the read-only system journal. The collector runs with a non-root identity.
+`metrics_url` is the VictoriaMetrics Prometheus import URL. It defaults to the VictoriaMetrics app in this repository. The recorder opens no listening ports. It reads systemd’s resource accounting over the host D-Bus and looks up container names in the read-only system journal. The collector runs with a non-root identity. Its Supervisor API access uses the default role to read the installed app list.
