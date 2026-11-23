@@ -1,5 +1,5 @@
 name: App Disk I/O
-version: 0.1.0
+version: 0.1.1
 slug: app-disk-io
 description: Collect host app disk I/O metrics
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/app-disk-io
@@ -7,6 +7,7 @@ arch:
   - aarch64
   - amd64
 init: false
+hassio_api: true
 host_dbus: true
 journald: true
 options:
