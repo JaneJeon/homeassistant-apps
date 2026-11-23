@@ -469,13 +469,17 @@ class PaperlessE2E(unittest.TestCase):
         settings, store, service, client, notifier = self.harness(loop=True)
         marker = "ottercanal" + uuid.uuid4().hex[:6]
         scan = numbered_letter(2, tag=marker)
-        source = settings.intake_dir / "born-digital-source.pdf"
-        source.parent.mkdir(parents=True, exist_ok=True)
+        # Make a PDF with text in it, without storing anything: the app's own searchable copy of a scan.
+        # The file, Google's answers and the working files each get a folder of their own, as the app keeps them.
+        scratch = settings.intake_dir / "scratch"
+        source = scratch / "source" / "scan.pdf"
+        source.parent.mkdir(parents=True)
         source.write_bytes(scan.pdf)
-        scratch = types.SimpleNamespace(google_dir=lambda: settings.intake_dir / "scratch-google")
-        work = settings.intake_dir / "scratch-work"
-        work.mkdir()
-        made = service.pipeline.make_copy(source, lambda: self.backend(scratch), lambda: work, "a PDF with text")
+        (scratch / "work").mkdir()
+        answers = types.SimpleNamespace(google_dir=lambda: scratch / "google")
+        made = service.pipeline.make_copy(source, lambda: self.backend(answers), lambda: scratch / "work",
+                                          "a PDF with text")
+        self.assertIsNotNone(made.searchable, made.why_not)
         asked = self.google.calls
         doc_id = self.stored_by_other_means(made.searchable, f"statement-{marker}.pdf")
         before = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
