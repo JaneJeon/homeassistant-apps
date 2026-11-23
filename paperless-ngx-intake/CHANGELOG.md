@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.1
+
+Version 1.3.0 was never installed. Before it went in, what the app looks at was cut back to what the app is for.
+
+- **Scanner only.** The app looks after what comes out of the scanner, and nothing else. Version 1.3.0 looked at every document it could see and judged from the file whether it had been scanned. That reached into kinds of document the app was never tested on.
+- **The `Physical Mail` tag is the boundary, and the only test.** The app takes on a stored document only if it carries the tag. The app puts the tag on every scan it stores, and a Paperless rule put it on the scans stored before the app. A document without the tag is not fetched, read or added to.
+- **A scan that is missing the tag is mended on the document:** add the tag in Paperless, and the app takes it on at its next look. The app has no second way of recognising a scan, such as the file's name.
+- Known and accepted: with Paperless's own OCR off, a file with no text inside it that reaches Paperless another way has no search text. It can be found by the missing tag.
+- As planned for 1.3.0, this version starts on three scans stored before the app, so the result can be looked at first. The next version removes the limit.
+- The Mail intake page, the notes, README, DOCS and DESIGN say all this. README and DESIGN have a section "Where the app stops".
+- Tests: a document without the tag, in plain sight of the app, is never looked at, and is taken on once it is given the tag. Both in the unit tests and against real Paperless.
+
+Everything else listed under 1.3.0 below is in this version unchanged, except where 1.3.0 says "every document" or "however it arrived".
+
 ## 1.3.0
 
 Until now the app only saw the scanner's folder. Anything that reached Paperless another way never met it, and with Paperless's own OCR switched off such a document had no search text at all. The same went for everything stored before the app existed.

@@ -13,7 +13,7 @@ configuration:
     description: Full resource name of the pinned OCR processor version.
   physical_mail_tag:
     name: Physical Mail tag
-    description: Paperless tag added to every committed scan.
+    description: Paperless tag that marks what came out of the scanner. The app adds it to every scan it stores, and looks after a stored document only if it carries this tag.
   intake_tag:
     name: Intake tag
     description: Paperless tag marking documents this app uploaded. The Paperless ingest workflow excludes it, so it doesn't also signal Home Assistant.

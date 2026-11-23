@@ -1,13 +1,21 @@
-"""Documents: one record for each document in Paperless, and the loop that keeps them in order.
+"""Documents: one record for each scanner document in Paperless, and the loop that keeps them in order.
 
-How a document arrived matters for one thing only: whether anything could be
-checked before it was stored. That is the scanner's folder, and pipeline.py.
-Once a document is in Paperless the route no longer matters. Every document
-gets the same question: was it scanned, and does it lack a searchable version?
+This app is for what comes out of the scanner, and nothing else. A scan can be
+checked before it is stored, while the paper is still in hand: that is
+pipeline.py. Once a scan is a document in Paperless, one question is left, and
+it can be asked again at any time: does it have a searchable version that
+reads back right?
 
-This file answers that question, for every document the app can see: scans the
-app stored itself, documents that came in through Paperless's web page, phone
-app or email, and everything stored before the app existed.
+This file asks that question of every document that came from the scanner:
+scans the app stored itself, and scans stored before the app existed. It knows
+them by the Physical Mail tag, which Jane's Paperless rule and this app both
+put on what the scanner produces.
+
+The tag is the boundary, and the only one. A document without it is never
+looked at, whatever its file looks like: a file added by hand, a photo, an
+email attachment. A scan that lacks the tag is a gap on that one document, and
+it is mended there, in Paperless, by adding the tag. It is never mended here by
+a second way of deciding, such as the file's name or what is inside it.
 
 Who owns a document. It belongs to its scan record (store.py) until that scan
 has finished going in and has written the document's record here. From then
@@ -88,8 +96,8 @@ TRIES_WHEN_ODD = 3              # tries after something nobody planned for (an e
                                 # and how often work may be cut short together with the whole app
 CAP_SHARE = 0.75                # this work stops at this share of the day's Google pages, so scans keep the rest
 OWN_TEXT_WORDS_PER_PAGE = 20    # a PDF with this much text inside the file was not scanned, or was read by its scanner
-# Release 1.3.0 starts on no more than this many documents that didn't come from the scanner.
-# They are looked at by eye before the next release lifts the limit. None: no limit.
+# Release 1.3.1, the first to run the loop on the Green, starts on no more than this many scans that
+# were stored before the app. They are looked at by eye before the next release lifts the limit. None: no limit.
 NEW_DOCUMENT_LIMIT: int | None = 3
 OWN_LABEL = "Google OCR "       # how every file version the app adds is labelled (pipeline.version_label)
 
@@ -324,6 +332,7 @@ class Documents:
         self._look_again_at = self.clock() + LOOK_MINUTES * 60      # unless this look finds one
         try:
             rows = self.paperless.documents()
+            from_the_scanner = self.paperless.tag_id(self.settings.physical_mail_tag)
         except PaperlessError as error:
             log.info("couldn't ask Paperless what it holds (%s); asking again in %d minutes", error, LOOK_MINUTES)
             return None
@@ -334,6 +343,8 @@ class Documents:
             doc_id = int(row["id"])
             if doc_id in known:
                 continue
+            if from_the_scanner not in (row.get("tags") or []):
+                continue                                  # no Physical Mail tag: not this app's, and nothing else decides
             versions = row.get("versions") or []
             root = next((version for version in versions if version.get("is_root")), None)
             checksum = str((root or {}).get("checksum") or "")
@@ -354,7 +365,7 @@ class Documents:
                     continue                              # otherwise the scan still owns it
                 # Another document that happens to hold the same file: treated like any other.
             if self.limit is not None and started >= self.limit:
-                self._say_once("limit", "this release starts on %d documents that didn't come from the scanner, "
+                self._say_once("limit", "this release starts on %d scans that were stored without the app, "
                                         "and it has; the rest wait for the next release", self.limit)
                 return None
             log.info("document %s has no record yet; looking at it", doc_id)
@@ -604,8 +615,8 @@ class Documents:
                          if redo else
                          "An earlier note here says only the original was stored; that was true then.")
         else:
-            lines = [f"This document came into Paperless another way than the scanner's folder. "
-                     f"paperless-intake {__version__} gave it a searchable version on {day} "
+            lines = [f"This scan was already in Paperless, without a searchable version, when "
+                     f"paperless-intake {__version__} looked at it. It was given one on {day} "
                      f"({mark}, Google OCR {processor}).",
                      "The newest version is the upright, searchable copy; version 1 is the file as it was first stored."]
         order = ORDER_WORDS.get(decided.get("order_status") or "", "as scanned")

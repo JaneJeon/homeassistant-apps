@@ -106,15 +106,16 @@ class Page:
         return ""
 
     def _other_documents(self) -> list[str]:
-        """Documents that didn't come through the scanner's folder: what the app has done about each."""
+        """Scans that were stored without this app: what the app has done about each."""
         documents = getattr(self.service, "documents", None)
         if documents is None:
             return []
         records = [record for record in documents.all() if record.state.get("source") == "paperless"]
-        parts = ["<h2>Other documents in Paperless</h2>",
-                 "<p class='muted'>Documents that came in another way than the scanner's folder, and everything "
-                 "stored before this app. Each is looked at once. A scanned one gets a searchable version from "
-                 "Google. Anything else is left as it is. Nothing here needs you.</p>"]
+        parts = ["<h2>Scans stored before this app</h2>",
+                 "<p class='muted'>Documents with the Physical Mail tag that this app didn't store itself. Each is "
+                 "looked at once. One with no text in it gets a searchable version from Google. One that already "
+                 "has text is left as it is. Documents without the tag are never looked at. "
+                 "Nothing here needs you.</p>"]
         if not records:
             return parts + ["<p class='muted'>None looked at yet.</p>"]
         count = lambda *statuses: sum(1 for record in records if record.status in statuses)  # noqa: E731

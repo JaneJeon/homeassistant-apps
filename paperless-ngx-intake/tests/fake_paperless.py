@@ -38,8 +38,12 @@ class FakePaperless:
         self.me = 7                  # the app's own Paperless user; it sees its own documents and unowned ones
         self.refuse_duplicates = False     # True: Paperless is set to refuse a file it already holds
 
+    def add_old_scan(self, data: bytes, *, name="20261014_101500_000042.pdf", owner=None, tags=(), pages=None) -> int:
+        """A scan stored before the app, through Paperless's own consume folder. Jane's rule tagged it Physical Mail."""
+        return self.add_foreign(data, name=name, owner=owner, tags=[self.tags["Physical Mail"], *tags], pages=pages)
+
     def add_foreign(self, data: bytes, *, name="upload.pdf", owner=None, tags=(), pages=None) -> int:
-        """A document that reached Paperless some other way than through the app."""
+        """A document that reached Paperless some other way: added by hand, from the phone, by email."""
         doc_id = next(self.ids)
         if pages is None:
             try:

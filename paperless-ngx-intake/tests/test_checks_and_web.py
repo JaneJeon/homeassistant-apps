@@ -126,18 +126,19 @@ class WebTests(unittest.TestCase):
         self.assertEqual(headers["Location"], "/api/hassio_ingress/abc/")
         self.assertEqual(h.store.all(), [])
 
-    def test_the_page_says_what_was_done_about_documents_that_came_another_way(self):
+    def test_the_page_says_what_was_done_about_scans_stored_before_the_app(self):
         from synth import PageSpec, make_scan
         h = Harness(self)
         page = Page(h.service, h.pipeline, h.settings)
         self.assertIn("None looked at yet", page.render())
-        body = ["A letter uploaded on the web page, with enough words to read",
+        body = ["A letter scanned before the app existed, with enough words to read",
                 "and a second line so that the page counts as one with plenty of text"]
-        h.paperless.add_foreign(make_scan([PageSpec(body)]).pdf)
-        h.paperless.add_foreign(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="<b>photo</b>.png")
+        h.paperless.add_old_scan(make_scan([PageSpec(body)]).pdf)
+        h.paperless.add_old_scan(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="<b>photo</b>.png")
+        h.paperless.add_foreign(make_scan([PageSpec(body)]).pdf, name="no tag.pdf")     # not the app's: not counted
         h.settle()
         html = page.render()
-        self.assertIn("Other documents in Paperless", html)
+        self.assertIn("Scans stored before this app", html)
         self.assertIn("2 looked at. 1 given a searchable version.", html)
         self.assertIn("1 left for the next release of the app.", html)
         self.assertIn("Document 2: it isn&#x27;t a PDF, and this release reads only PDFs", html)

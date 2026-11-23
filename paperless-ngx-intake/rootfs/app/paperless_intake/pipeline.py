@@ -558,7 +558,8 @@ class Pipeline:
                     item.save()
                     raise
         # Only a document the app stored itself is taken to be this scan's: it carries the intake tag.
-        # The same file stored some other way is someone else's document, and the loop's to look after.
+        # The same file stored some other way is someone else's document. It is never this scan's, and it is
+        # the loop's only if it carries the Physical Mail tag.
         mine = tag_ids[-1]
         doc_id = doc_id or self.paperless.find_by_checksum(item.sha, with_tag=mine)
         if not doc_id:
