@@ -91,7 +91,7 @@ The app works on one thing at a time, from a queue kept in its own records: new 
 
 Nothing starts while:
 
-- **An upload may still be on its way into Paperless.** When an upload times out, or the app is stopped with one in flight, Paperless may still be taking the file in minutes later. Until Paperless shows how that upload ended, the app sends nothing else, so the same file is never sent twice and a struggling Paperless isn't given more. Uploads get 10 minutes to answer. How it ends:
+- **An upload may still be on its way into Paperless.** When an upload times out, or the app is stopped with one in flight, Paperless may still be taking the file in minutes later. Until Paperless shows how that upload ended, the app sends nothing else, so no file is sent again while it may still be on its way, and a struggling Paperless isn't given more. Uploads get 10 minutes to answer. How it ends:
   - **It landed:** the file is in Paperless (found by its checksum).
   - **Its task ended:** the job goes on by its own rules.
   - **It never landed:** its task is still unfinished past Paperless's own time limit (`paperless_worker_timeout`, 30 minutes unless Paperless is set otherwise) and 15 minutes more, or, when the app never got a task id, Paperless has no unfinished upload from after this one. Paperless's worker can die while it takes a file in (a power cut, a restart), and Paperless then leaves the task unfinished for good. The job sends the file again.
@@ -111,7 +111,7 @@ Stored scans also wait:
 - **for two minutes after each one**, because Paperless goes on working on a new file version after it has taken it;
 - **until tomorrow**, once stored scans have used their share of the day's Google pages (below).
 
-**Killed at any moment.** A power cut, an out-of-memory kill or a restart by the Supervisor can stop the app anywhere. When it starts again it carries on every job from the first step not yet done, looking first at what is already there: the file in Paperless by its checksum, the upload's task, the note, the record. It never uploads the same file twice, never counts Google's pages twice, and never sends "started" twice. A job that was in hand when the app stopped isn't counted as a failed try. Only a worker that dies while the app is running counts against its job. A job that takes the whole app down ten times at the same step is set aside: a new scan is held with an alert, a stored scan is left for the next release.
+**Killed at any moment.** A power cut, an out-of-memory kill or a restart by the Supervisor can stop the app anywhere. When it starts again it carries on every job from the first step not yet done, looking first at what is already there: the file in Paperless by its checksum, the upload's task, the note, the record. It never sends a file again while Paperless may still be taking it in, never counts Google's pages twice, and never sends "started" twice. A job that was in hand when the app stopped isn't counted as a failed try. Only a worker that dies while the app is running counts against its job. A job that takes the whole app down ten times at the same step is set aside: a new scan is held with an alert, a stored scan is left for the next release.
 
 ## What you are told
 
