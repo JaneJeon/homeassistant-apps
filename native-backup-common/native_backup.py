@@ -128,8 +128,7 @@ def validate_native(root):
             check_part_list(path.parent, kind)
 
 
-def validate_backup(*, onerror=None):
-    identity = ident(); manifest = json.loads((BACKUP / 'manifest.json').read_text())
+def validate_manifest(manifest, identity):
     for key in ('schema_version', 'engine', 'engine_version', 'installation_id'):
         if manifest.get(key) != identity[key]: raise ValueError('manifest identity mismatch')
     if str(uuid.UUID(manifest['generation'])) != manifest['generation']: raise ValueError('invalid generation')
@@ -139,6 +138,11 @@ def validate_backup(*, onerror=None):
         if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z', value): raise ValueError('invalid timestamp')
         times.append(dt.datetime.fromisoformat(value.replace('Z', '+00:00')))
     if times != sorted(times): raise ValueError('invalid timestamp order')
+
+
+def validate_backup(*, onerror=None):
+    identity = ident(); manifest = json.loads((BACKUP / 'manifest.json').read_text())
+    validate_manifest(manifest, identity)
     files = inventory(BACKUP / 'payload', onerror=onerror)
     if not files or files != manifest['files']: raise ValueError('missing or corrupt backup files')
     parts = manifest['partitions']
@@ -381,6 +385,8 @@ def export():
         if not files: raise ValueError('empty snapshot')
         phase_start = time.monotonic()
         manifest = dict(identity, generation=str(uuid.uuid4()), snapshot_started_at=started, snapshot_completed_at=completed, export_completed_at=now(), partitions=sorted(partitions), files=files)
+        if ENGINE == 'victorialogs':
+            validate_manifest(manifest, identity)
         durable_json(staged / 'manifest.json', manifest)
         if ENGINE == 'victoriametrics':
             fsync_tree(staged)

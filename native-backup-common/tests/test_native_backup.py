@@ -138,6 +138,20 @@ class BackupTests(unittest.TestCase):
         with self.assertRaises(ValueError): m.startup('restore_only')
         with patch.object(m, 'BACKUP', m.WORK / 'previous-backup'): m.validate_backup()
 
+    def test_clock_step_cannot_publish_an_unrestorable_manifest(self):
+        self.do_export()
+        previous = m.validate_backup()
+        times = [
+            '2026-11-23T08:00:00.000000Z',
+            '2026-11-23T08:00:10.000000Z',
+            '2026-11-23T07:59:00.000000Z',
+        ]
+        with patch.object(m, 'now', side_effect=times):
+            with self.assertRaisesRegex(ValueError, 'invalid timestamp order'):
+                self.do_export()
+        self.assertFalse(m.JOURNAL.exists())
+        self.assertEqual(m.validate_backup(), previous)
+
     def test_publish_rename_interruptions_preserve_previous_and_fail_closed(self):
         for fail_at in ('retire', 'promote'):
             with self.subTest(fail_at=fail_at):
