@@ -152,7 +152,7 @@ class MemoryDiskAndPressureTests(unittest.TestCase):
         self.assertEqual(h.google.calls, 0)
 
     def test_a_saturated_disk_or_memory_stalls_hold_scans_too(self):
-        for io, memory, kind in ((30, 0, "io_pressure"), (0, 20, "memory_pressure")):
+        for io, memory, kind in ((60, 0, "io_pressure"), (0, 40, "memory_pressure")):
             h = Harness(self)
             h.green(io=io, memory=memory)
             h.drop(make_scan(letter(1)))
@@ -193,7 +193,7 @@ class MemoryDiskAndPressureTests(unittest.TestCase):
         from paperless_intake.pipeline import GATE_KINDS
         h = Harness(self, min_free_mib=0)
         kinds = set()
-        for green in (dict(available_mib=300), dict(io=50), dict(memory=50)):
+        for green in (dict(available_mib=300), dict(io=70), dict(memory=50)):
             h.green(available_mib=2048)
             h.green(**green)
             kinds.add(h.service.queue._resources().kind)
@@ -201,8 +201,21 @@ class MemoryDiskAndPressureTests(unittest.TestCase):
         kinds.add(h.service.queue._uploads().kind)
         self.assertLessEqual(kinds | {"disk_low"}, GATE_KINDS)
 
+    def test_what_the_gate_reads_is_logged_once_an_hour(self):
+        h = Harness(self)
+        h.green(available_mib=900, io=12.5, memory=3)
+        with self.assertLogs("paperless_intake.jobs", "INFO") as logged:
+            for _ in range(5):
+                h.service.step()
+                h.clock.advance(60)
+            h.clock.advance(3600)
+            h.service.step()
+        readings = [line for line in logged.output if "the Green: I/O pressure" in line]
+        self.assertEqual(len(readings), 2)
+        self.assertIn("I/O pressure 12.5%, memory pressure 3.0% (some, avg60), MemAvailable 900 MiB", readings[0])
+
     def test_a_scan_held_by_the_gate_goes_before_any_stored_document(self):
-        for green in (dict(available_mib=300), dict(io=50)):
+        for green in (dict(available_mib=300), dict(io=70)):
             with self.subTest(**green):
                 self.scan_first(green)
 
@@ -756,7 +769,7 @@ class TagAndOptionTests(unittest.TestCase):
         settings = load()
         self.assertEqual((settings.scanner_tag, settings.intake_tag, settings.webhook_alert), ("Scanner", "Mail Intake", ""))
         self.assertEqual((settings.min_available_mib, settings.max_io_pressure, settings.max_memory_pressure),
-                         (500, 30.0, 20.0))
+                         (500, 60.0, 40.0))
 
 
 class StartingAgainTests(unittest.TestCase):

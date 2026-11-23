@@ -63,6 +63,7 @@ UPLOAD_STRIKES = 3          # uploads of one file Paperless never finished, befo
 TIMED_OUT = -1000           # the exit code SubprocessRunner reports for a worker it stopped after 4 hours
 RESTART_BOUND = 10          # restarts of the whole app, with this job in hand and no step forward, before it is set aside
 RECHECK_SECONDS = 120       # how long a job the gate holds waits before the gate looks again
+READING_SECONDS = 3600      # how often the log gets one line of what the gate reads, to tune its bars by
 
 
 @dataclass
@@ -103,6 +104,7 @@ class Queue:
         self._settle_at = 0.0
         self._settle_backoff = RECHECK_SECONDS
         self._settle_hold: Hold | None = None
+        self._read_at: float | None = None
 
     # Start --------------------------------------------------------------------------------
 
@@ -141,6 +143,7 @@ class Queue:
 
     def next(self) -> Job | None:
         """The job to start now, already leased. None when nothing should start; held says why, for each kind."""
+        self._reading()
         in_doubt = self._uploads()
         item = next((item for item in self.store.all() if self.pipeline.due(item)), None)
         if item is not None:
@@ -234,6 +237,19 @@ class Queue:
                         f"(the app waits at {settings.max_memory_pressure:.0f}%)", "memory_pressure", "memory",
                         until, True)
         return None
+
+    def _reading(self) -> None:
+        """One line an hour of what the gate reads, held back or not, so its bars can be set from real figures."""
+        now = self.clock()
+        if self._read_at is not None and now - self._read_at < READING_SECONDS:
+            return
+        self._read_at = now
+        settings = self.settings
+        shown = lambda value: "unknown" if value is None else f"{value:.1f}%"  # noqa: E731
+        log.info("the Green: I/O pressure %s, memory pressure %s (some, avg60), MemAvailable %s MiB; the app waits "
+                 "at %.0f%%, %.0f%% and under %d MiB", shown(pressure("io", settings.pressure_dir)),
+                 shown(pressure("memory", settings.pressure_dir)), available_mib(settings.meminfo_path),
+                 settings.max_io_pressure, settings.max_memory_pressure, settings.min_available_mib)
 
     def _uploads(self) -> Hold | None:
         """While an upload's outcome isn't known, no job starts. Paperless is asked, never more than the backoff allows."""

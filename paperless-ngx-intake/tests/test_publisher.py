@@ -118,7 +118,7 @@ class ValueTests(unittest.TestCase):
 
     def test_waiting_means_a_scan_is_held_back_and_paused_means_an_outside_reason(self):
         h = Harness(self)
-        h.green(io=50)
+        h.green(io=70)
         h.drop(make_scan(letter(1)))
         h.settle()
         state = snapshot(h.service)

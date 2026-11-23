@@ -26,8 +26,8 @@ options:
   daily_page_cap: 200
   min_free_mib: 1024
   min_available_mib: 500
-  max_io_pressure: 30
-  max_memory_pressure: 20
+  max_io_pressure: 60
+  max_memory_pressure: 40
   paperless_worker_timeout: 1800
   keep_local_copies_days: 7
   watchdog_minutes: 45

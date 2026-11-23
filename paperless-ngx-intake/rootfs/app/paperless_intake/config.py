@@ -61,8 +61,8 @@ class Settings:
     # The queue's gate (jobs.py, gate.py): no job starts below this much available memory, or at or
     # above these shares of the last minute stalled on disk I/O or on memory.
     min_available_mib: int = 500
-    max_io_pressure: float = 30.0
-    max_memory_pressure: float = 20.0
+    max_io_pressure: float = 60.0
+    max_memory_pressure: float = 40.0
     # Paperless's own limit on one task (its PAPERLESS_WORKER_TIMEOUT). A task it leaves unfinished for
     # longer, with 15 minutes more, was lost with its worker (gate.Intent.settle).
     paperless_worker_timeout: float = 1800.0
@@ -126,8 +126,8 @@ def load(options_path: Path | None = None) -> Settings:
         min_free_mib=int(options.get("min_free_mib", 1024)),
         keep_local_copies_days=int(options.get("keep_local_copies_days", 7)),
         min_available_mib=int(options.get("min_available_mib", 500)),
-        max_io_pressure=float(options.get("max_io_pressure", 30)),
-        max_memory_pressure=float(options.get("max_memory_pressure", 20)),
+        max_io_pressure=float(options.get("max_io_pressure", 60)),
+        max_memory_pressure=float(options.get("max_memory_pressure", 40)),
         paperless_worker_timeout=float(options.get("paperless_worker_timeout", 1800)),
         meminfo_path=Path(os.environ.get("INTAKE_MEMINFO", "/proc/meminfo")),
         pressure_dir=Path(os.environ.get("INTAKE_PRESSURE_DIR", "/proc/pressure")),
