@@ -78,7 +78,10 @@ def snapshot(service, *, reachable: bool | None = None) -> dict:
                       key=lambda item: float(item.state.get("next_attempt_at_unix") or 0))
     committed = [float(item.state.get("committed_at_unix") or 0) for item in items
                  if item.status in {COMMITTED, COMMITTED_WARNING}]
-    set_aside = [record for record in records if record.status == GAVE_UP]
+    # Set aside: gave up for good, or left for the next release by this one (3 tries for a fault, 24 for an
+    # outside reason, or 10 restarts). One left by an earlier release is still to re-read: this one tries it.
+    set_aside = [record for record in records if record.status == GAVE_UP
+                 or (record.status == NEXT_RELEASE and record.state.get("by") == __version__)]
 
     # Status. Waiting means one thing: a scan is due and is being held back. A stored scan paused by
     # plan (the pace, tomorrow's pages) is not Waiting: it shows Re-reading or Idle, with the reason.

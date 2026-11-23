@@ -12,7 +12,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from paperless_intake import entities
+from paperless_intake import __version__, entities
 from paperless_intake.documents import GAVE_UP, LATER, NEXT_RELEASE, NOT_A_PDF, Record
 from paperless_intake.jobs import Hold, Job
 from paperless_intake.mqtt import Publisher, broker_from_supervisor
@@ -110,6 +110,11 @@ class ValueTests(unittest.TestCase):
             GAVE_UP, by="1.3.2")
         state = snapshot(h.service)
         self.assertEqual((state["stored_to_reread"], state["stored_set_aside"]), (2, 1))
+        Record(h.documents.dir / "3", {"doc_id": 3, "source": "paperless", "added": [], "tries": {}}).set(
+            NEXT_RELEASE, by=__version__, reason="kept failing")              # this release's tries ran out
+        state = snapshot(h.service)
+        self.assertEqual((state["stored_to_reread"], state["stored_set_aside"]), (1, 2))
+        self.assertIn({"document": 3, "reason": "kept failing"}, state["stored_set_aside_attributes"]["documents"])
 
     def test_waiting_means_a_scan_is_held_back_and_paused_means_an_outside_reason(self):
         h = Harness(self)

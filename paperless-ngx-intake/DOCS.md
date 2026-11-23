@@ -146,7 +146,7 @@ The app publishes what it is doing to Home Assistant over MQTT, as entities of o
 | `sensor.paperless_ngx_scanner_google_pages_today` | Pages sent to Google today. Attributes: the day's cap, and stored scans' share of it |
 | `sensor.paperless_ngx_scanner_google_pages_this_month` | Pages sent to Google this month. Google's free allowance is per month. Counting starts with version 1.4.0 |
 | `sensor.paperless_ngx_scanner_stored_to_reread` | Stored scans still waiting for their searchable version, from Paperless's list as last asked and the records. Unknown until the app has asked once |
-| `sensor.paperless_ngx_scanner_stored_set_aside` | Stored scans that need Jane: not a PDF, or gave up. Attribute: each document's id in Paperless and the reason |
+| `sensor.paperless_ngx_scanner_stored_set_aside` | Stored scans this release has set aside: gave up (not a PDF, say), or left for the next release after its tries ran out. Attribute: each document's id in Paperless and the reason |
 
 Every value is worked out again from the records each time it is published: on every change, and every five minutes. All are sent retained, so Home Assistant has them as soon as it starts. If the app dies, every entity shows unavailable (the availability topic has a last will). Counts are whole numbers of scans or pages. Nothing published holds document text.
 
