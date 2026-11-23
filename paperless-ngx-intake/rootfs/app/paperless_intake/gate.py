@@ -28,6 +28,26 @@ CGROUP_LIMITS = (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/
 NO_LIMIT_V1 = 1 << 62               # cgroup v1 writes "no limit" as a number this big
 HOST_AT_LEAST_MIB = 3.5 * 1024      # the Green has 4 GB. Less than this means the container isn't seeing the host
 SETTLE_AFTER_SECONDS = 300          # an upload with no task id is taken not to have landed only after this long
+# A worker that dies leaves its task "started". A task still "pending" is in a queue, perhaps a long one,
+# so it is taken as lost only much later: its queue message must have been lost.
+PENDING_LOST_AFTER_SECONDS = 6 * 3600
+
+
+def _lost(task: dict, now: float, stale_after: float, since: float) -> tuple[bool, str]:
+    """Whether an unfinished task will never finish, and why, in words.
+
+    Paperless's time limit starts when a task starts running, not when it is queued. So a
+    started task is aged from date_started, against the short limit (stale_after). A pending
+    one, or a started one that doesn't say when it started, is aged from date_created, against
+    the six-hour limit: a long queue is not a dead worker. since: when the app sent the file,
+    for a task that names no time at all.
+    """
+    if task["status"] == "started" and task.get("started"):
+        age = now - task["started"]
+        return age >= stale_after, f"still running {age / 60:.0f} minutes after it started, past Paperless's own time limit"
+    age = now - (task.get("created") or since)
+    return age >= PENDING_LOST_AFTER_SECONDS, (f"still {task['status']} {age / 60:.0f} minutes after Paperless was "
+                                               f"given it, so its queue message must have been lost")
 
 
 def meminfo(path: Path = MEMINFO) -> dict[str, int]:
@@ -143,9 +163,10 @@ class Intent:
         has the same task in its record, deals with a failed one by its own rules), or "lost" (it did
         not land, and the job sends it again). None while it isn't known yet.
 
-        A task Paperless left pending or started for longer than stale_after (its own time limit
-        and a margin) is taken as lost: Paperless's worker died with it, in a power cut say, and
-        Paperless leaves such a task as it was for good.
+        A task Paperless left started for longer than stale_after (its own time limit and a margin)
+        since it started running is taken as lost: Paperless's worker died with it, in a power cut
+        say, and Paperless leaves such a task as it was for good. A task still pending, or started
+        without saying when, is taken as lost only six hours after Paperless was given it.
 
         Raises PaperlessError when Paperless doesn't answer: that is an outside wait, and the caller
         backs off. It never settles a mark by guessing.
@@ -175,18 +196,17 @@ class Intent:
             if task["status"] in COMPLETE:
                 self.close()
                 return "ended", f"Paperless's task for it ended ({task['status']}); the job looks for the file itself"
-            age = now - (task["created"] or at)
-            if age < stale_after:
-                return None                         # Paperless is still working on it
+            lost, why = _lost(task, now, stale_after, at)
+            if not lost:
+                return None                         # Paperless is still working on it, or will be
             self.close()
-            return "lost", (f"it did not land: Paperless's task for it was still {task['status']} after "
-                            f"{age / 60:.0f} minutes, past Paperless's own time limit")
+            return "lost", f"it did not land: Paperless's task for it was {why}"
         if now - at < SETTLE_AFTER_SECONDS:
             return None
         # Only files Paperless was given after the mark went down can be this one. A task stuck from
         # long before (its worker died) must not keep the mark for ever, and nor can one stuck since.
         live = [task for task in paperless.consume_tasks(created_after=at - 60)
-                if now - (task["created"] or now) < stale_after]
+                if not _lost(task, now, stale_after, now)[0]]
         if live:
             return None
         self.close()

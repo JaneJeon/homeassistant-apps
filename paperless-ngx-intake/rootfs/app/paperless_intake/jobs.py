@@ -300,6 +300,13 @@ class Queue:
         """
         log.info("the upload of %s that was in doubt is settled: %s", intent.get("name"), how)
         item, record = self._owner(intent)
+        if outcome == "lost":
+            # The job must send the file again, not wait once more for a task that will never end.
+            key = "upload_task" if intent.get("what") == "original" else "version_task"
+            for owner in (item, record):
+                if owner is not None and owner.state.get(key):
+                    owner.state[key] = None
+                    owner.save()
         if item is not None:
             item.event("upload_settled", outcome=outcome, how=how)
         if record is not None:

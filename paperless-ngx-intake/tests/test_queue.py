@@ -397,7 +397,7 @@ class StuckTaskTests(unittest.TestCase):
         h.settle()
         self.assertTrue(h.pipeline.intent.read()["task"])
         [task] = [name for name, task in h.paperless.tasks.items() if task["status"] == "pending"]
-        h.paperless.tasks[task]["status"] = "started"                       # its worker died with it
+        h.paperless.start(task)                                             # its worker picks it up, then dies
         h.paperless.pending = []                                            # and the file is gone
         h.paperless.slow_uploads = False
         h.clock.advance(self.LIMIT - 120)
@@ -410,7 +410,58 @@ class StuckTaskTests(unittest.TestCase):
         h.clock.advance(31 * 60)
         h.settle()
         self.assertEqual((h.only_item().status, len(h.paperless.docs)), (COMMITTED, 1))
+        self.assertEqual(h.paperless.calls.count("post_document"), 2)       # sent again once, not waited on for ever
         self.assertIn("past Paperless's own time limit",
+                      [e for e in h.only_item().events() if e["event"] == "upload_settled"][0]["how"])
+
+    def test_an_upload_queued_40_minutes_then_running_10_is_sent_once(self):
+        h = Harness(self)
+        h.paperless.slow_uploads = True
+        h.drop(make_scan(letter(1)))
+        h.settle()
+        [task] = [name for name, task in h.paperless.tasks.items() if task["status"] == "pending"]
+        h.clock.advance(40 * 60)
+        h.paperless.start(task)                                             # a long queue, then its turn
+        h.settle()
+        h.clock.advance(6 * 60)                                             # 46 minutes after it was queued
+        h.settle()
+        self.assertIsNotNone(h.pipeline.intent.read())                      # still running: not lost
+        h.clock.advance(4 * 60)
+        h.paperless.slow_uploads = False
+        h.paperless.land()                                                  # it finishes after 10 minutes' work
+        h.settle()
+        h.clock.advance(31 * 60)
+        h.settle()
+        self.assertEqual((h.only_item().status, len(h.paperless.docs)), (COMMITTED, 1))
+        self.assertEqual(h.paperless.calls.count("post_document"), 1)
+
+    def test_a_started_task_that_doesnt_say_when_it_started_gets_only_the_long_limit(self):
+        from paperless_intake.gate import _lost
+        task = {"status": "started", "created": 0.0, "started": None}
+        self.assertFalse(_lost(task, self.LIMIT + 60, self.LIMIT, 0.0)[0])
+        self.assertTrue(_lost(task, 6 * HOUR, self.LIMIT, 0.0)[0])
+        self.assertTrue(_lost(dict(task, started=10.0), self.LIMIT + 10, self.LIMIT, 0.0)[0])
+        self.assertFalse(_lost(dict(task, status="pending"), self.LIMIT + 60, self.LIMIT, 0.0)[0])
+
+    def test_a_task_still_pending_waits_six_hours_because_a_long_queue_is_not_a_dead_worker(self):
+        h = Harness(self)
+        h.paperless.slow_uploads = True
+        h.drop(make_scan(letter(1)))
+        h.settle()
+        [task] = [name for name, task in h.paperless.tasks.items() if task["status"] == "pending"]
+        h.clock.advance(self.LIMIT + 60)                                    # a started task would be lost by now
+        h.settle()
+        self.assertIsNotNone(h.pipeline.intent.read())
+        self.assertEqual(h.paperless.calls.count("post_document"), 1)
+        h.paperless.pending = []                                            # its queue message was lost
+        h.paperless.slow_uploads = False
+        h.clock.advance(6 * HOUR)
+        h.settle()
+        self.assertIsNone(h.pipeline.intent.read())
+        h.clock.advance(31 * 60)
+        h.settle()
+        self.assertEqual((h.only_item().status, len(h.paperless.docs)), (COMMITTED, 1))
+        self.assertIn("its queue message must have been lost",
                       [e for e in h.only_item().events() if e["event"] == "upload_settled"][0]["how"])
 
     def test_without_a_task_id_only_tasks_made_after_the_mark_count_and_none_for_ever(self):
@@ -420,7 +471,8 @@ class StuckTaskTests(unittest.TestCase):
                                              "type": "consume_file"}       # stuck since long before
         h.pipeline.intent.open(what="version", sha256="0" * 64, name="lost.pdf", doc_id=doc_id)
         h.clock.advance(60)
-        h.paperless.tasks["stuck-after"] = {"status": "started", "created": h.clock(), "type": "consume_file"}
+        h.paperless.tasks["stuck-after"] = {"status": "started", "created": h.clock(), "started": h.clock(),
+                                            "type": "consume_file"}
         look(h)
         self.assertIsNotNone(h.pipeline.intent.read())                      # one made after the mark might be ours
         h.clock.advance(self.LIMIT)
@@ -437,7 +489,8 @@ class StuckTaskTests(unittest.TestCase):
             h.settle()
             h.paperless.pending = []                                        # Paperless never files it
             for task in h.paperless.tasks.values():
-                task["status"] = "started" if task["status"] == "pending" else task["status"]
+                if task["status"] == "pending":
+                    task.update(status="started", started=h.clock())
             h.clock.advance(self.LIMIT + 60)
             h.settle()
         item = h.only_item()

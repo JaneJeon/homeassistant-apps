@@ -198,18 +198,23 @@ class FakePaperless:
         task = self.tasks[task_id]
         if task["status"] == "failure":
             raise PaperlessTaskFailed(f"Paperless task {task_id} failure", task["result"])
-        if task["status"] == "pending":
+        if task["status"] in {"pending", "started"}:
             raise PaperlessError(f"Paperless task {task_id} did not finish in time", TIMEOUT, answered=None)
         return task
 
     def task(self, task_id):
         self._check("task")
         task = self.tasks.get(task_id)
-        return {"status": task["status"], "created": task.get("created"), "started": None} if task else None
+        return ({"status": task["status"], "created": task.get("created"), "started": task.get("started")}
+                if task else None)
+
+    def start(self, task_id):
+        """Paperless's worker picks the task up from its queue."""
+        self.tasks[task_id].update(status="started", started=self.clock())
 
     def consume_tasks(self, *, created_after):
         self._check("consume_tasks")
-        return [{"status": task["status"], "created": task.get("created"), "started": None}
+        return [{"status": task["status"], "created": task.get("created"), "started": task.get("started")}
                 for task in self.tasks.values()
                 if task.get("type", "consume_file") == "consume_file" and task["status"] in {"pending", "started"}
                 and (task.get("created") is None or task["created"] >= created_after)]

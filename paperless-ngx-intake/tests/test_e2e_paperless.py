@@ -300,6 +300,8 @@ class PaperlessE2E(unittest.TestCase):
         task = client.task(item.state["upload_task"])
         self.assertEqual(task["status"], "success")
         self.assertLess(abs(task["created"] - time.time()), 600)           # Paperless's own time, as a timestamp
+        self.assertIsNotNone(task["started"])                               # date_started, for the app's own user
+        self.assertGreaterEqual(task["started"], task["created"] - 1)
         self.assertIsNone(client.task(str(uuid.uuid4())))
         deadline = time.time() + 120
         while client.consume_tasks(created_after=time.time() - 3600) and time.time() < deadline:
