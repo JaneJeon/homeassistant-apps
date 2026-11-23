@@ -8,56 +8,44 @@ Gives every scanned document in Paperless-ngx an upright, ordered, searchable ve
 flowchart TD
     scanner["Brother ADS-1800W scanner<br/>double-sided, drops blank pages"]
     doors["Any other way in:<br/>Paperless's web page, phone app, email,<br/>and everything stored before this app"]
-    google["Google Document AI<br/>reads the text (OCR)"]
     telegram["Telegram"]
 
     subgraph green["Home Assistant Green"]
         samba["Samba share app<br/>/share/paperless/capture"]
 
-        subgraph intake["Paperless Intake app (this folder)"]
-            subgraph first["Before storing. Only a scan can be checked while you still have the paper"]
-                pick["Pick up the scan<br/>and keep it byte for byte"]
-                make["Make the searchable version:<br/>same page images, upright, in order,<br/>Google's text laid on top"]
-                gap{"Does a page<br/>look missing?"}
-                held["Held on the Mail intake page<br/>until you keep or discard it"]
-                store["Store both, then read back<br/>and compare"]
-            end
-            subgraph second["After storing. The same question for every document, however it arrived"]
-                need{"Was it scanned, and does it<br/>lack a searchable version?"}
-                add["Make one the same way<br/>and add it"]
-                record["One record per document:<br/>done, not needed, gave up,<br/>or left for the next release"]
-            end
+        subgraph before["Paperless Intake app, before storing: only a scan can be checked while you still have the paper"]
+            make["Make the searchable version:<br/>Google Document AI reads the pages,<br/>the app turns them upright, puts them in order<br/>and lays the text on top"]
+            gap{"Does a page<br/>look missing?"}
+            held["Held on the Mail intake page<br/>until you keep or discard it"]
+            store["Store both, then read back<br/>and compare"]
         end
 
-        subgraph paperless["Paperless-ngx app (stock)"]
-            doc["A document<br/>Version 1: the file as it arrived, untouched<br/>Newest version: the searchable one,<br/>which is what is shown and searched"]
+        doc["Paperless-ngx app (stock): a document<br/>Version 1: the file as it arrived, untouched<br/>Newest version: the searchable one,<br/>which is what is shown and searched"]
+
+        subgraph after["Paperless Intake app, after storing: the same question for every document"]
+            need{"Was it scanned, and does it<br/>lack a searchable version?"}
+            add["Make one the same way and<br/>add it as the newest version"]
+            record["One record per document:<br/>done, not needed, gave up,<br/>or left for the next release"]
         end
 
         ha["Home Assistant automation<br/>Alert - Paperless intake"]
     end
 
-    scanner -- "SMB" --> samba --> pick --> make --> gap
-    gap -- "yes" --> held
+    scanner -- "SMB" --> samba --> make --> gap
     gap -- "no" --> store
+    gap -- "yes" --> held
     held -- "keep as it is" --> store
-    store -- "REST: upload, then add a version" --> doc
-    store -- "hands the document over" --> record
+    store -- "REST" --> doc
     doors --> doc
     doc -- "asked every few minutes:<br/>what do you hold?" --> need
-    need -- "yes" --> add
+    need -- "yes" --> add --> record
     need -- "no" --> record
-    add -- "REST: add a version and a note" --> doc
-    add --> record
-    make <-- "pages out, text and positions back" --> google
-    add <--> google
-    held -. "alert" .-> ha
-    store -. "alert, only when something needs a look" .-> ha
-    ha -.-> telegram
+    held -. "alert" .-> ha -.-> telegram
 ```
 
-Solid arrows are the path of a document. Dotted arrows are alerts.
+Solid arrows are the path of a document. Dotted arrows are alerts. A stored scan can also raise an alert, only when something about it needs a look.
 
-How a document arrived matters for one thing only: whether anything can be checked before it is stored. That is the top box. Once a document is in Paperless, the bottom box treats them all alike. Each document has one owner at a time: a scan belongs to the top box until it has finished going in, and to the bottom box from then on. The app works on one thing at a time, and scans always go first.
+How a document arrived matters for one thing only: whether anything can be checked before it is stored. That is the top box. Once a document is in Paperless, the bottom box treats them all alike, and adds what it makes to the same document. Each document has one owner at a time: a scan belongs to the top box until it has finished going in, and to the bottom box from then on. The app works on one thing at a time, and scans always go first.
 
 ## Who does what
 
