@@ -138,6 +138,7 @@ Every step looks first. A kill (power cut, out-of-memory, the Supervisor's stop)
 | Owner cleared, note added | the next step not yet done | each is looked for before it is done again |
 | Outcome written with its alert queued | "finished" or the alert not yet sent | sent from the record; "finished" at most once, alerts at least once |
 | Outcome written, before the hand-over | no document record | written from the scan's record (`adopt_scans`) |
+| Outcome written, before Google's answers were summarised | the raw answers, page images and all | a worker summarises them; the service never loads them |
 | Stored scan done, before tidying or closing the scan's alert | working files left, alert open | tidied, and closed |
 | Lease written | the job is in hand | resumed; not a try |
 

@@ -54,7 +54,7 @@ from .paperless import NO_TAG, Paperless, PaperlessError, PaperlessTaskFailed
 from .searchable import sha256
 from .store import (COMMITTED, COMMITTED_WARNING, COMMITTING, CAPTURED, DISCARDED, FAILED, HELD, READY, WAITING,
                     Item, Store,
-                    iso, now, write_atomic)
+                    copy_atomic, iso, now, write_atomic)
 from .usage import GoogleUsage
 
 # A scan has ended, for the watchdog's count, once it is in one of these.
@@ -188,6 +188,7 @@ class Pipeline:
         self.intent = Intent(settings.intake_dir / "upload-in-doubt.json", clock)
         # Set by wiring: where a scan's document is handed over once the scan has finished going in.
         self.documents = None
+        self.left_to_tidy: list[str] = []      # committed scans whose Google answers a worker summarises (recover)
 
     # Dispatch -------------------------------------------------------------------
 
@@ -936,7 +937,7 @@ class Pipeline:
                 path = item.root / name
                 kept = item.root / f"{name.split('.')[0]}.by-{earlier}.{name.split('.', 1)[1]}"
                 if path.exists() and not kept.exists():
-                    write_atomic(kept, path.read_bytes())
+                    copy_atomic(path, kept)
             item.event("prepared_again", by=__version__, was_by=earlier)
             item.set(CAPTURED, waiting_since_unix=None, alerted_reason_kind=None)
             again.append(item.sha)
@@ -997,6 +998,7 @@ class Pipeline:
     def recover(self) -> list[str]:
         """When the app starts: finish what a kill left owed for every scan. Safe to run any number of times."""
         done = []
+        self.left_to_tidy = []
         for item in self.store.all():
             state = item.state
             if state.get("started_sending") and state.get("started_sent") is None:
@@ -1012,10 +1014,12 @@ class Pipeline:
                 done.append(f"sent what was owed to Home Assistant for {item.sha[:12]}")
             if item.status in {COMMITTED, COMMITTED_WARNING} and (item.root / "google").exists():
                 if (item.root / "google-summary.json.gz").exists():
-                    shutil.rmtree(item.root / "google", ignore_errors=True)
+                    shutil.rmtree(item.root / "google", ignore_errors=True)       # nothing in them is needed
                     shutil.rmtree(item.root / "work", ignore_errors=True)
                 else:
-                    self._tidy_after_commit(item)
+                    # The summary is made from the raw answers, page images and all. That is a worker's job:
+                    # the service never loads large files (Service.start runs it).
+                    self.left_to_tidy.append(item.sha)
             if item.status == DISCARDED:
                 self._move_discarded(item)               # discarded, then killed before it was moved aside
                 done.append(f"moved discarded {item.sha[:12]} aside")

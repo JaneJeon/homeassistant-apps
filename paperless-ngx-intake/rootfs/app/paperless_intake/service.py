@@ -52,6 +52,10 @@ class SubprocessRunner:
     def document(self, record) -> int:
         return self._run("document", str(record.doc_id))
 
+    def tidy(self, sha: str) -> int:
+        """Summarise a committed scan's Google answers and drop them (pipeline._tidy_after_commit)."""
+        return self._run("tidy", sha)
+
     def _run(self, *arguments: str) -> int:
         child = subprocess.Popen([*self.command, *arguments], env=self.env)
         self._child = child
@@ -100,7 +104,14 @@ class Service:
     def start(self) -> list[str]:
         """Put every record back in a state the queue understands. Run once, before the loop."""
         with self.lock:
-            return self.queue.recover()
+            done = self.queue.recover()
+            for sha in self.pipeline.left_to_tidy:
+                if self.runner is None:
+                    self.pipeline._tidy_after_commit(self.store.load(sha))
+                else:
+                    self.runner.tidy(sha)
+                done.append(f"summarised the Google answers of {sha[:12]}, left by a kill after it went in")
+            return done
 
     def _told(self) -> None:
         if self.poke is not None:

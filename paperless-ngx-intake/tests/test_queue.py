@@ -6,6 +6,8 @@ import json
 import os
 import time
 import unittest
+import unittest.mock
+from pathlib import Path
 
 import requests
 
@@ -787,6 +789,53 @@ class StartingAgainTests(unittest.TestCase):
         self.assertEqual((item.status, item.state["original_name"]), ("captured", "20261101_100000_000500.pdf"))
         h.settle()
         self.assertEqual(h.store.load(sha).status, COMMITTED)
+
+    def test_google_answers_left_after_a_scan_went_in_are_summarised_by_a_worker_not_the_service(self):
+        h = Harness(self)
+        h.drop(make_scan(letter(1)))
+        h.settle()
+        item = h.only_item()
+        (item.root / "google-summary.json.gz").unlink()                     # killed after "committed", before tidying
+        answer = item.root / "google" / "run-1" / "chunk" / "attempt-1"
+        answer.mkdir(parents=True)
+        (answer / "response.json").write_text(json.dumps({"document": {"pages": [{"image": {"content": "eA=="}}]}}))
+        (answer / "manifest.json").write_text(json.dumps({"status": "complete"}))
+
+        class Runner:
+            stopping = False
+            tidied = []
+
+            def tidy(self, sha):
+                self.tidied.append(sha)
+                return 0
+        h.build()
+        runner = Runner()
+        h.service.runner = runner
+        opened = []
+        real_open = Path.open
+
+        def watch(path, *args, **kwargs):
+            if path.name == "response.json":
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+        with unittest.mock.patch.object(Path, "open", watch), \
+                unittest.mock.patch.object(Path, "read_bytes", lambda path: opened.append(path) or real_open(path, "rb").read()):
+            h.service.start()
+        self.assertEqual(runner.tidied, [item.sha])
+        self.assertEqual([path for path in opened if path.name == "response.json"], [])   # the service didn't load it
+        h.restart()                                                         # in the tests' own process: done there
+        self.assertTrue((item.root / "google-summary.json.gz").exists())
+        self.assertFalse((item.root / "google").exists())
+
+    def test_google_answers_are_just_removed_when_their_summary_was_written(self):
+        h = Harness(self)
+        h.drop(make_scan(letter(1)))
+        h.settle()
+        item = h.only_item()
+        (item.root / "google" / "run-1").mkdir(parents=True)
+        h.restart()
+        self.assertFalse((item.root / "google").exists())
+        self.assertEqual(h.pipeline.left_to_tidy, [])
 
     def test_records_from_132_are_resumed_as_they_are(self):
         h = Harness(self)

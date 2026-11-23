@@ -75,6 +75,20 @@ def write_atomic(path: Path, data: bytes, mode: int = 0o644) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def copy_atomic(source: Path, path: Path) -> None:
+    """write_atomic for a file that may be large: copied in pieces, never read whole."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with source.open("rb") as reader, temporary.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, 1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, path)
+        fsync_dir(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def append_line(path: Path, line: str) -> None:
     """One line onto a history file. A kill can leave the last line cut off; readers skip it."""
     with path.open("a", encoding="utf-8") as stream:
