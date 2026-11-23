@@ -227,7 +227,7 @@ class PaperlessE2E(unittest.TestCase):
                                            token_provider=token_provider, transport=google)
 
         pipeline = Pipeline(settings, store, client, notifier, token_provider=token_provider, backend_factory=backend)
-        self.documents = Documents(settings, store, client, pipeline, limit=None)
+        self.documents = Documents(settings, store, client, pipeline)
         pipeline.documents = self.documents
         self.google = google
         self.backend = backend
