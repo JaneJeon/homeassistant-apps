@@ -204,7 +204,7 @@ paperless_intake_google_key: |
 - **Paperless API token**: the token of the dedicated Paperless user (see Paperless setup).
 - **Scanner tag** (`scanner_tag`, default `Scanner`) and **Intake tag** (`intake_tag`, default `Mail Intake`): the two tag names (see Paperless setup). The old option `physical_mail_tag` is gone. The Supervisor drops it from the stored options, with a warning in its own log.
 - **Google service-account key**: the Document AI service account's key. The app loads it from options; no key file is written.
-- **Webhook IDs**, none of which has a default. An empty one means: don't send.
+- **Webhook IDs**. An empty one means: don't send.
   - `webhook_started` and `webhook_finished` are the existing ingest-watchdog webhooks.
   - `webhook_alert` feeds the alert automation.
 - **Paperless worker timeout** (`paperless_worker_timeout`, default 1800 seconds): the same as Paperless's own `PAPERLESS_WORKER_TIMEOUT`. Set it to match if Paperless is set otherwise. See When the app waits.

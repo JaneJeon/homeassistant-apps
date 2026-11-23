@@ -23,6 +23,9 @@ options:
   scanner_tag: Scanner
   intake_tag: Mail Intake
   ha_url: http://homeassistant:8123
+  webhook_started: 3b9d98f8-989d-4d0e-93f6-b9ad7aa683c1
+  webhook_finished: f2de5a2c-7360-4387-9698-88ab679fcd74
+  webhook_alert: bbd89851-5a89-4848-bba2-7a5e4d70925e
   daily_page_cap: 200
   min_free_mib: 1024
   min_available_mib: 500
