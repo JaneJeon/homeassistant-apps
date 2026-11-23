@@ -14,14 +14,14 @@ import (
 func TestNameCatalogRefreshAndRetention(t *testing.T) {
 	body := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" || r.Header.Get("Authorization") != "Bearer fixture-token" {
+		if r.Method != "GET" || r.URL.Path != "/supervisor/info" || r.Header.Get("Authorization") != "Bearer fixture-token" {
 			t.Error("incorrect credentials or method")
 		}
 		io.WriteString(w, <-body)
 	}))
 	defer srv.Close()
 	c := newNameCatalog("fixture-token")
-	c.url = srv.URL
+	c.url = strings.Replace(c.url, "http://supervisor", srv.URL, 1)
 	ctx := context.Background()
 	body <- `{"result":"ok","data":{"addons":[{"slug":"local_one","name":"Weather \"North\"","state":"stopped"},{"slug":"local_one","name":"Weather \"North\""},{"slug":"empty","name":""},{"name":"unmatched"}]}}`
 	c.refresh(ctx)
