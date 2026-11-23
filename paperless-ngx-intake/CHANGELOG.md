@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+Google is meant to be the only reader. Paperless still read every raw scan itself with Tesseract, and that second reading showed in two places: the document's date, and what Paperless displays as version 1 (its own turned and cleaned rendition, not the scan). This version makes the app ready for Paperless with its own OCR switched off.
+
+- **The document's date is the day it was scanned.** The app takes it from the scanner's file name, or uses the day it picked the file up, and gives it to Paperless with the upload. Paperless no longer guesses a date from its own reading of the raw scan.
+- **Works with Paperless's OCR mode `off` and archive file generation `never`.** The end-to-end tests now run against Paperless set that way as well as against its defaults. A scan that goes in without its Google copy then has no search text, and its note says that instead of saying Paperless did its own OCR.
+- **The warning for Paperless re-saving the searchable copy says what happened and where to look.** The check itself is not new: after every scan the app looks for an archive file on the copy. The tests now also run against Paperless set to archive every PDF, to prove the warning is sent.
+- README: a diagram of the whole path, and tables of who does what and where each part is defined.
+
 ## 1.1.3
 
 Version 1.1.2 put both real scans into Paperless upright and in page order. Both came with a warning that about one word in twenty was missing from Paperless's search text.

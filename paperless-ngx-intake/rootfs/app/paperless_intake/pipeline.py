@@ -35,6 +35,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -54,6 +55,29 @@ from .store import (COMMITTED, COMMITTED_WARNING, COMMITTING, CAPTURED, DISCARDE
 
 log = logging.getLogger(__name__)
 
+# The scanner names a file after its own clock: 20261122_144510_000353.pdf.
+_SCANNER_NAME = re.compile(r"^(\d{4})(\d{2})(\d{2})_\d{6}(?:[_.]|$)")
+
+
+def scan_date(original_name: str, captured_at_unix: float) -> str:
+    """The day the paper was scanned, which the app gives Paperless as the document's date.
+
+    Taken from the scanner's file name. Without one, or with one from a clock that is plainly
+    wrong (ahead of the day the app picked the file up), it is the day the app picked the file
+    up, in the app's own time zone. Paperless would otherwise guess a date from its own reading
+    of the raw scan, and that reading is not the one anybody sees.
+    """
+    picked_up = datetime.fromtimestamp(captured_at_unix).date()
+    match = _SCANNER_NAME.match(original_name or "")
+    if match:
+        try:
+            named = date(*(int(part) for part in match.groups()))
+        except ValueError:
+            named = None
+        if named and date(2000, 1, 1) <= named <= picked_up + timedelta(days=1):
+            return named.isoformat()
+    return picked_up.isoformat()
+
 WITH_GOOGLE = "with_google"
 ORIGINAL_ONLY = "original_only"
 
@@ -70,9 +94,15 @@ ORDER_WORDS = {
 
 # Reasons version 1.0 held a scan for that no longer hold one. Scans still held for
 # them are put back through the checks once, when this version starts.
+COPY_RESAVED = "Paperless made its own archive file of the searchable copy and shows that in its place"
+# The same warning as versions before 1.2.0 worded it, so a document that already carries it isn't alerted again.
+_EARLIER_WORDING = {"Paperless re-ran its own OCR on the searchable copy": COPY_RESAVED}
+
+
 def _kinds(reason: str | None) -> set[str]:
     """The warnings in a reason, without the figures in brackets: what they are about, not how much."""
-    return {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
+    kinds = {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
+    return {_EARLIER_WORDING.get(kind, kind) for kind in kinds}
 
 
 COPY_RETRIES = 3            # tries per app version to add a copy an earlier version couldn't build
@@ -507,7 +537,9 @@ class Pipeline:
                     raise
         doc_id = doc_id or self.paperless.find_by_checksum(item.sha)
         if not doc_id:
-            task_id = self.paperless.post_document(item.state["original_name"], original, tag_ids=tag_ids)
+            created = scan_date(item.state["original_name"], float(item.state.get("captured_at_unix") or self.clock()))
+            task_id = self.paperless.post_document(item.state["original_name"], original, tag_ids=tag_ids,
+                                                   created=created)
             item.event("uploaded_original", task=task_id)
             item.state["upload_task"] = task_id
             item.save()
@@ -605,7 +637,10 @@ class Pipeline:
                 metadata = self.paperless.metadata(doc_id, version.id)
                 record["version_has_archive"] = metadata.get("has_archive_version")
                 if metadata.get("has_archive_version"):
-                    warnings.append("Paperless re-ran its own OCR on the searchable copy")
+                    # Paperless leaves a PDF that has text alone only while its OCR mode is auto or
+                    # off and its archive file generation is auto or never. This is how the app
+                    # notices that one of them changed: by what Paperless did, not by what it is set to.
+                    warnings.append(f"{COPY_RESAVED} (see Paperless's OCR mode and archive file generation settings)")
                 google_text = (item.root / "text.txt").read_text(encoding="utf-8")
                 match = checks.text_matches(google_text, document.get("content") or "")
                 record["text_match"] = match
@@ -614,6 +649,10 @@ class Pipeline:
                     warnings.append(f"Paperless's search text differs from Google's "
                                     f"({match['missing_words']} of {match['google_words']} words missing)")
                 record["version_id"] = version.id
+        if mode == ORIGINAL_ONLY:
+            # With Paperless's own OCR switched off, a scan that goes in without its copy has no text at all.
+            item.state["paperless_read_it"] = bool((document.get("content") or "").strip())
+            record["paperless_read_it"] = item.state["paperless_read_it"]
         item.event("read_back", doc_id=doc_id, problems=problems, warnings=warnings, **record)
         return problems, warnings
 
@@ -649,10 +688,16 @@ class Pipeline:
             if state.get("quality_notes"):
                 lines.append("Text layer: " + "; ".join(state["quality_notes"]) + ". The page images aren't affected.")
         elif state.get("no_google_copy_reason"):
+            # Only a copy the app itself failed to build is tried again, by the next version of the app.
+            own = ("Paperless did its own OCR" if state.get("paperless_read_it", True)
+                   else "It has no search text until a newer version of the app builds the copy"
+                   if state.get("copy_not_built") else "It has no search text")
             lines.append(f"Only the original was stored, because {state['no_google_copy_reason']}. "
-                         f"Paperless did its own OCR, and the pages are as the scanner saved them.")
+                         f"{own}, and the pages are as the scanner saved them.")
         elif state.get("short_text"):
-            lines.append("Google found almost no text, so only the original was stored and Paperless did its own OCR.")
+            own = (" and Paperless did its own OCR" if state.get("paperless_read_it", True)
+                   else ". Paperless has no search text for it")
+            lines.append(f"Google found almost no text, so only the original was stored{own}.")
         else:
             lines.append("Only the original was stored.")
         if state.get("copy_note_needed") and mode == WITH_GOOGLE:

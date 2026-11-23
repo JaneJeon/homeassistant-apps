@@ -56,3 +56,22 @@ jobs:
         run: |
           echo "Paperless version under test: $(grep -v '^#' ../rootfs/app/tested-paperless-version)"
           python -m unittest -v test_e2e_paperless
+
+      # Paperless as Jane runs it once Google is the only reader: no Tesseract, no archive files.
+      - name: End-to-end tests against Paperless with its own OCR and archive files off
+        working-directory: paperless-ngx-intake/tests
+        env:
+          PYTHONPATH: ../rootfs/app:.
+          INTAKE_E2E: "1"
+          INTAKE_E2E_PAPERLESS_ENV: "PAPERLESS_OCR_MODE=off,PAPERLESS_ARCHIVE_FILE_GENERATION=never"
+        run: python -m unittest -v test_e2e_paperless
+
+      # The setting that would make Paperless re-save the searchable copy. The app must say so.
+      - name: The app notices when Paperless is set to archive every PDF
+        working-directory: paperless-ngx-intake/tests
+        env:
+          PYTHONPATH: ../rootfs/app:.
+          INTAKE_E2E: "1"
+          INTAKE_E2E_PAPERLESS_ENV: "PAPERLESS_ARCHIVE_FILE_GENERATION=always"
+          INTAKE_E2E_EXPECT_COPY_REWORKED: "1"
+        run: python -m unittest -v test_e2e_paperless.PaperlessE2E.test_commit_reads_back_and_searches_on_google_text
