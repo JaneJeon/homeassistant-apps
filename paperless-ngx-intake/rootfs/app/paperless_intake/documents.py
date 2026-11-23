@@ -30,11 +30,11 @@ it, and if it has none, why. events.jsonl beside it keeps every change of state.
   done          it has its searchable version, and Paperless reads it back right
   not_needed    for good: the file has its own text, or almost no text at all,
                 or someone else added a file version to the document
-  gave_up       for good: it can't be done (Google can't read it, or it is
-                gone from Paperless). The reason is recorded
+  gave_up       for good: it can't be done (Google can't read it, it isn't a
+                PDF, or it is gone from Paperless). The reason is recorded
   next_release  this release couldn't, and the next release of the app tries
                 once: the searchable version reads back badly or couldn't be
-                built, the file isn't a PDF, or a day of tries didn't get through
+                built, or a day of tries didn't get through
   later         not now: tried again in an hour, or tomorrow when stored
                 documents have used their share of the day's Google pages
   working       handed out to be worked on. Found like this when the app
@@ -86,6 +86,7 @@ NEXT_RELEASE = "next_release"
 LATER = "later"
 WORKING = "working"
 
+NOT_A_PDF = "it isn't a PDF. The scanner saves PDFs, and this app reads nothing else"
 WORDS = {DONE: "has its searchable version", NOT_NEEDED: "needs nothing from the app",
          GAVE_UP: "is left as it is, for good", NEXT_RELEASE: "is left for the next release of the app"}
 
@@ -498,7 +499,7 @@ class Documents:
             if not data.startswith(b"%PDF-"):
                 record.state["kind"] = "not_pdf"
                 record.save()
-                raise NextRelease("it isn't a PDF, and this release reads only PDFs")
+                raise GiveUp(NOT_A_PDF)
             # Tested on the file itself. Paperless's own text for the document is no guide:
             # for an old document it holds Tesseract's reading of a scan.
             record.state["kind"] = "has_text" if _has_own_text(record.source_path) else "scanned"
@@ -506,7 +507,7 @@ class Documents:
         if record.state["kind"] == "has_text":
             raise NotNeeded("the file already has text inside it, so there is nothing to read off the page images")
         if record.state["kind"] != "scanned":
-            raise NextRelease("it isn't a PDF, and this release reads only PDFs")
+            raise GiveUp(NOT_A_PDF)
 
         # 3. The searchable version. Built once and kept until the work ends, so work that is
         #    started again offers Paperless the same bytes and can ask whether it has them.

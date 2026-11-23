@@ -52,9 +52,9 @@ The invisible text covers the characters almost all mail uses (Unicode's basic p
 
 The app also looks after scans that are already stored: the ones from before the app existed, and any whose searchable version failed the first time.
 
-**The `Physical Mail` tag is the boundary.** The app puts the tag on every scan it stores, and a Paperless rule put it on every scan that came through Paperless's own consume folder before the app. The app takes on a stored document only if it carries the tag. Nothing else decides: not the file's name, not its owner, not what is inside it.
+**The `Physical Mail` tag is the boundary.** It says: this came out of the scanner. The app puts the tag on every scan it stores, and a Paperless rule put it on the scans that came through Paperless's own consume folder before the app. The app takes on a stored document only if it carries the tag. Nothing else decides: not the file's name, not its owner, not what is inside it.
 
-- **A scan that is missing the tag** is a gap on that one document. Add the tag in Paperless, and the app takes the document on at its next look. The app has no second way of recognising a scan, and shouldn't be given one.
+- **A scan that is missing the tag** is a gap on that one document. Jane adds the tag in Paperless, and the app takes the document on at its next look. The app never changes tags on a stored document. It has no second way of recognising a scan, and shouldn't be given one.
 - **A document without the tag is left alone:** a file added on Paperless's web page, a photo from the phone, an email attachment. The app doesn't fetch it, read it or add to it. With Paperless's own OCR off, such a file has search text only if it has text inside it already. That is known and accepted for now, and the missing tag is how to find those documents in Paperless.
 - The tag is looked at when the app first meets a document. Taking the tag off a document the app already has a record for doesn't make the app forget it.
 
@@ -62,7 +62,7 @@ Every five minutes, when no scan is waiting, the app asks Paperless for its list
 
 - **No text inside the file** (what the scanner saves): it gets a searchable version made the same way as for a scan on its way in. Google reads it, the pages are turned upright and put in order, and the result is added as the newest version with a note. Version 1 stays as it was.
 - **Text already inside the file** (a scanner set to read pages itself): left exactly as it is. There is nothing to read off the page images.
-- **Not a PDF** (a photo that was given the tag): left for a later version of the app that can read images.
+- **Not a PDF:** not something the scanner saves, so the tag on it is probably a mistake. The app sets it aside for good and lists it on the Mail intake page with the reason. Giving a photo the tag does not get it read.
 
 The app keeps one small record per document (see Files). Every document ends in one of four outcomes: **done**, **not needed** (for good), **gave up** (for good, with the reason), or **next release** (this version of the app couldn't, and the next one tries once). The Mail intake page has a section listing them.
 
@@ -82,10 +82,17 @@ Three limits apply:
 
 **A scan the app can't see.** Paperless hides a document that has an owner from every other user who isn't a superuser. A scan from Paperless's consume folder has no owner, and the app clears the owner on the scans it stores, so those are visible. A scan that does have an owner (one that was added by hand on Paperless's web page belongs to whoever added it) is hidden from the app even with the tag on it. Clear the owner on that document, or give the app's user View and Change permission on it. The end-to-end tests check both halves: an owned document is invisible, and it is picked up once it is shared.
 
+**If a scan that carries the tag isn't picked up,** look in this order:
+
+1. The Mail intake page. It lists every stored scan the app has looked at, and the reason when nothing was done.
+2. The document's owner in Paperless. If it has one, the app can't see it (above).
+3. This version's limit of three stored scans.
+4. Scans on their way in and the day's Google pages come first, so a stored scan can wait until tomorrow.
+
 ## What you are told
 
 - Nothing, when a scan went in normally. The document's note in Paperless has the details.
-- Nothing, ever, about a scan that was already in Paperless. Its note and the Mail intake page say what was done.
+- Nothing, ever, from the work on scans that are already stored (previous section). The document's note and the Mail intake page say what was done.
 - **Held:** a page looks missing, the file can't be read, or a day of retries failed. Keep that paper.
 - **Waiting:** something needs attention before scans can go in (Google's setup, an untested Paperless version, a crashed worker, an unexpected error in the app). Sent once per cause.
 - **Warning:** the scan is in Paperless but something about it needs a look, such as no Google copy.
@@ -119,6 +126,8 @@ Scans are worked on one at a time, each in a short-lived worker process. On a sy
   | `auto` | `auto` | The defaults. Paperless reads the raw scan itself and shows its own turned and cleaned rendition as version 1. It leaves the searchable copy alone, because the copy already has text. |
   | `off` | `never` | Paperless reads nothing and re-saves nothing. Version 1 is shown exactly as the scanner saved it, and a scan lands in seconds, not minutes. A scan that goes in without its Google copy has no search text until the copy is built. A file with no text inside it that is added to Paperless some other way has no search text at all, because this app only looks after documents that carry `Physical Mail`. |
   | `redo`, `force` | or `always` | Paperless re-saves the searchable copy and shows its own file in its place. Don't use these. |
+
+  **This system runs the second row, `off` and `never`.** That is Jane's decision: Google is the only reader, with no fallback. The app works with the first row too, but there a scan whose Google copy fails keeps Tesseract's text, which is the silent fallback she ruled out.
 
   The end-to-end tests run against the first two rows, and against `always` to prove the third is noticed. The app can't read these settings. After every scan it checks what Paperless did: if the copy got an archive file, the scan's alert says so.
 - **The "document added" ingest workflow must skip the `Mail intake` tag.** Add the filter "Does not have these tags: Mail intake" to its trigger. The app already signals Home Assistant itself, so without the filter each scan counts as finished twice. The workflow's source filter can't do this: Paperless checks sources only on "consumption started" triggers. The end-to-end tests check both points.

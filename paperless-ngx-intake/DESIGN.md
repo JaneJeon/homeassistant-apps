@@ -13,7 +13,7 @@ Words used here:
 
 ## What it has to do
 
-- Google is the only thing that reads a scan. Paperless's own OCR does not run.
+- Google is the only thing that reads a scan. Paperless's own OCR does not run: this system has Paperless's OCR mode set to `off`. The app also works with Paperless's defaults, and is tested with them, but that is not how this system runs.
 - The app looks after what comes out of the scanner: scans arriving now, and scans stored before the app existed. Nothing else in Paperless is its to touch.
 - It knows its own documents by one tag, and by nothing else.
 - Each piece of work has one owner. Nothing is done twice, and nothing is missed after a restart.
@@ -23,11 +23,15 @@ Words used here:
 
 This is the part to read before changing what the app looks at.
 
-**The `Physical Mail` tag is the boundary.** The app puts the tag on every scan it stores. A Paperless workflow put it on every scan that came through Paperless's own consume folder before the app existed. The loop over stored documents takes one on only if it carries the tag.
+**The `Physical Mail` tag is the boundary.** It says one thing: this came out of the scanner. The app puts the tag on every scan it stores. A Paperless workflow put it on the scans that came through Paperless's own consume folder before the app existed. The loop over stored documents takes one on only if it carries the tag.
 
-**The tag is the only test.** Jane's rule, decided 2026-11-22: tags represent the truth, and each part of the system knows its documents by tag. The app does not work out from a file's name, its owner or its contents whether a document "is really a scan".
+**The tag is the only test** of whether a stored document is the app's to look after. Jane's rule, decided 2026-11-22: tags represent the truth, and each part of the system knows its documents by tag. The app does not work out from a file's name, its owner or its contents whether a document "is really a scan".
 
-**A wrong tag is fixed on the document.** A scan without the tag is a gap on that one document. She adds the tag in Paperless, and the loop takes the document on at its next look. The gap is never closed by giving the app a second way to recognise scans.
+Which half of the app is working on one of its own documents at a given moment is a different question. The app answers that from its own records (see "Who owns a document"), and that is not a second test of what a document is. The `Mail intake` tag is the same kind of thing as `Physical Mail`: a tag that states a fact, here "this app uploaded it".
+
+**A wrong tag is fixed on the document.** A scan without the tag is a gap on that one document. Jane adds the tag in Paperless, and the loop takes the document on at its next look. The gap is never closed by giving the app a second way to recognise scans.
+
+**Tags are Jane's.** The app never writes a tag on a stored document. Someone working on this system who finds a scan without the tag tells her, and does not tag documents on their own. And a file is never given the tag as a way to get it read: the tag says the scanner produced it. A tagged file that is not a PDF is set aside for good, with the reason shown on the Mail intake page.
 
 Why one test and not two. A tag is declared, it shows in Paperless, anything can filter by it, and it can be corrected on a single document. A rule such as "the file is named the way the scanner names files" is a detail of one scanner model. Nobody can see it, and it cannot be corrected for one document. With two tests, everything that touches documents later has to know both and how they disagree. With one, a wrong case is a fix to one document's data.
 
@@ -35,7 +39,7 @@ Why one test and not two. A tag is declared, it shows in Paperless, anything can
 
 Another way in needs answers this app does not have: what the original is (paper in hand, or a file that already exists somewhere), what can be checked before it is stored, what is kept about where it came from, and who reads it when it has no text. The searchable version has only ever been tested on this scanner's pages.
 
-**One limit of the tag.** The loop looks at the tag when it first meets a document. A document the app already has a record for stays the app's if the tag is taken off later.
+**One limit of the tag.** The loop looks at the tag when it first meets a document. A document the app already has a record for stays the app's if the tag is taken off later. In practice that matters only for a document whose searchable version failed or reads back badly: the next release tries it once more, tag or no tag. A document that is done is never touched again.
 
 How it came to this. Release 1.3.0, as merged, looked at every document the app's user could see and judged from the file whether it had been scanned. That reached into kinds of document that do not exist here yet and that the app was never tested on. Jane narrowed it to the scanner. The first attempt at the narrowing then swapped the tag for the scanner's file-name pattern, because one early scan in her Paperless has no tag. That was the wrong fix: the document had a gap, and the rule did not.
 
@@ -93,7 +97,7 @@ There is no lock file. Home Assistant runs exactly one container for the app, th
 4. Look at its version 1 and decide what work there is. This is about what the file needs, never about whether the document is the app's. The tag has already settled that.
    - **No text inside the file:** what the scanner saves. It needs a searchable version. Tested on the file itself. Paperless's text field is no guide, because for old documents it holds Tesseract's reading.
    - **Text already inside the file:** a scanner set to read pages itself. Recorded as "not needed", for good.
-   - **Not a PDF:** a photo that was given the tag. Recorded as "next release". A release that can read images picks these up.
+   - **Not a PDF:** not something the scanner saves, so the tag is probably the mistake. Recorded as "gave up", for good, with the reason.
 5. For one with no text inside: Google reads it, the app decides upright and order for the stack, builds the searchable version, adds it to the document, reads it back, writes a note, and records "done".
 
 **If it stops halfway**, it starts that document again from the top and skips what is already done. Each step looks first: is the file here, is the searchable version built, does the document already have it, is the note there. So a step that runs twice does its work once. An outcome that has been written down stands: trouble afterwards, such as a full disk while the working files are removed, cannot turn "done" back into "try again".
@@ -108,7 +112,7 @@ There is no lock file. Home Assistant runs exactly one container for the app, th
 | --- | --- |
 | done | It has its searchable version, and Paperless reads it back right |
 | not needed | For good. The file has its own text, or almost none, or somebody else added a file version |
-| gave up | For good. Google cannot read it, or it is gone from Paperless |
+| gave up | For good. Google cannot read it, it is not a PDF, or it is gone from Paperless |
 | next release | This release could not. The next release of the app tries once |
 
 **On the way there, something can be in the way:**
@@ -158,12 +162,15 @@ That code is deleted. The same need is met by the record: "has a searchable vers
 
 **The one instant that is left open.** Paperless takes an upload, answers, and then needs a few seconds to file it. If the app is killed in the instant between that answer and writing it down, and restarts before Paperless has finished filing, the app cannot see that the file is on its way and sends it again. The result would be two identical file versions on one document, or, for a scan's original, two documents that Paperless flags as duplicates. Nothing is lost either way. Closing it needs Paperless to recognise a repeated upload, which it does not offer. This has been true since 1.0 and is listed here so that it is known, not discovered.
 
-## What comes next, and what is not this app's
+## What comes next for this app
 
-- **Lifting the three-document limit**, once the first three stored scans have been looked at.
+- **Lifting the three-document limit**, once the first three stored scans have been looked at in Paperless.
+
+## What is not this app's
+
 - **Other ways in** (email, uploads on Paperless's web page, photos from the phone). Each needs its own design: see "Where the app stops". Until one exists, those documents carry no `Physical Mail` tag and this app leaves them alone.
 - **Dates, people, and what a document is about.** That is understanding a document, a separate part of the system from scanning it reliably. It reads what this app stores. It is not built here.
-- **Duplicates.** The same letter scanned twice is two different files. Its own research and design first. Nothing that deletes or merges is built without Jane.
+- **Duplicates.** The same letter scanned twice is two different files, and telling that needs the text, not the file. It belongs with understanding. Finding and showing likely duplicates is research. Anything that deletes, merges or hides a document needs Jane first.
 
 ## What the two reviews changed
 

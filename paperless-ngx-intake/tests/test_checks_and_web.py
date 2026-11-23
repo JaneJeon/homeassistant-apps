@@ -140,8 +140,8 @@ class WebTests(unittest.TestCase):
         html = page.render()
         self.assertIn("Scans stored before this app", html)
         self.assertIn("2 looked at. 1 given a searchable version.", html)
-        self.assertIn("1 left for the next release of the app.", html)
-        self.assertIn("Document 2: it isn&#x27;t a PDF, and this release reads only PDFs", html)
+        self.assertIn("0 left for the next release of the app. 1 can't be done.", html)
+        self.assertIn("Document 2: it isn&#x27;t a PDF. The scanner saves PDFs", html)
         self.assertNotIn("<b>photo", html)
 
     def test_a_scan_whose_copy_a_later_release_mended_says_so(self):

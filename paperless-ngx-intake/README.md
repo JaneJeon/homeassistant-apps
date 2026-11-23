@@ -45,7 +45,7 @@ flowchart TD
     held -. "alert" .-> ha -.-> telegram
 ```
 
-Solid arrows are the path of a document. Dotted arrows are alerts. A stored scan can also raise an alert, only when something about it needs a look.
+Solid arrows are the path of a document. Dotted arrows are alerts. A scan that has just gone in can also raise an alert, a warning, when something about it needs a look (it went in without its searchable version, say). The bottom box never alerts.
 
 The top box is the only place a scan can be checked while you still have the paper. The bottom box finishes the same job for scans that are already stored: the ones from before this app, and any whose searchable version failed the first time. It adds what it makes to the same document. Each document has one owner at a time: a scan belongs to the top box until it has finished going in, and to the bottom box from then on. The app works on one thing at a time, and scans always go first.
 
@@ -53,8 +53,9 @@ Documents that reach Paperless any other way (its web page, the phone app, email
 
 ## Where the app stops
 
-- **The `Physical Mail` tag is the boundary.** The app puts the tag on every scan it stores. A Paperless rule put it on every scan that came through Paperless's own consume folder before the app. The app takes on a stored document only if it carries the tag.
-- **The tag is the only test.** The app never works out from a file's name, its owner or what is inside it whether a document "is really a scan". If a scan is missing the tag, that is a gap on that one document. Add the tag in Paperless and the app takes the document on within minutes. Don't teach the app a second way to recognise scans.
+- **The `Physical Mail` tag is the boundary.** It says: this came out of the scanner. The app puts the tag on every scan it stores. A Paperless rule put it on the scans that came through Paperless's own consume folder before the app. The app takes on a stored document only if it carries the tag.
+- **The tag is the only test.** The app never works out from a file's name, its owner or what is inside it whether a document "is really a scan". If a scan is missing the tag, that is a gap on that one document. Jane adds the tag in Paperless and the app takes the document on within minutes. Don't teach the app a second way to recognise scans.
+- **Tags are Jane's.** The app never changes a tag on a stored document. If you are working on this system and find a scan without the tag, tell her. Don't tag documents yourself, and don't give a file the tag to get it read: a tagged file that isn't a PDF is set aside for good and listed on the Mail intake page.
 - **Everything without the tag is left alone:** a file added on Paperless's web page, a photo from the phone, an email attachment. The app doesn't fetch it, read it or add to it.
 - **Known and accepted for now.** With Paperless's own OCR off, a file with no text inside it that arrives another way has no search text. Those documents can be found in Paperless by the missing tag. Another way in needs its own design before anything reads what it brings.
 
@@ -81,6 +82,8 @@ Two Paperless settings keep it this way. Both are in Paperless under Configurati
 - **Mode** `auto` or `off`. Paperless's documentation says `redo` and `force` OCR every document again, which would replace Google's text in the copy.
 - **Archive file generation** `auto` or `never`. With `always`, Paperless makes a PDF/A archive even of a PDF that has text, and shows its own re-saved file in place of the copy.
 
+**This system runs `off` and `never`.** That is Jane's decision: Google is the only reader, with no fallback. The app also works with Paperless's defaults and is tested with them, but with mode `auto` a scan whose Google copy fails keeps Tesseract's text without anyone being told it isn't Google's, which is the silent fallback she ruled out.
+
 `auto` and `auto` are Paperless's defaults. `off` and `never` take Paperless out of the reading altogether: it stores and searches what this app gives it, and version 1 is shown exactly as the scanner saved it. The end-to-end tests run both ways, and once against `always` to prove the app notices. The app can't read the settings themselves. After every scan it checks what Paperless did, and the scan's alert says so if the copy got an archive file. See [DOCS.md](DOCS.md).
 
 ## Where each part is defined
@@ -88,6 +91,7 @@ Two Paperless settings keep it this way. Both are in Paperless under Configurati
 | Part | Where it lives |
 | --- | --- |
 | This app's code and image | This folder. CI publishes `ghcr.io/janejeon/paperless-intake` |
+| Which version is running | Home Assistant, on the app's own page. This repository says what the code does, not what is installed |
 | The top box of the picture | `pipeline.py`. One record per scan in `/share/paperless/intake/items/` |
 | The bottom box of the picture | `documents.py`. One record per document in `/share/paperless/intake/documents/` |
 | Adding a searchable version and reading it back | `searchable.py`, used by both boxes |

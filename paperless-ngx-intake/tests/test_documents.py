@@ -607,19 +607,19 @@ class ScansStoredBeforeTheAppTests(Base):
         self.assertIn("Paperless didn't take the new file version", record.state["reason"])
         self.assertEqual((h.google.calls, h.notifier.sent), (1, []))
 
-    def test_a_tagged_file_that_isnt_a_pdf_waits_for_a_release_that_can_read_it(self):
-        # A photo Jane tagged Physical Mail herself. The tag makes it the app's to look at, and the app can't read it.
+    def test_a_tagged_file_that_isnt_a_pdf_is_set_aside_for_good_with_the_reason(self):
+        # A photo that was given the Physical Mail tag. The tag makes it the app's to look at. The scanner saves
+        # PDFs, so the tag is probably the mistake, and giving a photo the tag must not be a way to get it read.
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="photo.png")
         h.settle()
         record = self.record(h, doc_id)
-        self.assertEqual((record.status, record.state["kind"]), (NEXT_RELEASE, "not_pdf"))
+        self.assertEqual((record.status, record.state["kind"]), (GAVE_UP, "not_pdf"))
+        self.assertIn("it isn't a PDF", record.state["reason"])
         self.assertEqual((h.google.calls, h.notifier.sent), (0, []))
         self.assertNothingToDo(h)
         a_newer_release_starts(h)
-        h.settle()
-        record = self.record(h, doc_id)
-        self.assertEqual((record.status, record.state["by"]), (NEXT_RELEASE, __version__))  # looked at once per release
+        self.assertNothingToDo(h)                                           # a later release doesn't look again
 
     def test_a_scan_with_almost_no_text_is_left_alone(self):
         h = Harness(self)
