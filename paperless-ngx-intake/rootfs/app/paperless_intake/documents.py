@@ -39,12 +39,19 @@ it, and if it has none, why. events.jsonl beside it keeps every change of state.
                 documents have used their share of the day's Google pages
   working       handed out to be worked on. Found like this when the app
                 starts, the work was cut short, and it is started again first
+  let_go        not an outcome of the work: the tag was taken off, so the app
+                did nothing to it. Taken on again if the tag comes back
+
+The tag is checked every time the app is about to work on a stored document,
+before anything is fetched. A document that already has its searchable version
+is never worked on again, so taking its tag off changes nothing.
 
 The loop (service.py calls step() when no scan is waiting). One document at a
 time. A document cut short is done first. Then one that is due another try.
 Then one left for this release by an earlier one. Then the next document in
-Paperless that has no record: every few minutes the app asks Paperless for its list, so
-nothing has to tell the app that a document arrived. If work stops halfway it
+Paperless that carries the tag and has no record, or was let go and carries the
+tag again: every few minutes the app asks Paperless for the documents with the
+tag, so nothing has to tell the app that a document arrived. If work stops halfway it
 starts again from the top and skips what is already done: is the file here, is
 the searchable version built, does the document already have it, is the note
 there.
@@ -85,10 +92,12 @@ GAVE_UP = "gave_up"
 NEXT_RELEASE = "next_release"
 LATER = "later"
 WORKING = "working"
+LET_GO = "let_go"
 
 NOT_A_PDF = "it isn't a PDF. The scanner saves PDFs, and this app reads nothing else"
 WORDS = {DONE: "has its searchable version", NOT_NEEDED: "needs nothing from the app",
-         GAVE_UP: "is left as it is, for good", NEXT_RELEASE: "is left for the next release of the app"}
+         GAVE_UP: "is left as it is, for good", NEXT_RELEASE: "is left for the next release of the app",
+         LET_GO: "is let go"}
 
 LOOK_MINUTES = 5                # how often Paperless is asked what it holds, when there was nothing to do
 LATER_MINUTES = 60              # the wait between tries when something outside was in the way
@@ -105,6 +114,10 @@ OWN_LABEL = "Google OCR "       # how every file version the app adds is labelle
 
 class NotNeeded(Exception):
     """This document needs no searchable version from the app, now or later."""
+
+
+class NotOurs(Exception):
+    """This document no longer carries the Physical Mail tag, so it isn't the app's to work on."""
 
 
 class GiveUp(Exception):
@@ -332,20 +345,34 @@ class Documents:
         """The next document in Paperless that has no record. Asks Paperless; nothing is pushed to the app."""
         self._look_again_at = self.clock() + LOOK_MINUTES * 60      # unless this look finds one
         try:
-            rows = self.paperless.documents()
             from_the_scanner = self.paperless.tag_id(self.settings.physical_mail_tag)
+        except PaperlessError as error:
+            log.info("couldn't find the Physical Mail tag in Paperless (%s); looking again in %d minutes",
+                     error, LOOK_MINUTES)
+            return None
+        try:
+            rows = self.paperless.documents(with_tag=from_the_scanner)
         except PaperlessError as error:
             log.info("couldn't ask Paperless what it holds (%s); asking again in %d minutes", error, LOOK_MINUTES)
             return None
-        known = {record.doc_id for record in records}
+        let_go = {record.doc_id: record for record in records if record.status == LET_GO}
+        known = {record.doc_id for record in records if record.status != LET_GO}
         started = sum(1 for record in records if record.state.get("source") == "paperless"
-                      and record.status != NOT_NEEDED and record.state.get("kind") != "not_pdf")
+                      and record.status not in {NOT_NEEDED, LET_GO} and record.state.get("kind") != "not_pdf")
         for row in sorted(rows, key=lambda row: int(row["id"])):
             doc_id = int(row["id"])
             if doc_id in known:
                 continue
+            # Paperless was asked for these documents only. The same test is made on its answer, so that
+            # a Paperless version that ignored the filter could never widen what the app touches.
             if from_the_scanner not in (row.get("tags") or []):
                 continue                                  # no Physical Mail tag: not this app's, and nothing else decides
+            if doc_id in let_go:
+                # Let go when its tag was taken off, and the tag is back. What the record knows is kept.
+                # It was taken on once already, so the limit on new documents doesn't apply to it again.
+                log.info("document %s carries the Physical Mail tag again; taking it on again", doc_id)
+                self._look_again_at = 0.0
+                return let_go[doc_id]
             versions = row.get("versions") or []
             root = next((version for version in versions if version.get("is_root")), None)
             checksum = str((root or {}).get("checksum") or "")
@@ -397,6 +424,9 @@ class Documents:
             self._finish(record, NOT_NEEDED, str(outcome))
         except GiveUp as outcome:
             self._finish(record, GAVE_UP, str(outcome))
+        except NotOurs as outcome:
+            # Not an outcome of the work: the tag is gone. No alert, and nothing is written to Paperless.
+            self._finish(record, LET_GO, str(outcome))
         except NextRelease as outcome:
             self._finish(record, NEXT_RELEASE, str(outcome))
         except NotToday as outcome:
@@ -453,13 +483,18 @@ class Documents:
         if not self.pipeline.version_accepted(live):
             raise Later(f"Paperless is {live}, but the app was tested on {self.settings.tested_paperless_version}")
 
-        # 1. The document as Paperless has it now.
+        # 1. The document as Paperless has it now. Fetched once, and checked for the tag before anything
+        #    is downloaded: the tag may have been taken off since the app last worked on it.
         try:
-            versions = self.paperless.versions(doc_id)
+            document = self.paperless.document(doc_id)
         except PaperlessError as error:
             if "HTTP 404" in str(error):
                 raise GiveUp("the document is no longer in Paperless, or the app may no longer see it")
             raise Later(str(error))
+        from_the_scanner = self._ask(lambda: self.paperless.tag_id(self.settings.physical_mail_tag))
+        if from_the_scanner not in (document.get("tags") or []):
+            raise NotOurs("it doesn't carry the Physical Mail tag")
+        versions = Paperless.versions_in(document)
         root = next((version for version in versions if version.is_root), None)
         if root is None:
             raise GiveUp("Paperless doesn't say which file version is the first")

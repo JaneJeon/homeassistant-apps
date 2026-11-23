@@ -29,7 +29,7 @@ This is the part to read before changing what the app looks at.
 
 Which half of the app is working on one of its own documents at a given moment is a different question. The app answers that from its own records (see "Who owns a document"), and that is not a second test of what a document is. The `Mail intake` tag is the same kind of thing as `Physical Mail`: a tag that states a fact, here "this app uploaded it".
 
-**A wrong tag is fixed on the document.** A scan without the tag is a gap on that one document. Jane adds the tag in Paperless, and the loop takes the document on at its next look. The gap is never closed by giving the app a second way to recognise scans.
+**A wrong tag is fixed on the document.** A scan without the tag is a gap on that one document. Jane adds the tag in Paperless, and the loop takes the document on at its next look. (Release 1.3.1 starts on only three stored scans, so after those a newly tagged one waits for the next release.) The gap is never closed by giving the app a second way to recognise scans.
 
 **Tags are Jane's.** The app never writes a tag on a stored document. Someone working on this system who finds a scan without the tag tells her, and does not tag documents on their own. And a file is never given the tag as a way to get it read: the tag says the scanner produced it. A tagged file that is not a PDF is set aside for good, with the reason shown on the Mail intake page.
 
@@ -39,7 +39,7 @@ Why one test and not two. A tag is declared, it shows in Paperless, anything can
 
 Another way in needs answers this app does not have: what the original is (paper in hand, or a file that already exists somewhere), what can be checked before it is stored, what is kept about where it came from, and who reads it when it has no text. The searchable version has only ever been tested on this scanner's pages.
 
-**One limit of the tag.** The loop looks at the tag when it first meets a document. A document the app already has a record for stays the app's if the tag is taken off later. In practice that matters only for a document whose searchable version failed or reads back badly: the next release tries it once more, tag or no tag. A document that is done is never touched again.
+**The tag is checked every time.** The loop checks the tag every time it is about to work on a stored document, before it fetches anything. If the tag has been taken off, the app does nothing to the document and lets it go. If the tag comes back, the app takes the document on again, and what its record knows is kept. A document that already has its searchable version stays as it is: nothing works on it again, so taking the tag off changes nothing for it. The app also asks Paperless only for the documents that carry the tag, and checks the tag again on each one Paperless sends.
 
 How it came to this. Release 1.3.0, as merged, looked at every document the app's user could see and judged from the file whether it had been scanned. That reached into kinds of document that do not exist here yet and that the app was never tested on. Jane narrowed it to the scanner. The first attempt at the narrowing then swapped the tag for the scanner's file-name pattern, because one early scan in her Paperless has no tag. That was the wrong fix: the document had a gap, and the rule did not.
 
@@ -93,7 +93,7 @@ There is no lock file. Home Assistant runs exactly one container for the app, th
 
 1. If a document's work was cut short, finish it.
 2. Otherwise take one that is due another try, then one an earlier release left for this one.
-3. Otherwise ask Paperless for its list of documents (at most every five minutes) and take the first one that carries the `Physical Mail` tag and has no record. A document without the tag is passed over: not fetched, not recorded.
+3. Otherwise ask Paperless for the documents that carry the `Physical Mail` tag (at most every five minutes) and take the first one that has no record, or that was let go and carries the tag again. A document without the tag is not even listed: not fetched, not recorded.
 4. Look at its version 1 and decide what work there is. This is about what the file needs, never about whether the document is the app's. The tag has already settled that.
    - **No text inside the file:** what the scanner saves. It needs a searchable version. Tested on the file itself. Paperless's text field is no guide, because for old documents it holds Tesseract's reading.
    - **Text already inside the file:** a scanner set to read pages itself. Recorded as "not needed", for good.
@@ -114,6 +114,8 @@ There is no lock file. Home Assistant runs exactly one container for the app, th
 | not needed | For good. The file has its own text, or almost none, or somebody else added a file version |
 | gave up | For good. Google cannot read it, it is not a PDF, or it is gone from Paperless |
 | next release | This release could not. The next release of the app tries once |
+
+"Let go" is not an outcome of the work. It is what the record says when the tag is gone, and the document is taken on again if the tag comes back.
 
 **On the way there, something can be in the way:**
 

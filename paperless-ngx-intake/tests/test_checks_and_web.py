@@ -137,11 +137,21 @@ class WebTests(unittest.TestCase):
         h.paperless.add_old_scan(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="<b>photo</b>.png")
         h.paperless.add_foreign(make_scan([PageSpec(body)]).pdf, name="no tag.pdf")     # not the app's: not counted
         h.settle()
+        untagged_later = h.paperless.add_old_scan(make_scan([PageSpec(body)]).pdf)
+        h.google.fail = [503] * 200                                     # its first try waits for Google
+        h.clock.advance(301)
+        h.settle()
+        h.google.fail = []
+        h.paperless.docs[untagged_later]["tags"].remove(h.paperless.tags["Physical Mail"])
+        h.clock.advance(3600)
+        h.settle()
         html = page.render()
         self.assertIn("Scans stored before this app", html)
-        self.assertIn("2 looked at. 1 given a searchable version.", html)
+        self.assertIn("3 looked at. 1 given a searchable version.", html)
         self.assertIn("0 left for the next release of the app. 1 can't be done.", html)
+        self.assertIn("1 let go, because the tag was taken off.", html)
         self.assertIn("Document 2: it isn&#x27;t a PDF. The scanner saves PDFs", html)
+        self.assertIn(f"Document {untagged_later}: it doesn&#x27;t carry the Physical Mail tag", html)
         self.assertNotIn("<b>photo", html)
 
     def test_a_scan_whose_copy_a_later_release_mended_says_so(self):

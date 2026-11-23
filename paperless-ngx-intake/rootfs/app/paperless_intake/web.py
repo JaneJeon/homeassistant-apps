@@ -112,8 +112,8 @@ class Page:
             return []
         records = [record for record in documents.all() if record.state.get("source") == "paperless"]
         parts = ["<h2>Scans stored before this app</h2>",
-                 "<p class='muted'>Documents with the Physical Mail tag that this app didn't store itself. Each is "
-                 "looked at once. One with no text in it gets a searchable version from Google. One that already "
+                 "<p class='muted'>Scans the app found already stored in Paperless: the ones from before this "
+                 "app. One with no text in it gets a searchable version from Google. One that already "
                  "has text is left as it is. Documents without the tag are never looked at. "
                  "Nothing here needs you.</p>"]
         if not records:
@@ -124,8 +124,9 @@ class Page:
                      f"{count('not_needed')} left as they are, with nothing for Google to read. "
                      f"{count('next_release')} left for the next release of the app. "
                      f"{count('gave_up')} can't be done. "
+                     f"{count('let_go')} let go, because the tag was taken off. "
                      f"{count('later', 'working')} in progress.</div>")
-        open_ones = [record for record in records if record.status in {"next_release", "gave_up", "later"}]
+        open_ones = [record for record in records if record.status in {"next_release", "gave_up", "later", "let_go"}]
         if open_ones:
             parts.append("<div class='card'>" + "<br>".join(
                 f"Document {record.doc_id}: {html.escape(record.state.get('reason') or record.status)}"

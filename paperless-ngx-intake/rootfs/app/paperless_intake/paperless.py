@@ -86,21 +86,32 @@ class Paperless:
     def document(self, doc_id: int) -> dict:
         return self._request("GET", f"/api/documents/{doc_id}/").json()
 
-    def documents(self) -> list[dict]:
-        """Every document this user can see, without its text: id, tags, versions, page count and file name."""
+    def documents(self, *, with_tag: int | None = None) -> list[dict]:
+        """The documents this user can see, without their text: id, tags, versions, page count and file name.
+
+        with_tag: only the ones that carry this tag. Paperless does the filtering, so nothing else is sent.
+        Without it, every document this user can see.
+        """
         rows, page = [], 1
         while True:
-            body = self._request("GET", "/api/documents/", params={
-                "page": page, "page_size": 100, "ordering": "id",
-                "fields": "id,tags,versions,page_count,original_file_name"}).json()
+            params = {"page": page, "page_size": 100, "ordering": "id",
+                      "fields": "id,tags,versions,page_count,original_file_name"}
+            if with_tag is not None:
+                params["tags__id__all"] = with_tag
+            body = self._request("GET", "/api/documents/", params=params).json()
             rows.extend(body.get("results") or [])
             if not body.get("next"):
                 return rows
             page += 1
 
     def versions(self, doc_id: int) -> list[Version]:
+        return self.versions_in(self.document(doc_id))
+
+    @staticmethod
+    def versions_in(document: dict) -> list[Version]:
+        """The file versions listed in a document that was already fetched, newest first."""
         return [Version(int(v["id"]), v.get("checksum"), v.get("version_label"), bool(v.get("is_root")))
-                for v in self.document(doc_id).get("versions") or []]
+                for v in document.get("versions") or []]
 
     def metadata(self, doc_id: int, version_id: int | None = None) -> dict:
         params = {"version": version_id} if version_id else None

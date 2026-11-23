@@ -65,13 +65,14 @@ class FakePaperless:
     def _missing(self, doc_id):
         return PaperlessError(f"Paperless GET /api/documents/{doc_id}/ returned HTTP 404")
 
-    def documents(self):
+    def documents(self, *, with_tag=None):
         self._check("documents")
         return [{"id": doc_id, "tags": doc["tags"], "page_count": doc.get("pages"),
                  "original_file_name": doc.get("name"),
                  "versions": [{"id": v["id"], "checksum": v["checksum"], "version_label": v["label"],
                                "is_root": v["id"] == doc_id} for v in doc["versions"]]}
-                for doc_id, doc in sorted(self.docs.items()) if self._visible(doc_id)]
+                for doc_id, doc in sorted(self.docs.items())
+                if self._visible(doc_id) and (with_tag is None or with_tag in doc["tags"])]
 
     def notes(self, doc_id):
         self._check("notes")
@@ -179,7 +180,8 @@ class FakePaperless:
             raise self._missing(doc_id)
         doc = self.docs[doc_id]
         return {"id": doc_id, "tags": doc["tags"], "owner": doc["owner"], "content": doc["versions"][0]["content"],
-                "versions": [{"id": v["id"], "checksum": v["checksum"]} for v in doc["versions"]]}
+                "versions": [{"id": v["id"], "checksum": v["checksum"], "version_label": v["label"],
+                              "is_root": v["id"] == doc_id} for v in doc["versions"]]}
 
     def metadata(self, doc_id, version_id=None):
         self._check("metadata")

@@ -269,11 +269,17 @@ class PaperlessE2E(unittest.TestCase):
             self.api.patch(f"{self.base}/api/documents/{doc_id}/", json=changes).raise_for_status()
         return doc_id
 
-    def give_the_loop_its_turns(self, service, rounds=40):
+    def give_the_loop_its_turns(self, service, rounds=200):
+        """Let the loop work until it has nothing left to do, and fail if it never gets there.
+
+        Documents from earlier tests share this Paperless. If the rounds ran out first, a check that the
+        loop left a document alone would pass without the loop ever having reached it.
+        """
         for _ in range(rounds):
             self.documents._look_again_at = 0.0              # no need to sit out the five minutes between looks
             if not service.step():
-                break
+                return
+        self.fail(f"the loop still had work to do after {rounds} rounds, so it may never have reached this document")
 
     FIELDS_THAT_ARE_JANES = ("title", "created", "tags", "owner", "correspondent", "document_type", "storage_path",
                              "archive_serial_number", "custom_fields")
@@ -615,16 +621,18 @@ class PaperlessE2E(unittest.TestCase):
         self.assertEqual(len(client.versions(item.state["doc_id"])), 2)
 
     def test_a_document_without_the_physical_mail_tag_is_left_alone_until_it_is_given_one(self):
-        """The tag is the boundary, against real Paperless. The list the app asks for names each document's
-        tags. A scanned file without the tag is not fetched, read or added to, though the app can see it.
-        Given the tag in Paperless, which is how a gap on one document is mended, it is taken on at the
-        next look."""
+        """The tag is the boundary, against real Paperless. The app asks Paperless only for documents with
+        the tag, and this proves Paperless obeys that filter. A scanned file without the tag is not listed,
+        fetched, read or added to, though the app can see it. Given the tag in Paperless, which is how a gap
+        on one document is mended, it is taken on at the next look."""
         settings, store, service, client, notifier = self.harness(loop=True)
         marker = "ploverweir" + uuid.uuid4().hex[:6]
         scan = numbered_letter(2, tag=marker)
         doc_id = self.stored_by_other_means(scan.pdf, f"no-tag-{marker}.pdf", physical_mail=False)
         row = next(row for row in client.documents() if row["id"] == doc_id)
         self.assertNotIn(self.tag, row["tags"])
+        self.assertIn(doc_id, [row["id"] for row in client.documents()])                    # the app can see it
+        self.assertNotIn(doc_id, [row["id"] for row in client.documents(with_tag=self.tag)])  # but isn't sent it
         self.give_the_loop_its_turns(service)
         self.assertFalse(self.documents.exists(doc_id))
         self.assertEqual(len(client.versions(doc_id)), 1)
@@ -632,6 +640,7 @@ class PaperlessE2E(unittest.TestCase):
         self.api.patch(f"{self.base}/api/documents/{doc_id}/", json={"tags": [self.tag]}).raise_for_status()
         row = next(row for row in client.documents() if row["id"] == doc_id)
         self.assertIn(self.tag, row["tags"])
+        self.assertIn(doc_id, [row["id"] for row in client.documents(with_tag=self.tag)])
         record = self.loop_until(service, doc_id)
         self.assertEqual(record.status, DONE, record.state.get("reason"))
         self.assertEqual(len(client.versions(doc_id)), 2)

@@ -1,8 +1,9 @@
-"""Every document in Paperless gets the same question, however it arrived.
+"""Every scan in Paperless gets the same question: does it have a searchable version that reads back right?
 
-Was it scanned, and does it lack a searchable version? These tests put documents
-into a stand-in Paperless by every route (the scanner's folder, a hand upload,
-stored long before the app) and end at what Jane would see on the document.
+The scans are the ones the app stored itself and the ones stored before the app.
+The app knows them by the Physical Mail tag, and by nothing else. These tests put
+documents into a stand-in Paperless, with and without the tag, and end at what
+Jane would see on the document.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import unittest.mock
 
 from paperless_intake import __version__
 from paperless_intake.docai import glyphless
-from paperless_intake.documents import DONE, GAVE_UP, LATER, NEXT_RELEASE, NOT_NEEDED, WORKING, Record
+from paperless_intake.documents import DONE, GAVE_UP, LATER, LET_GO, NEXT_RELEASE, NOT_NEEDED, WORKING, Record
 from paperless_intake.paperless import PaperlessError
 from paperless_intake.service import Service
 from paperless_intake.store import COMMITTED, COMMITTED_WARNING, HELD, WAITING
@@ -362,12 +363,12 @@ class ScansHandedOverTests(Base):
     def test_tags_jane_changed_since_are_left_as_she_set_them(self):
         h, item = self.stored_without_a_copy()
         doc = h.paperless.docs[item.state["doc_id"]]
-        doc["tags"] = [9]                                                   # she took the app's tags off and set her own
+        doc["tags"] = [1, 9]                                                # she took Mail intake off and set her own
         as_stored_before_this_release(h, item, "1.1.0")
         h.pipeline.renderer.render = self.real_render
         h.settle()
         self.assertEqual(self.record(h, item.state["doc_id"]).status, DONE)
-        self.assertEqual((doc["tags"], doc["owner"], len(doc["versions"])), ([9], None, 2))
+        self.assertEqual((doc["tags"], doc["owner"], len(doc["versions"])), ([1, 9], None, 2))
 
     def test_a_document_jane_made_her_own_is_let_go_without_a_word(self):
         # Paperless hides a document with an owner from every other user, the app included.
@@ -536,6 +537,113 @@ class OnlyWhatCameFromTheScannerTests(Base):
         h.paperless.tags["Physical Mail"] = number
         look(h)
         self.assertEqual(self.record(h, doc_id).status, DONE)
+
+    def spy_on_downloads(self, h) -> list:
+        fetched = []
+        download = h.paperless.download_original
+        h.paperless.download_original = lambda *args, **kwargs: fetched.append(args) or download(*args, **kwargs)
+        return fetched
+
+    def waiting_for_google(self, h) -> int:
+        """A tagged old scan whose first try waits, because Google is down."""
+        doc_id = h.paperless.add_old_scan(make_scan(letter(2)).pdf)
+        h.google.fail = [503] * 200
+        h.settle()
+        self.assertEqual(self.record(h, doc_id).status, LATER)
+        h.google.fail = []
+        return doc_id
+
+    def take_the_tag_off(self, h, doc_id):
+        h.paperless.docs[doc_id]["tags"].remove(h.paperless.tags["Physical Mail"])
+
+    def test_a_scan_whose_tag_is_taken_off_while_it_waits_is_let_go_and_nothing_is_sent(self):
+        h = Harness(self)
+        doc_id = self.waiting_for_google(h)
+        asked = h.google.calls
+        self.take_the_tag_off(h, doc_id)
+        fetched = self.spy_on_downloads(h)
+        look(h, HOUR)                                                       # its hour is up, and Google is back
+        doc = h.paperless.docs[doc_id]
+        self.assertEqual((fetched, h.google.calls), ([], asked))            # not fetched, not sent to Google
+        self.assertEqual((len(doc["versions"]), doc["notes"], h.notifier.sent), (1, [], []))
+        self.assertEqual(self.record(h, doc_id).status, LET_GO)
+        self.assertNothingToDo(h)
+
+    def test_a_scan_that_was_let_go_is_taken_on_again_when_the_tag_comes_back(self):
+        h = Harness(self)
+        doc_id = self.waiting_for_google(h)
+        self.take_the_tag_off(h, doc_id)
+        look(h, HOUR)
+        self.assertEqual(self.record(h, doc_id).status, LET_GO)
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        look(h)
+        doc = h.paperless.docs[doc_id]
+        record = self.record(h, doc_id)
+        self.assertEqual((record.status, record.state["source"]), (DONE, "paperless"))
+        self.assertEqual((len(doc["versions"]), len(doc["notes"])), (2, 1))
+
+    def test_a_scan_left_for_the_next_release_whose_tag_is_taken_off_is_not_worked_on_by_it(self):
+        from paperless_intake.paperless import PaperlessTaskFailed
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
+
+        def refuse(*args, **kwargs):
+            raise PaperlessTaskFailed("Paperless task t-1 failure", "the file was rejected")
+
+        h.paperless.update_version = refuse
+        for _ in range(5):
+            h.settle()
+            h.clock.advance(HOUR)
+        self.assertEqual(self.record(h, doc_id).status, NEXT_RELEASE)
+        del h.paperless.update_version                                      # Paperless takes new versions again
+        self.take_the_tag_off(h, doc_id)
+        asked = h.google.calls
+        fetched = self.spy_on_downloads(h)
+        a_newer_release_starts(h)
+        h.settle()
+        doc = h.paperless.docs[doc_id]
+        self.assertEqual((fetched, h.google.calls), ([], asked))
+        self.assertEqual((len(doc["versions"]), doc["notes"], h.notifier.sent), (1, [], []))
+        self.assertEqual(self.record(h, doc_id).status, LET_GO)
+
+    def test_a_scan_that_was_let_go_doesnt_use_up_the_limit_of_three(self):
+        h = Harness(self)
+        h.document_limit = 3
+        h.build()
+        first = self.waiting_for_google(h)
+        self.take_the_tag_off(h, first)
+        look(h, HOUR)
+        self.assertEqual(self.record(h, first).status, LET_GO)
+        others = [h.paperless.add_old_scan(make_scan(letter(1, f"old {n}")).pdf) for n in range(3)]
+        for _ in range(4):
+            look(h)
+        self.assertEqual([self.record(h, doc_id).status for doc_id in others], [DONE] * 3)
+        h.paperless.docs[first]["tags"].append(h.paperless.tags["Physical Mail"])
+        look(h)                                                             # taken on once already, so the limit doesn't apply
+        self.assertEqual(self.record(h, first).status, DONE)
+
+    def test_the_app_asks_paperless_only_for_documents_with_the_physical_mail_tag(self):
+        h = Harness(self)
+        h.paperless.add_old_scan(make_scan(letter(1)).pdf)
+        asked_with = []
+        listing = h.paperless.documents
+        h.paperless.documents = lambda **kwargs: asked_with.append(kwargs) or listing(**kwargs)
+        h.settle()
+        look(h)
+        self.assertTrue(asked_with)
+        self.assertEqual(asked_with, [{"with_tag": h.paperless.tags["Physical Mail"]}] * len(asked_with))
+
+    def test_a_document_without_the_tag_is_left_alone_even_if_paperless_ignores_the_filter(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_foreign(make_scan(letter(2)).pdf, name="from my phone.pdf", tags=[9])
+        listing = h.paperless.documents
+        h.paperless.documents = lambda **kwargs: listing()                  # every document, whatever was asked
+        fetched = self.spy_on_downloads(h)
+        h.settle()
+        for _ in range(3):
+            look(h)
+        self.assertFalse(h.documents.exists(doc_id))
+        self.assertEqual((fetched, h.google.calls), ([], 0))
 
 
 class ScansStoredBeforeTheAppTests(Base):
@@ -846,8 +954,8 @@ class WhoOwnsADocumentTests(Base):
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
         listing = h.paperless.documents
-        h.paperless.documents = lambda: [{**row, "versions": [{**v, "checksum": None} for v in row["versions"]]}
-                                         for row in listing()]
+        h.paperless.documents = lambda **kwargs: [{**row, "versions": [{**v, "checksum": None} for v in row["versions"]]}
+                                                  for row in listing(**kwargs)]
         h.settle()
         self.assertEqual((h.documents.all(), h.google.calls), ([], 0))
         h.paperless.documents = listing
