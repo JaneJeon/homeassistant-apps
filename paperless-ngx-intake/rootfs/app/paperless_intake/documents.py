@@ -246,7 +246,7 @@ class Documents:
         # Releases before 1.1.3 recorded these two outcomes only as a sentence.
         no_copy = str(state.get("no_google_copy_reason") or "")
         not_built = state.get("copy_not_built") or no_copy.startswith("the searchable copy couldn't be built")
-        reads_badly = bool(state["copy_reads_badly"]) if "copy_reads_badly" in state else (
+        reads_badly = bool(state["copy_reads_badly"]) if state.get("copy_reads_badly") is not None else (
             item.status == COMMITTED_WARNING and "search text differs" in str(state.get("reason") or ""))
         if state.get("mode") == WITH_GOOGLE and state.get("searchable_sha256"):
             if state.get("copy_in_paperless") is False:
@@ -293,7 +293,7 @@ class Documents:
                 return None
             if chosen.status != WORKING:
                 # Marked before the work starts, so a worker that dies at once is seen and counted.
-                chosen.set(WORKING, by=__version__, cut_short=0)
+                chosen.set(WORKING, by=__version__, cut_short=0, waits_for_pages=False)
                 return chosen
             # Still marked from before: the whole app stopped while it had this document in hand.
             cut_short = int(chosen.state.get("cut_short") or 0) + 1
@@ -312,7 +312,10 @@ class Documents:
             # Each release tries once what an earlier release left for it.
             chosen = next((record for record in records if record.status == NEXT_RELEASE
                            and record.state.get("by") != __version__), None)
-        if chosen is None and self.clock() >= self._look_again_at:
+        # While one document waits for tomorrow's Google pages, no new one is started: it would only
+        # be fetched to wait as well. The one that waits goes first tomorrow.
+        waiting_for_pages = any(record.status == LATER and record.state.get("waits_for_pages") for record in records)
+        if chosen is None and not waiting_for_pages and self.clock() >= self._look_again_at:
             chosen = self._next_unseen(records)
         return chosen
 
@@ -388,7 +391,7 @@ class Documents:
             # Waiting for the day's allowance is not a failed try. It is picked up after midnight, UTC,
             # which is when the count of pages starts again.
             log.info("%s waits for tomorrow: %s", record.label, outcome)
-            record.set(LATER, reason=str(outcome), by=__version__,
+            record.set(LATER, reason=str(outcome), by=__version__, waits_for_pages=True,
                        not_before_unix=(int(self.clock() // 86400) + 1) * 86400 + 60)
         except Later as outcome:
             self._later(record, str(outcome), odd=outcome.odd, ask_google_afresh=outcome.ask_google_afresh)

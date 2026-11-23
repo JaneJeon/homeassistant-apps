@@ -649,8 +649,9 @@ class Pipeline:
         if item.state.get("note_added"):
             return
         text = self.note_text(item, mode, warnings)
-        # Looked for before it is written: the app may have been cut short just after writing it.
-        opening = text.split(". ", 1)[0]
+        # Looked for before it is written: the app may have been cut short just after writing it,
+        # and updated since, so the opening is taken without the release's number.
+        opening = text.split("paperless-intake", 1)[0]
         if not any(str(note.get("note") or "").startswith(opening) for note in self.paperless.notes(doc_id)):
             self.paperless.add_note(doc_id, text)
         item.state["note_added"] = True

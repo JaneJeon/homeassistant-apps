@@ -93,7 +93,7 @@ There is no lock file. Home Assistant runs exactly one container for the app, th
 **On the way there, something can be in the way:**
 
 - Outside the document (Google or Paperless not answering, disk low): try again in an hour, for up to a day. Then "next release".
-- The day's Google pages for stored documents are used up: wait for tomorrow. This is not a failed try, however long it takes.
+- The day's Google pages for stored documents are used up: wait for tomorrow, and start nothing new until then. This is not a failed try, however long it takes.
 - The app itself (it cannot build the version, an error nobody planned for, its worker dying): three tries, then "next release".
 - The whole app stopping with the document in hand (a power cut): the work is started again, three times at most, then "next release".
 
@@ -124,7 +124,7 @@ That code is deleted. The same need is met by the record: "has a searchable vers
 | Two parts of the app worked on one document | The ownership rule above, with tests for a scan that is half way in |
 | One bad document looped and used up Google pages | Every kind of try is counted and capped, including the app dying with the document in hand. Google's answer is kept until the work ends, so a retry does not pay twice. Every try for a stored document stops at three quarters of the day's page limit, so scans always have room |
 | Real scans were delayed | Scans go first. One document at a time |
-| A document that does not fit today's page allowance blocked the ones behind it | The loop passes over it and carries on with smaller ones. One too big for any day is set aside with the reason |
+| The backlog filled the disk with files waiting for their turn | Once one document is waiting for tomorrow's pages, no new one is started that day. So at most one fetched file waits. One too big for any day is set aside with the reason |
 | Hand uploads were not covered and Jane assumed they were | The app's Paperless user cannot see a document that somebody owns, and an upload on the web page belongs to the uploader. DOCS.md says so and says how to share them. The 46 old documents have no owner, so they are visible |
 | A Paperless update changed how file versions work | Same rule as for scans: nothing is written unless Paperless is at a version the tests passed on |
 | Jane changed a document while it was being worked on | Her tags, owner and date are never written. A file version she added makes the app leave the document alone. A document that is gone when the app next has reason to look at it is recorded as gone, and nothing else happens |
@@ -167,4 +167,5 @@ Third review, of the code. Each finding was first reproduced as a failing test:
 - The stand-in for Paperless in the unit tests refused duplicate files, as Paperless did before version 3. It now takes them, as Paperless 3 does. The same case is tested against the real thing.
 - A scan cut short just after its note was written got a second note. It now looks first.
 - Six outcomes became four. "Redo", "not yet" and "gave up, the fault was ours" all meant "the next release tries".
+- The reviewer then checked the fixes and found three more things, fixed the same way: a scan record that an earlier release had put back from a snapshot still hid "reads back badly"; with the limit lifted, every remaining file would have been fetched on the first day only to wait; and a note written just before an app update was not recognised after it.
 - Not adopted: writing the document's record the moment a scan learns its document id. It would not cover the moments before the scan knows that id, which recognising the file does.

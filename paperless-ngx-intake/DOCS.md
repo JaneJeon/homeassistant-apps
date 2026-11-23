@@ -71,7 +71,7 @@ A stored document is never held and never raises an alert, because nothing depen
 Three limits apply:
 
 - **Scans go first.** The app works on one thing at a time, and a stored document gets a turn only when no scan is waiting.
-- **Stored documents use at most three quarters of `daily_page_cap`** in a day, so a scan always has room. A document that doesn't fit today waits for tomorrow, and smaller ones behind it still go. Waiting for tomorrow isn't counted as a failed try.
+- **Stored documents use at most three quarters of `daily_page_cap`** in a day, so a scan always has room. A document that doesn't fit today waits for tomorrow and goes first then. Until then no new document is started, so files aren't fetched only to wait. Waiting for tomorrow isn't counted as a failed try.
 - **Version 1.3.0 starts on only three documents** that didn't come from the scanner, so the result can be looked at in Paperless first. The version after it removes that limit.
 
 **Documents the app can't see.** Paperless hides a document that has an owner from every other user who isn't a superuser. A file uploaded on Paperless's web page belongs to whoever uploaded it, so the app's user can't see it and the app can't know it exists. A file from Paperless's consume folder has no owner and is visible. To have web uploads covered, give the app's user View and Change permission on the document, by hand or with a Paperless workflow that does it for every new document (trigger: document added; action: assign permissions). The end-to-end tests check both halves: an owned document is invisible, and it is picked up once those two permissions are given.

@@ -101,7 +101,7 @@ class Page:
             return (f". <span class='ok'>Release {html.escape(str(record.state['by']))} has since given it "
                     f"a searchable version that reads back right.</span>")
         if record.status in {"next_release", "gave_up"}:
-            return (f". <span class='muted'>Release {html.escape(str(record.state['by']))} tried to improve its "
+            return (f". <span class='muted'>Release {html.escape(str(record.state['by']))} tried again for its "
                     f"searchable version: {html.escape(record.state.get('reason') or 'no reason recorded')}.</span>")
         return ""
 

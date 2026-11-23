@@ -473,6 +473,15 @@ class ScansHandedOverTests(Base):
         self.assertEqual(self.record(h, item.state["doc_id"]).status, DONE)
         self.assertEqual(len(h.paperless.docs[item.state["doc_id"]]["versions"]), 3)
 
+    def test_a_scan_record_put_back_from_a_snapshot_has_the_key_with_nothing_in_it(self):
+        # 1.2.0 began to redo a 1.1.2 scan and put its record back: "reads badly" is there, and empty.
+        h, item = self.stored_reading_badly()
+        item.state["copy_reads_badly"] = None
+        item.state.pop("copy_in_paperless", None)
+        item.save()
+        as_stored_before_this_release(h, item, "1.1.2")
+        self.assertEqual(self.record(h, item.state["doc_id"]).status, NEXT_RELEASE)
+
     def test_what_each_try_measured_is_kept_with_the_record(self):
         h, item = self.stored_without_a_copy()
         first = (item.root / "checks.json").read_bytes()
@@ -769,6 +778,24 @@ class WhoOwnsADocumentTests(Base):
         doc = h.paperless.docs[h.only_item().state["doc_id"]]
         self.assertEqual((h.only_item().status, len(doc["versions"]), len(doc["notes"])), (COMMITTED, 2, 1))
 
+    def test_a_note_written_just_before_an_update_is_recognised_after_it(self):
+        h = Harness(self)
+        h.drop(make_scan(letter(2)))
+        h.service.claim_captures()
+        h.clock.advance(31)
+        h.service.claim_captures()
+        item = h.only_item()
+        h.pipeline.prepare(item)
+        h.paperless.crash_after.add("add_note")
+        with self.assertRaises(Crash):
+            h.pipeline.commit(item)
+        doc = h.paperless.docs[item.state["doc_id"]]
+        doc["notes"] = [note.replace(f"paperless-intake {__version__}", "paperless-intake 1.2.9")
+                        for note in doc["notes"]]                           # as the release before wrote it
+        h.build()
+        h.settle()
+        self.assertEqual((h.only_item().status, len(doc["notes"])), (COMMITTED, 1))
+
     def test_a_document_paperless_names_no_file_for_is_left_alone(self):
         # If Paperless ever stopped saying which file a document holds, the app couldn't tell whose it is.
         h = Harness(self)
@@ -842,27 +869,34 @@ class HowMuchAtOnceTests(Base):
         small = h.paperless.add_foreign(make_scan(letter(1, "c")).pdf)
         for _ in range(4):
             look(h)
-        self.assertEqual([self.record(h, doc_id).status for doc_id in [*docs, small]], [DONE, DONE, LATER, LATER])
-        self.assertIn("share of today's Google pages", self.record(h, small).state["reason"])
+        self.assertEqual([self.record(h, doc_id).status for doc_id in docs], [DONE, DONE, LATER])
+        self.assertIn("share of today's Google pages", self.record(h, docs[2]).state["reason"])
+        self.assertFalse(h.documents.exists(small))                         # nothing new is started today
         self.assertEqual(h.google.calls, 2)
         h.drop(make_scan(letter(2, "new")))                                 # a scan the same day still goes through
         h.settle()
         self.assertEqual(h.only_item().status, COMMITTED, h.only_item().state.get("reason"))
         for _ in range(40):                                                 # waiting is not a failed try, however long
             look(h, 1800)
-            if all(self.record(h, doc_id).status == DONE for doc_id in [*docs, small]):
+            if h.documents.exists(small) and self.record(h, small).status == DONE:
                 break
         self.assertEqual([self.record(h, doc_id).status for doc_id in [*docs, small]], [DONE] * 4)
-        self.assertEqual(self.record(h, small).state["tries"], {})
+        self.assertEqual(self.record(h, docs[2]).state["tries"], {})
 
-    def test_a_small_document_isnt_stuck_behind_one_that_doesnt_fit_today(self):
-        h = Harness(self, daily_page_cap=8)
-        first = h.paperless.add_foreign(make_scan(letter(4, "a")).pdf)
-        big = h.paperless.add_foreign(make_scan(letter(4, "big")).pdf)
-        small = h.paperless.add_foreign(make_scan(letter(2, "c")).pdf)
-        for _ in range(3):
+    def test_once_one_document_waits_for_tomorrow_no_new_one_is_fetched_today(self):
+        # Otherwise every remaining file would be fetched onto the Green at once, only to wait there.
+        h = Harness(self, daily_page_cap=8)                                 # their share is 6 pages
+        docs = [h.paperless.add_foreign(make_scan(letter(3, tag)).pdf) for tag in ("a", "b", "c", "d", "e")]
+        for _ in range(6):
             look(h)
-        self.assertEqual([self.record(h, doc_id).status for doc_id in (first, big, small)], [DONE, LATER, DONE])
+        self.assertEqual([self.record(h, doc_id).status for doc_id in docs[:3]], [DONE, DONE, LATER])
+        self.assertEqual([h.documents.exists(doc_id) for doc_id in docs[3:]], [False, False])
+        self.assertEqual(h.paperless.calls.count("download_original"), 3 + 2)   # three originals, two read-backs
+        for _ in range(3):                                                  # three more days at two a day
+            h.clock.advance(24 * HOUR)
+            for _ in range(4):
+                look(h)
+        self.assertEqual([self.record(h, doc_id).status for doc_id in docs], [DONE] * 5)
 
     def test_a_second_try_also_keeps_to_the_days_share(self):
         h = Harness(self, daily_page_cap=10)                                # their share is 7 pages
