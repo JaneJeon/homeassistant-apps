@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.2
+
+- **The three-scan limit is gone.** Version 1.3.1 started on three stored scans so the result could be looked at first. They were looked at in Paperless: upright, in order, a note on each, the original still version 1, and nothing else about them changed. The rest of the scans stored before the app are now re-read, one at a time, within three quarters of the day's Google page cap.
+- The code for the limit is removed, not switched off.
+- Small corrections to README, DOCS and DESIGN.
+
 ## 1.3.1
 
 Version 1.3.0 was never installed. Before it went in, what the app looks at was cut back to what the app is for.

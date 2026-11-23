@@ -54,7 +54,6 @@ class Harness:
         self.google = FakeGoogle()
         self.paperless = FakePaperless()
         self.notifier = RecordingNotifier()
-        self.document_limit = None      # how many documents from outside the scanner a release may start on
         self.build()
 
     def build(self):
@@ -68,8 +67,7 @@ class Harness:
 
         self.pipeline = Pipeline(self.settings, self.store, self.paperless, self.notifier,
                                  token_provider=token_provider, backend_factory=backend, clock=self.clock)
-        self.documents = Documents(self.settings, self.store, self.paperless, self.pipeline,
-                                   clock=self.clock, limit=self.document_limit)
+        self.documents = Documents(self.settings, self.store, self.paperless, self.pipeline, clock=self.clock)
         self.pipeline.documents = self.documents
         self.service = Service(self.settings, self.store, self.pipeline, self.notifier, clock=self.clock,
                                documents=self.documents)

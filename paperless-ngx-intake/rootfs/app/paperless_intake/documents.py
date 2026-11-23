@@ -106,9 +106,6 @@ TRIES_WHEN_ODD = 3              # tries after something nobody planned for (an e
                                 # and how often work may be cut short together with the whole app
 CAP_SHARE = 0.75                # this work stops at this share of the day's Google pages, so scans keep the rest
 OWN_TEXT_WORDS_PER_PAGE = 20    # a PDF with this much text inside the file was not scanned, or was read by its scanner
-# Release 1.3.1, the first to run the loop on the Green, starts on no more than this many scans that
-# were stored before the app. They are looked at by eye before the next release lifts the limit. None: no limit.
-NEW_DOCUMENT_LIMIT: int | None = 3
 OWN_LABEL = "Google OCR "       # how every file version the app adds is labelled (pipeline.version_label)
 
 
@@ -210,13 +207,12 @@ class Record:
 
 class Documents:
     def __init__(self, settings: Settings, store: Store, paperless: Paperless, pipeline: Pipeline, *,
-                 clock: Callable[[], float] = now, limit: int | None = NEW_DOCUMENT_LIMIT):
+                 clock: Callable[[], float] = now):
         self.settings = settings
         self.store = store
         self.paperless = paperless
         self.pipeline = pipeline
         self.clock = clock
-        self.limit = limit
         self.dir = settings.intake_dir / "documents"
         self._look_again_at = 0.0
         self._said: set[str] = set()            # log lines that are said once, not at every look
@@ -357,8 +353,6 @@ class Documents:
             return None
         let_go = {record.doc_id: record for record in records if record.status == LET_GO}
         known = {record.doc_id for record in records if record.status != LET_GO}
-        started = sum(1 for record in records if record.state.get("source") == "paperless"
-                      and record.status != NOT_NEEDED and record.state.get("kind") != "not_pdf")
         for row in sorted(rows, key=lambda row: int(row["id"])):
             doc_id = int(row["id"])
             if doc_id in known:
@@ -368,8 +362,8 @@ class Documents:
             if from_the_scanner not in (row.get("tags") or []):
                 continue                                  # no Physical Mail tag: not this app's, and nothing else decides
             if doc_id in let_go:
-                # Let go when its tag was taken off, and the tag is back. What the record knows is kept.
-                # It was counted once already, so the limit on new documents doesn't apply to it again.
+                # Let go when its tag was taken off, and the tag is back. It is taken on again from its
+                # existing record, so what the record knows is kept.
                 # The wait before the next look is kept, so this can happen at most once every five minutes.
                 log.info("document %s carries the Physical Mail tag again; taking it on again", doc_id)
                 return let_go[doc_id]
@@ -392,10 +386,6 @@ class Documents:
                         self.record_scan(item)            # a finished scan whose record is missing
                     continue                              # otherwise the scan still owns it
                 # Another document that happens to hold the same file: treated like any other.
-            if self.limit is not None and started >= self.limit:
-                self._say_once("limit", "this release starts on %d scans that were stored without the app, "
-                                        "and it has; the rest wait for the next release", self.limit)
-                return None
             log.info("document %s has no record yet; looking at it", doc_id)
             self._look_again_at = 0.0                     # there may be more: look again as soon as this one is done
             # Not written down yet: step() does that, as it hands the document out.

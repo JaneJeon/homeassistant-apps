@@ -13,7 +13,7 @@ For each scan in `/share/paperless/capture`, the app:
 3. Decides, for the stack as a whole, which way up it is and whether it went in flipped (next section).
 4. Builds the searchable copy. The page images are the scanner's own, byte for byte, in whatever format the scanner chose for each page (a scanner that detects colour mixes JPEG pages with one-bit black and white ones). Pages are turned upright and put in reading order. Google's text sits invisibly on top, word by word.
 5. Checks that the printed page numbers don't reveal a missing page.
-6. Commits to Paperless through the REST API: the untouched scan as version 1, the searchable copy as version 2. Then it reads both back and checks the bytes, the tags and the search text.
+6. Commits to Paperless through the REST API: the untouched scan as version 1, the searchable copy as version 2 (a later release may add newer ones). Then it reads both back and checks the bytes, the tags and the search text.
 7. Adds a note to the document saying what it decided. The evidence behind each decision is in the scan's `checks.json` (see Files).
 
 When the app uploads a scan, it gives Paperless the day of the scan as the document's date. It takes the day from the scanner's file name (`20261122_144510_000353.pdf`), or uses the day it picked the file up. Paperless would otherwise guess a date from its own reading of the raw scan. Documents uploaded before version 1.2.0 keep the date Paperless guessed.
@@ -54,7 +54,7 @@ The app also looks after scans that are already stored: the ones from before the
 
 **The `Physical Mail` tag is the boundary.** It says: this came out of the scanner. The app puts the tag on every scan it stores, and a Paperless rule put it on the scans that came through Paperless's own consume folder before the app. The app takes on a stored document only if it carries the tag. Nothing else decides: not the file's name, not its owner, not what is inside it.
 
-- **A scan that is missing the tag** is a gap on that one document. Jane adds the tag in Paperless, and the app takes the document on at its next look. This release starts on only three stored scans, so after those a newly tagged one waits for the next release, and nothing new is started while any document waits for tomorrow's Google pages. The app never changes tags on a stored document. It has no second way of recognising a scan, and shouldn't be given one.
+- **A scan that is missing the tag** is a gap on that one document. Jane adds the tag in Paperless, and the app takes the document on at its next look. Nothing new is started while any document waits for tomorrow's Google pages. The app never changes tags on a stored document. It has no second way of recognising a scan, and shouldn't be given one.
 - **A document without the tag is left alone:** a file added on Paperless's web page, a photo from the phone, an email attachment. The app doesn't fetch it, read it or add to it. With Paperless's own OCR off, such a file has search text only if it has text inside it already. That is known and accepted for now, and the missing tag is how to find those documents in Paperless.
 - **The tag is checked every time** the app is about to work on a stored document. If it has been taken off, the app does nothing to the document and lets it go. If the tag comes back, the app takes the document on again. A document that already has its searchable version stays as it is.
 
@@ -74,19 +74,18 @@ What the app may change on a stored document: it adds one file version and one n
 
 A stored scan is never held and never raises an alert, because nothing depends on an answer: the document is already safe. A page that looks missing goes into the document's note. If Google or Paperless isn't answering, the app tries again each hour for a day, then leaves the document for the next version of the app. An unexpected error gets three tries. So does work that is cut short because the whole app stopped.
 
-Three limits apply:
+Two limits apply:
 
 - **Scans on their way in go first.** The app works on one thing at a time, and a stored scan gets a turn only when no scan is waiting.
 - **Stored scans use at most three quarters of `daily_page_cap`** in a day, so a new scan always has room. A document that doesn't fit today waits for tomorrow and goes first then. Until then no new document is started, so files aren't fetched only to wait. Waiting for tomorrow isn't counted as a failed try.
-- **Version 1.3.1 starts on only three scans** that were stored before the app, so the result can be looked at in Paperless first. The version after it removes that limit.
 
 **A scan the app can't see.** Paperless hides a document that has an owner from every other user who isn't a superuser. A scan from Paperless's consume folder has no owner, and the app clears the owner on the scans it stores, so those are visible. A scan that does have an owner (one that was added by hand on Paperless's web page belongs to whoever added it) is hidden from the app even with the tag on it. Clear the owner on that document, or give the app's user View and Change permission on it. The end-to-end tests check both halves: an owned document is invisible, and it is picked up once it is shared.
 
 **If a scan that carries the tag isn't picked up,** look in this order:
 
-1. The Mail intake page. It lists every stored scan the app has looked at, and the reason when nothing was done.
-2. The document's owner in Paperless. If it has one, the app can't see it (above).
-3. This version's limit of three stored scans.
+1. Which version of the app is installed, on the app's page in Home Assistant. The work on stored scans starts with version 1.3.1.
+2. The Mail intake page. It lists every stored scan the app has looked at, and the reason when nothing was done.
+3. The document's owner in Paperless. If it has one, the app can't see it (above).
 4. Scans on their way in and the day's Google pages come first, so a stored scan can wait until tomorrow.
 
 ## What you are told

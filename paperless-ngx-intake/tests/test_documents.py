@@ -606,25 +606,6 @@ class OnlyWhatCameFromTheScannerTests(Base):
         self.assertEqual((len(doc["versions"]), doc["notes"], h.notifier.sent), (1, [], []))
         self.assertEqual(self.record(h, doc_id).status, LET_GO)
 
-    def test_a_scan_that_was_let_go_still_counts_toward_the_limit_of_three(self):
-        h = Harness(self)
-        h.document_limit = 3
-        h.build()
-        first = self.waiting_for_google(h)
-        self.take_the_tag_off(h, first)
-        look(h, HOUR)
-        self.assertEqual(self.record(h, first).status, LET_GO)
-        others = [h.paperless.add_old_scan(make_scan(letter(1, f"old {n}")).pdf) for n in range(3)]
-        for _ in range(4):
-            look(h)
-        self.assertEqual([self.record(h, doc_id).status for doc_id in others[:2]], [DONE] * 2)
-        self.assertFalse(h.documents.exists(others[2]))                     # the one let go was counted
-        h.paperless.docs[first]["tags"].append(h.paperless.tags["Physical Mail"])
-        for _ in range(2):
-            look(h)                                                         # counted already, so the limit doesn't stop it
-        self.assertEqual(self.record(h, first).status, DONE)
-        self.assertFalse(h.documents.exists(others[2]))
-
     def test_a_scan_let_go_after_its_version_went_in_is_finished_with_its_note_when_the_tag_comes_back(self):
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(make_scan(letter(2)).pdf)
@@ -1038,25 +1019,24 @@ class WhoOwnsADocumentTests(Base):
 
 
 class HowMuchAtOnceTests(Base):
-    def test_this_release_starts_on_three_scans_stored_before_the_app_and_no_more(self):
+    def test_every_tagged_scan_stored_before_the_app_is_given_its_searchable_version_one_after_the_other(self):
         h = Harness(self)
-        h.document_limit = 3
-        h.build()
-        h.drop(make_scan(letter(1, "scan")))
-        h.settle()
-        with_text = h.paperless.docs[h.only_item().state["doc_id"]]["versions"][0]["data"]
-        has_text = h.paperless.add_old_scan(with_text)
-        others = [h.paperless.add_old_scan(make_scan(letter(1, f"old {n}")).pdf) for n in range(5)]
-        for _ in range(8):
+        docs = [h.paperless.add_old_scan(make_scan(letter(1, f"old {n}")).pdf) for n in range(5)]
+        order, at_once = [], []
+        update = h.paperless.update_version
+
+        def add_version(doc_id, *args, **kwargs):
+            order.append(doc_id)
+            at_once.append(sum(1 for record in h.documents.all() if record.status == WORKING))
+            return update(doc_id, *args, **kwargs)
+
+        h.paperless.update_version = add_version
+        for _ in range(3):
             look(h)
-        self.assertEqual(self.record(h, has_text).status, NOT_NEEDED)       # looking costs nothing, so it isn't counted
-        self.assertEqual([self.record(h, doc_id).status for doc_id in others[:3]], [DONE] * 3)
-        self.assertEqual([h.documents.exists(doc_id) for doc_id in others[3:]], [False, False])
-        self.assertEqual(h.google.calls, 4)
-        h.document_limit = None                                             # the release after lifts it
-        h.build()
-        h.settle()
-        self.assertEqual([self.record(h, doc_id).status for doc_id in others], [DONE] * 5)
+        self.assertEqual([self.record(h, doc_id).status for doc_id in docs], [DONE] * 5)
+        self.assertEqual((order, at_once), (docs, [1] * 5))                 # in order, and one at a time
+        self.assertEqual([len(h.paperless.docs[doc_id]["notes"]) for doc_id in docs], [1] * 5)
+        self.assertEqual((h.google.calls, h.notifier.sent), (5, []))        # no alert
 
     def test_stored_documents_leave_a_quarter_of_the_days_google_pages_for_scans(self):
         h = Harness(self, daily_page_cap=8)                                 # their share is 6 pages
