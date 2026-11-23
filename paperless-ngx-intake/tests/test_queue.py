@@ -662,6 +662,89 @@ class RestartBoundTests(unittest.TestCase):
         self.assertEqual(alert_kinds(h), ["held"])
 
 
+class HeldNotCountedTests(unittest.TestCase):
+    """A job the gate holds isn't running, so restarts while it is held are never counted against it."""
+
+    def outage_of_eleven_restarts(self, h):
+        h.paperless.unreachable = True
+        for _ in range(RESTART_BOUND + 1):
+            h.restart()
+            for _ in range(3):
+                h.clock.advance(31 * 60)
+                h.service.step()
+        item = h.only_item()
+        self.assertNotEqual(item.status, HELD)
+        self.assertIsNotNone(h.pipeline.intent.read())                      # still in doubt: nobody could tell
+        h.paperless.unreachable = False                                     # Paperless answers again
+        h.paperless.slow_uploads = False
+        h.paperless.land()
+        for _ in range(4):
+            h.clock.advance(31 * 60)
+            h.settle()
+        item = h.only_item()
+        self.assertEqual((item.status, len(h.paperless.docs)), (COMMITTED, 1))
+        self.assertIsNone(h.pipeline.intent.read())
+        self.assertEqual(alert_kinds(h), [])
+        return item
+
+    def test_eleven_restarts_while_an_upload_that_timed_out_is_in_doubt(self):
+        h = Harness(self)
+        h.paperless.slow_uploads = True
+        h.paperless.upload_times_out = True                                 # the file went; the answer doesn't come
+        h.drop(make_scan(letter(1)))
+        h.settle()
+        self.assertIsNotNone(h.pipeline.intent.read())
+        self.assertNotIn("lease", h.only_item().state)                      # the worker came back: not in hand
+        self.outage_of_eleven_restarts(h)
+
+    def test_eleven_restarts_while_an_upload_the_app_died_in_is_in_doubt(self):
+        h = Harness(self)
+
+        def dies(where):
+            if where == "paperless post_document":
+                raise Killed(where)
+        h.paperless.on_effect = dies                                        # the file lands, then the app dies
+        h.drop(make_scan(letter(1)))
+        with self.assertRaises(Killed):
+            h.settle()
+        h.paperless.on_effect = None
+        self.assertIn("lease", h.only_item().state)                         # in hand when it died
+        item = self.outage_of_eleven_restarts(h)
+        self.assertEqual(h.paperless.calls.count("post_document"), 1)
+
+    def test_eleven_restarts_while_a_stored_scans_version_the_app_died_in_is_in_doubt(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
+        h.paperless.slow_uploads = True
+
+        def dies(where):
+            if where == "paperless update_version":
+                raise Killed(where)
+        h.paperless.on_effect = dies                                        # the version goes out, then the app dies
+        with self.assertRaises(Killed):
+            look(h)
+        h.paperless.on_effect = None
+        self.assertEqual(h.documents.load(doc_id).status, WORKING)          # in hand when it died
+        h.paperless.unreachable = True
+        for _ in range(RESTART_BOUND + 1):
+            h.restart()
+            for _ in range(3):
+                look(h, 31 * 60)
+        record = h.documents.load(doc_id)
+        self.assertEqual(record.status, WORKING)                            # still waiting to resume: not set aside
+        self.assertIsNotNone(h.pipeline.intent.read())
+        h.paperless.unreachable = False                                     # Paperless answers again
+        h.paperless.slow_uploads = False
+        h.paperless.land()
+        for _ in range(4):
+            look(h, 31 * 60)
+        record = h.documents.load(doc_id)
+        self.assertEqual(record.status, DONE)
+        self.assertIsNone(h.pipeline.intent.read())
+        self.assertEqual(len(h.paperless.docs[doc_id]["versions"]), 2)
+        self.assertEqual(h.paperless.calls.count("update_version"), 1)
+
+
 class WebhookTests(unittest.TestCase):
     """started and finished stay paired across kills; alerts are owed until Home Assistant takes them."""
 
