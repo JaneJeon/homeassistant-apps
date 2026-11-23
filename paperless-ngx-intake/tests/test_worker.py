@@ -29,7 +29,8 @@ class WorkerProcessTest(unittest.TestCase):
         # No Google key: the child gets as far as "waiting for configuration" without any network.
         options.write_text(json.dumps({"paperless_token": "x", "paperless_url": "http://127.0.0.1:9",
                                        "google_service_account": "-", "ha_url": "http://127.0.0.1:9",
-                                       "webhook_alert": "a"}))
+                                       "webhook_alert": "a", "min_available_mib": 0, "max_io_pressure": 100,
+                                       "max_memory_pressure": 100}))
         self.env = dict(os.environ, INTAKE_OPTIONS=str(options), INTAKE_CAPTURE_DIR=str(self.root / "capture"),
                         INTAKE_DIR=str(self.root / "intake"), INTAKE_STABLE_SECONDS="0",
                         PYTHONPATH=str(APP))
@@ -79,6 +80,16 @@ class WorkerProcessTest(unittest.TestCase):
         self.assertTrue(service.step())                       # retried once, killed again: no second alert
         self.assertEqual([kind for kind, _ in self.notifier.sent if kind == "alert"], ["alert"])
         self.assertFalse(service.step())                      # and rescheduled, not retried in a tight loop
+
+    def test_a_worker_summarises_a_committed_scans_google_answers(self):
+        item = self.claim(self.service(None))
+        answer = item.root / "google" / "run-1" / "chunk" / "attempt-1"
+        answer.mkdir(parents=True)
+        (answer / "response.json").write_text(json.dumps({"document": {"pages": [{"image": {"content": "eA=="}}]}}))
+        (answer / "manifest.json").write_text(json.dumps({"status": "complete"}))
+        self.assertEqual(SubprocessRunner(env=self.env).tidy(item.sha), 0)
+        self.assertTrue((item.root / "google-summary.json.gz").exists())
+        self.assertFalse((item.root / "google").exists())
 
     def test_a_stored_document_is_worked_in_a_child_process_too(self):
         # Paperless can't be reached here, so the child gets as far as "try again later" and says so in the record.

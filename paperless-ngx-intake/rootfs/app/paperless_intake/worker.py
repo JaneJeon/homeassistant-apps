@@ -2,6 +2,7 @@
 
     python -m paperless_intake.worker <sha256>          a scan
     python -m paperless_intake.worker document <id>     a document in Paperless
+    python -m paperless_intake.worker tidy <sha256>     summarise a committed scan's Google answers
 
 The service runs each scan's work in a fresh process. Building and checking the
 searchable copy of a 15-page scan peaks around 350 MiB, and CPython keeps most of
@@ -24,8 +25,9 @@ def main(argv: list[str]) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     log = logging.getLogger("paperless_intake.worker")
     document = len(argv) == 2 and argv[0] == "document" and argv[1].isdigit()
-    if not document and (len(argv) != 1 or not re.fullmatch(r"[0-9a-f]{64}", argv[0])):
-        log.error("usage: python -m paperless_intake.worker <sha256> | document <id>")
+    tidy = len(argv) == 2 and argv[0] == "tidy" and re.fullmatch(r"[0-9a-f]{64}", argv[1])
+    if not document and not tidy and (len(argv) != 1 or not re.fullmatch(r"[0-9a-f]{64}", argv[0])):
+        log.error("usage: python -m paperless_intake.worker <sha256> | document <id> | tidy <sha256>")
         return 2
     try:
         app = build(load())
@@ -34,6 +36,8 @@ def main(argv: list[str]) -> int:
         return 3
     if document:
         app.documents.run(app.documents.load(int(argv[1])))
+    elif tidy:
+        app.pipeline._tidy_after_commit(app.store.load(argv[1]))
     else:
         app.pipeline.run(app.store.load(argv[0]))
     return 0

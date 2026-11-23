@@ -8,8 +8,8 @@ reads back right?
 
 This file asks that question of every document that came from the scanner:
 scans the app stored itself, and scans stored before the app existed. It knows
-them by the Physical Mail tag, which Jane's Paperless rule and this app both
-put on what the scanner produces.
+them by the Scanner tag (called Physical Mail before 1.4.0), which Jane's
+Paperless rule and this app both put on what the scanner produces.
 
 The tag is the boundary, and the only one. A document without it is never
 looked at, whatever its file looks like: a file added by hand, a photo, an
@@ -37,8 +37,8 @@ it, and if it has none, why. events.jsonl beside it keeps every change of state.
                 built, or a day of tries didn't get through
   later         not now: tried again in an hour, or tomorrow when stored
                 documents have used their share of the day's Google pages
-  working       handed out to be worked on. Found like this when the app
-                starts, the work was cut short, and it is started again first
+  working       leased to a worker (jobs.py). Found like this after the app
+                was killed, it is resumed, and that is not counted as a try
   let_go        not an outcome of the work: the tag was taken off, so the app
                 did nothing to it. Taken on again if the tag comes back
 
@@ -46,15 +46,12 @@ The tag is checked every time the app is about to work on a stored document,
 before anything is fetched. A document that already has its searchable version
 is never worked on again, so taking its tag off changes nothing.
 
-The loop (service.py calls step() when no scan is waiting). One document at a
-time. A document cut short is done first. Then one that is due another try.
-Then one left for this release by an earlier one. Then the next document in
-Paperless that carries the tag and has no record, or was let go and carries the
-tag again: every few minutes the app asks Paperless for the documents with the
-tag, so nothing has to tell the app that a document arrived. If work stops halfway it
-starts again from the top and skips what is already done: is the file here, is
-the searchable version built, does the document already have it, is the note
-there.
+Which document goes next, and whether anything may start now, is the queue's
+(jobs.py). This file does one document's work, and finds new ones: every few
+minutes it asks Paperless for the documents with the tag, so nothing has to
+tell the app that a document arrived. If work stops halfway it starts again
+from the top and skips what is already done: is the file here, is the
+searchable version built, does the document already have it, is the note there.
 
 What it may change in Paperless: it adds one file version and one note. It adds
 a version only when every other file version on the document is one the app
@@ -79,10 +76,12 @@ from pypdf import PdfReader
 
 from . import __version__, searchable
 from .config import Settings
-from .paperless import Paperless, PaperlessError, PaperlessTaskFailed
+from .paperless import NO_TAG, NOT_FOUND, Paperless, PaperlessError, PaperlessTaskFailed
 from .pipeline import ORDER_WORDS, ORIGINAL_ONLY, WITH_GOOGLE, Hold, Pipeline, Wait
 from .searchable import sha256
-from .store import ACTIVE, COMMITTED, COMMITTED_WARNING, HELD, Item, Store, iso, now, write_atomic
+from .store import (ACTIVE, COMMITTED, COMMITTED_WARNING, HELD, Item, Store, append_line, iso, now, remove_leftovers,
+                    write_atomic)
+from .usage import next_midnight
 
 log = logging.getLogger(__name__)
 
@@ -114,7 +113,7 @@ class NotNeeded(Exception):
 
 
 class NotOurs(Exception):
-    """This document no longer carries the Physical Mail tag, so it isn't the app's to work on."""
+    """This document no longer carries the Scanner tag, so it isn't the app's to work on."""
 
 
 class GiveUp(Exception):
@@ -129,12 +128,26 @@ class Later(Exception):
     """Not now. odd: nobody planned for this, so it gets few tries. Otherwise something outside was in the way.
 
     ask_google_afresh: Google was what failed, so the next try doesn't reuse this try's saved requests.
+    waits_on: "paperless" or "google" when that service is what failed, not this document. While a
+    document waits on one, the queue starts no other stored document: its own next try is the check
+    that the service is back.
     """
 
-    def __init__(self, reason: str, *, odd: bool = False, ask_google_afresh: bool = False):
+    def __init__(self, reason: str, *, odd: bool = False, ask_google_afresh: bool = False,
+                 waits_on: str | None = None):
         super().__init__(reason)
         self.odd = odd
         self.ask_google_afresh = ask_google_afresh
+        self.waits_on = waits_on
+
+
+def _about(error: PaperlessError) -> Exception:
+    """What a failed call to Paperless means for the document being worked on."""
+    if error.outside:
+        return Later(str(error), waits_on="paperless")
+    if error.kind == NOT_FOUND:
+        return GiveUp("the document is no longer in Paperless, or the app may no longer see it")
+    return Later(str(error), odd=True)          # about this request or this document: few tries
 
 
 class NotToday(Exception):
@@ -188,8 +201,7 @@ class Record:
         """Record a change of state: the event first, then the record, as a scan's record does."""
         self.root.mkdir(parents=True, exist_ok=True)
         line = {"at": iso(now()), "status": status, **fields}
-        with (self.root / "events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(line, sort_keys=True, default=str) + "\n")
+        append_line(self.root / "events.jsonl", json.dumps(line, sort_keys=True, default=str))
         self.state.update(fields)
         self.state["status"] = status
         self.save()
@@ -300,57 +312,48 @@ class Documents:
         record.set(status, **fields)
         return record
 
-    # The loop -------------------------------------------------------------------------
+    # Finding new work -------------------------------------------------------------------
+    #
+    # Which document goes next, and whether anything may start now, is the queue's (jobs.py).
+    # This half only finds documents in Paperless that need a record.
 
-    def step(self) -> Record | None:
-        """Choose the one document to work on now, if any, and mark it. The caller runs it (in a worker process)."""
-        while True:
-            records = self.all()
-            chosen = self._choose(records)
-            if chosen is None:
-                return None
-            if chosen.status != WORKING:
-                # Marked before the work starts, so a worker that dies at once is seen and counted.
-                chosen.set(WORKING, by=__version__, cut_short=0, waits_for_pages=False)
-                return chosen
-            # Still marked from before: the whole app stopped while it had this document in hand.
-            cut_short = int(chosen.state.get("cut_short") or 0) + 1
-            if cut_short <= TRIES_WHEN_ODD:
-                chosen.set(WORKING, by=__version__, cut_short=cut_short)
-                return chosen
-            self._finish(chosen, NEXT_RELEASE,
-                         f"the app stopped {cut_short - 1} times while working on it", cut_short=0)
+    def listing_path(self) -> Path:
+        return self.settings.intake_dir / "paperless-listing.json"
 
-    def _choose(self, records: list[Record]) -> Record | None:
-        chosen = next((record for record in records if record.status == WORKING), None)
-        if chosen is None:
-            chosen = next((record for record in records if record.status == LATER
-                           and float(record.state.get("not_before_unix") or 0) <= self.clock()), None)
-        if chosen is None:
-            # Each release tries once what an earlier release left for it.
-            chosen = next((record for record in records if record.status == NEXT_RELEASE
-                           and record.state.get("by") != __version__), None)
-        # While one document waits for tomorrow's Google pages, no new one is started: it would only
-        # be fetched to wait as well. The one that waits goes first tomorrow.
-        waiting_for_pages = any(record.status == LATER and record.state.get("waits_for_pages") for record in records)
-        if chosen is None and not waiting_for_pages and self.clock() >= self._look_again_at:
-            chosen = self._next_unseen(records)
-        return chosen
+    def read_listing(self) -> dict | None:
+        """The last list of tagged documents Paperless sent: their ids and their first file's checksum."""
+        try:
+            return json.loads(self.listing_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def discover(self, records: list[Record]) -> Record | None:
+        """The next document in Paperless that has no record, at most every few minutes. Not written down yet."""
+        if self.clock() < self._look_again_at:
+            return None
+        return self._next_unseen(records)
 
     def _next_unseen(self, records: list[Record]) -> Record | None:
         """The next document in Paperless that has no record. Asks Paperless; nothing is pushed to the app."""
         self._look_again_at = self.clock() + LOOK_MINUTES * 60      # unless this look finds one
         try:
-            from_the_scanner = self.paperless.tag_id(self.settings.physical_mail_tag)
+            from_the_scanner = self.paperless.tag_id(self.settings.scanner_tag)
         except PaperlessError as error:
-            log.info("couldn't find the Physical Mail tag in Paperless (%s); looking again in %d minutes",
-                     error, LOOK_MINUTES)
+            # Renamed or not made yet (the Physical Mail tag became Scanner in 1.4.0): only a wait, never a stop.
+            what = "isn't in Paperless" if error.kind == NO_TAG else "couldn't be looked up"
+            self._say_once(f"no tag {error}", "the %s tag %s (%s); looking again every %d minutes",
+                           self.settings.scanner_tag, what, error, LOOK_MINUTES)
             return None
         try:
             rows = self.paperless.documents(with_tag=from_the_scanner)
         except PaperlessError as error:
             log.info("couldn't ask Paperless what it holds (%s); asking again in %d minutes", error, LOOK_MINUTES)
             return None
+        self._said = {key for key in self._said if not key.startswith("no tag ")}
+        # Kept for the count of stored scans still to re-read (report.py), which needs Paperless's list.
+        listed = [{"id": int(row["id"]), "checksum": self._root_checksum(row)} for row in rows
+                  if from_the_scanner in (row.get("tags") or [])]
+        write_atomic(self.listing_path(), json.dumps({"at": self.clock(), "documents": listed}).encode())
         let_go = {record.doc_id: record for record in records if record.status == LET_GO}
         known = {record.doc_id for record in records if record.status != LET_GO}
         for row in sorted(rows, key=lambda row: int(row["id"])):
@@ -360,32 +363,25 @@ class Documents:
             # Paperless was asked for these documents only. The same test is made on its answer, so that
             # a Paperless version that ignored the filter could never widen what the app touches.
             if from_the_scanner not in (row.get("tags") or []):
-                continue                                  # no Physical Mail tag: not this app's, and nothing else decides
+                continue                                  # no Scanner tag: not this app's, and nothing else decides
             if doc_id in let_go:
                 # Let go when its tag was taken off, and the tag is back. It is taken on again from its
                 # existing record, so what the record knows is kept.
                 # The wait before the next look is kept, so this can happen at most once every five minutes.
-                log.info("document %s carries the Physical Mail tag again; taking it on again", doc_id)
+                log.info("document %s carries the %s tag again; taking it on again", doc_id, self.settings.scanner_tag)
                 return let_go[doc_id]
-            versions = row.get("versions") or []
-            root = next((version for version in versions if version.get("is_root")), None)
-            checksum = str((root or {}).get("checksum") or "")
+            checksum = self._root_checksum(row)
             if not checksum:
                 # Without it the app can't tell whether a scan is still putting this document in.
                 self._say_once(f"no file {doc_id}", "Paperless doesn't say which file document %s holds; "
                                                     "leaving it alone", doc_id)
                 continue
-            if self.store.exists(checksum):
-                # The same file went through the scanner's folder. Is this the document that scan made?
-                item = self.store.load(checksum)
-                theirs = item.state.get("doc_id")
-                if theirs is None and (item.status in ACTIVE or item.status == HELD):
-                    continue                              # that scan is still going in; this may be its document
-                if theirs is not None and int(theirs) == doc_id:
-                    if item.status in {COMMITTED, COMMITTED_WARNING}:
-                        self.record_scan(item)            # a finished scan whose record is missing
-                    continue                              # otherwise the scan still owns it
-                # Another document that happens to hold the same file: treated like any other.
+            item = self.scan_for(doc_id, checksum)
+            if item is not None:
+                # The same file went through the scanner's folder, and this is (or may be) that scan's document.
+                if item.state.get("doc_id") is not None and item.status in {COMMITTED, COMMITTED_WARNING}:
+                    self.record_scan(item)                # a finished scan whose record is missing
+                continue                                  # otherwise the scan still owns it
             log.info("document %s has no record yet; looking at it", doc_id)
             self._look_again_at = 0.0                     # there may be more: look again as soon as this one is done
             # Not written down yet: step() does that, as it hands the document out.
@@ -399,6 +395,26 @@ class Documents:
                 "tries": {},
                 "google_run": 1,
             })
+        return None
+
+    @staticmethod
+    def _root_checksum(row: dict) -> str:
+        root = next((version for version in row.get("versions") or [] if version.get("is_root")), None)
+        return str((root or {}).get("checksum") or "")
+
+    def scan_for(self, doc_id: int, checksum: str) -> Item | None:
+        """The scan record that owns this document, if one does: the scan made it, or may be making it now.
+
+        A scan whose file is the same but whose document is another one doesn't own this one.
+        """
+        if not checksum or not self.store.exists(checksum):
+            return None
+        item = self.store.load(checksum)
+        theirs = item.state.get("doc_id")
+        if theirs is None and (item.status in ACTIVE or item.status == HELD):
+            return item                                   # still going in: this may be its document
+        if theirs is not None and int(theirs) == doc_id:
+            return item
         return None
 
     def _say_once(self, key: str, message: str, *args) -> None:
@@ -423,13 +439,14 @@ class Documents:
         except NextRelease as outcome:
             self._finish(record, NEXT_RELEASE, str(outcome))
         except NotToday as outcome:
-            # Waiting for the day's allowance is not a failed try. It is picked up after midnight, UTC,
+            # Waiting for the day's allowance is not a failed try. It is picked up just after local midnight,
             # which is when the count of pages starts again.
             log.info("%s waits for tomorrow: %s", record.label, outcome)
-            record.set(LATER, reason=str(outcome), by=__version__, waits_for_pages=True,
-                       not_before_unix=(int(self.clock() // 86400) + 1) * 86400 + 60)
+            record.set(LATER, reason=str(outcome), by=__version__, waits_for_pages=True, waits_on=None,
+                       not_before_unix=next_midnight(self.clock()) + 60)
         except Later as outcome:
-            self._later(record, str(outcome), odd=outcome.odd, ask_google_afresh=outcome.ask_google_afresh)
+            self._later(record, str(outcome), odd=outcome.odd, ask_google_afresh=outcome.ask_google_afresh,
+                        waits_on=outcome.waits_on)
         except Exception as error:      # a defect in the app must not spin the loop or lose the record
             log.exception("unexpected error on %s", record.label)
             if record.status == WORKING:    # an outcome that is already recorded stands
@@ -450,7 +467,8 @@ class Documents:
         except Exception:
             log.exception("couldn't remove the working files of %s; its outcome is recorded", record.label)
 
-    def _later(self, record: Record, why: str, *, odd: bool, ask_google_afresh: bool = False) -> None:
+    def _later(self, record: Record, why: str, *, odd: bool, ask_google_afresh: bool = False,
+               waits_on: str | None = None) -> None:
         tries = dict(record.state.get("tries") or {})
         same = tries.get("release") == __version__
         count = (int(tries.get("count", 0)) if same else 0) + 1
@@ -462,8 +480,8 @@ class Documents:
         log.info("%s waits and is tried again: %s", record.label, why)
         # Google's saved answers are kept for the next try, so it never pays twice. Only when Google
         # itself failed does the next try start a new run: this run's retry budget may be spent.
-        record.set(LATER, reason=why, tries=tries, by=__version__,
-                   not_before_unix=self.clock() + LATER_MINUTES * 60,
+        record.set(LATER, reason=why, tries=tries, by=__version__, waits_on=None if odd else waits_on,
+                   waits_for_pages=False, not_before_unix=self.clock() + LATER_MINUTES * 60,
                    google_run=int(record.state.get("google_run", 1)) + (1 if ask_google_afresh else 0))
 
     def _work(self, record: Record) -> None:
@@ -474,7 +492,8 @@ class Documents:
         # Nothing is written unless Paperless is at a version the tests passed on, as for scans.
         live = self._ask(self.paperless.server_version)
         if not self.pipeline.version_accepted(live):
-            raise Later(f"Paperless is {live}, but the app was tested on {self.settings.tested_paperless_version}")
+            raise Later(f"Paperless is {live}, but the app was tested on {self.settings.tested_paperless_version}",
+                        waits_on="paperless")
 
         # 1. The document as Paperless has it now, checked for the tag before anything is downloaded:
         #    the tag may have been taken off since the app last worked on it.
@@ -547,7 +566,9 @@ class Documents:
             except Wait as wait:
                 if wait.kind == "page_cap":
                     raise NotToday(f"stored documents have used their share of today's Google pages ({share})")
-                raise Later(wait.reason, ask_google_afresh=wait.kind in {"google", "auth"})
+                # Everything else make_copy waits for is Google, or the app's Google settings.
+                raise Later(wait.reason, ask_google_afresh=wait.kind in {"google", "auth"},
+                            waits_on=wait.waits_on or "google")
             write_atomic(record.root / "checks.json",
                          (json.dumps({"at": iso(self.clock()), "release": __version__, **made.record},
                                      indent=2, default=str) + "\n").encode())
@@ -580,18 +601,19 @@ class Documents:
         try:
             added = searchable.ensure_added(self.paperless, doc_id, pending, record.copy_path.read_bytes,
                                             f"{stem}.searchable.pdf", self.pipeline.version_label(),
-                                            task=record.state.get("version_task"), remember=remember)
+                                            task=record.state.get("version_task"), remember=remember,
+                                            intent=self.pipeline.intent)
         except PaperlessTaskFailed as error:
             raise Later(f"Paperless didn't take the new file version ({error}: {error.result[:200]})", odd=True)
         except PaperlessError as error:
-            raise Later(str(error))
+            raise _about(error)
         if not added:
             raise Later("the searchable version on disk changed before it was added", odd=True)
         try:
             warnings, measured = searchable.read_back(self.paperless, doc_id, pending,
                                                       record.text_path.read_text(encoding="utf-8"))
         except PaperlessError as error:
-            raise Later(str(error))
+            raise _about(error)
         if "version_id" not in measured:
             raise Later("Paperless took the searchable version but doesn't list it", odd=True)
         reads_badly = not measured["text_match"]["ok"]
@@ -612,24 +634,57 @@ class Documents:
                 log.exception("couldn't close the earlier alert about %s", record.label)
 
     def _still_ours(self, doc_id: int) -> dict:
-        """The document as Paperless has it now. NotOurs if it no longer carries the Physical Mail tag."""
-        try:
-            document = self.paperless.document(doc_id)
-        except PaperlessError as error:
-            if "HTTP 404" in str(error):
-                raise GiveUp("the document is no longer in Paperless, or the app may no longer see it")
-            raise Later(str(error))
-        from_the_scanner = self._ask(lambda: self.paperless.tag_id(self.settings.physical_mail_tag))
+        """The document as Paperless has it now. NotOurs if it no longer carries the Scanner tag."""
+        document = self._ask(lambda: self.paperless.document(doc_id))
+        from_the_scanner = self._ask(lambda: self.paperless.tag_id(self.settings.scanner_tag))
         if from_the_scanner not in (document.get("tags") or []):
-            raise NotOurs("it doesn't carry the Physical Mail tag")
+            raise NotOurs(f"it doesn't carry the {self.settings.scanner_tag} tag")
         return document
 
     def _ask(self, call):
-        """A call to Paperless whose failing only means: try this document again later."""
+        """A call to Paperless. A failure is typed: Paperless itself (an outside wait), gone, or about this document."""
         try:
             return call()
         except PaperlessError as error:
-            raise Later(str(error))
+            raise _about(error)
+
+    # Starting again after a kill ---------------------------------------------------------
+
+    def recover(self) -> list[str]:
+        """When the app starts: finish what a kill left after an outcome was written. Safe to run any number of times."""
+        done = []
+        if self.adopt_scans():
+            done.append("wrote document records for scans that had finished going in")
+        for record in self.all():
+            remove_leftovers(record.root)
+            if self.settle(record):
+                done.append(f"finished what {record.label} still owed after its outcome was written")
+        return done
+
+    def settle(self, record: Record) -> bool:
+        """What an outcome leaves to do, if a kill came between: the working files, and closing the scan's alert.
+
+        Safe to run any number of times. The queue runs it whenever a worker comes back, and for
+        every record when the app starts. True if there was anything to do.
+        """
+        owed = False
+        if record.status in {DONE, NOT_NEEDED, GAVE_UP, NEXT_RELEASE} and (
+                (record.root / "source").exists() or record.copy_path.exists() or (record.root / "google").exists()):
+            owed = True
+            try:
+                record.tidy()
+            except Exception:       # a full disk, say: the outcome stands, and the files go next time
+                log.exception("couldn't remove the working files of %s; its outcome is recorded", record.label)
+        # Done by the loop itself (it writes its warnings, none here), then killed before the scan's
+        # earlier alert was closed. A record the hand-over wrote has no warnings field and is left alone.
+        if (record.status == DONE and record.state.get("source") == "scanner"
+                and record.state.get("warnings") == [] and record.state.get("original_sha256")
+                and self.store.exists(record.state["original_sha256"])):
+            item = self.store.load(record.state["original_sha256"])
+            if item.state.get("alert_open") or item.state.get("outbox"):
+                self._close_alert(record)
+                owed = True
+        return owed
 
     def _close_alert(self, record: Record) -> None:
         """The scan's own route told Jane something was wrong with this document. It no longer is."""

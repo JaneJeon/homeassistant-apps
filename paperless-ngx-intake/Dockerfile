@@ -19,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 CMD ["python3", "-m", "paperless_intake"]
 
 LABEL \
-    org.opencontainers.image.title="Paperless Intake" \
+    org.opencontainers.image.title="Paperless-ngx Scanner" \
     org.opencontainers.image.description="Turns scans upright and into reading order with Google OCR, then commits them into Paperless-ngx" \
     org.opencontainers.image.source="https://github.com/JaneJeon/homeassistant-apps" \
     org.opencontainers.image.licenses="MIT"

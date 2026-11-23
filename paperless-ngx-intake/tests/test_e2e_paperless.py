@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -146,8 +147,8 @@ class PaperlessE2E(unittest.TestCase):
         cls.reader_token, _ = cls._user("reader", ["view_document"])    # another user, like an MCP client
         # Jane's tags are owned by her account, so the app's user needs view permission on them.
         view = {"view": {"users": [intake_id], "groups": []}, "change": {"users": [], "groups": []}}
-        cls.tag = cls._tag("Physical Mail", admin_id, view)
-        cls.intake_tag = cls._tag("Mail intake", admin_id, view)
+        cls.tag = cls._tag("Scanner", admin_id, view)
+        cls.intake_tag = cls._tag("Mail Intake", admin_id, view)
         cls.hooks = HookListener()
         cls._jane_workflows()
 
@@ -209,10 +210,12 @@ class PaperlessE2E(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         values = dict(
             paperless_url=self.base, paperless_token=self.intake_token, google_service_account=None,
-            processor_version=PROCESSOR, physical_mail_tag="Physical Mail", intake_tag="Mail intake", ha_url="http://ha.invalid",
+            processor_version=PROCESSOR, scanner_tag="Scanner", intake_tag="Mail Intake", ha_url="http://ha.invalid",
             webhook_started="s", webhook_finished="f", webhook_alert="a", daily_page_cap=500, min_free_mib=0,
             keep_local_copies_days=7, watchdog_minutes=45, capture_dir=root / "capture", intake_dir=root / "intake",
             tested_paperless_version=VERSION, stable_seconds=0, poll_seconds=0,
+            # The test machine's own load must not hold the app back here; the gate has unit tests of its own.
+            min_available_mib=0, max_io_pressure=101, max_memory_pressure=101, pace_seconds=0,
         )
         values.update(overrides)
         settings = Settings(**values)
@@ -249,10 +252,10 @@ class PaperlessE2E(unittest.TestCase):
                 self.documents._look_again_at = 0.0          # no need to sit out the five minutes between looks
         self.fail(f"the loop reached no outcome for document {doc_id}")
 
-    def stored_by_other_means(self, pdf: bytes, name: str, *, owner_cleared=True, physical_mail=True) -> int:
+    def stored_by_other_means(self, pdf: bytes, name: str, *, owner_cleared=True, tagged=True) -> int:
         """A document that reaches Paperless without the app: uploaded by Jane's own account.
 
-        physical_mail: she then gives it the Physical Mail tag in Paperless. The tag is what makes a
+        tagged: she then gives it the Scanner tag in Paperless. The tag is what makes a
         document the app's to look at, and adding it by hand is how a scan that lacks it is mended.
         """
         response = self.api.post(f"{self.base}/api/documents/post_document/",
@@ -263,7 +266,7 @@ class PaperlessE2E(unittest.TestCase):
         changes = {}
         if owner_cleared:       # as a consume-folder document is: nobody's, so every user sees it
             changes["owner"] = None
-        if physical_mail:       # added afterwards, so that no "document added" workflow fires for it
+        if tagged:       # added afterwards, so that no "document added" workflow fires for it
             changes["tags"] = [self.tag]
         if changes:
             self.api.patch(f"{self.base}/api/documents/{doc_id}/", json=changes).raise_for_status()
@@ -287,6 +290,41 @@ class PaperlessE2E(unittest.TestCase):
     def search(self, word: str) -> list[int]:
         response = self.api.get(f"{self.base}/api/documents/", params={"query": word, "fields": "id"})
         return [row["id"] for row in response.json()["results"]]
+
+    def test_the_app_can_ask_paperless_how_its_uploads_ended(self):
+        """The tasks API as the app's own user, as the queue uses it to settle an upload in doubt (gate.Intent)."""
+        settings, store, service, client, notifier = self.harness()
+        (settings.capture_dir / "20261101_100000_000501.pdf").write_bytes(numbered_letter(1, tag=uuid.uuid4().hex[:8]).pdf)
+        self.run_until_quiet(service)
+        item = store.all()[0]
+        task = client.task(item.state["upload_task"])
+        self.assertEqual(task["status"], "success")
+        self.assertLess(abs(task["created"] - time.time()), 600)           # Paperless's own time, as a timestamp
+        self.assertIsNotNone(task["started"])                               # date_started, for the app's own user
+        self.assertGreaterEqual(task["started"], task["created"] - 1)
+        self.assertIsNone(client.task(str(uuid.uuid4())))
+        deadline = time.time() + 120
+        while client.consume_tasks(created_after=time.time() - 3600) and time.time() < deadline:
+            time.sleep(2)
+        self.assertEqual(client.consume_tasks(created_after=time.time() - 3600), [])
+        # The filter consume_tasks relies on is honoured: the app's finished upload is listed without it,
+        # and not when asked only for tasks made after it.
+        def listed(**params):
+            body = client._request("GET", "/api/tasks/", params={"task_type": "consume_file", **params}).json()
+            return body.get("count", len(body.get("results", [])))
+        later = datetime.fromtimestamp(task["created"] + 60, timezone.utc).isoformat()
+        self.assertGreaterEqual(listed(), 1)
+        self.assertEqual(listed(date_created_after=later), 0)
+        # A mark for an upload that landed is settled by its checksum; one whose task ended, by the task.
+        intent = service.pipeline.intent
+        intent.open(what="original", sha256=item.sha, name="landed.pdf")
+        self.assertEqual(intent.settle(client, settings.intake_tag, stale_after=2700), ("landed", "it landed"))
+        intent.open(what="version", sha256="0" * 64, name="lost.pdf", doc_id=item.state["doc_id"])
+        intent.task(item.state["version_task"])
+        outcome, how = intent.settle(client, settings.intake_tag, stale_after=2700)
+        self.assertEqual(outcome, "ended")
+        self.assertIn("task for it ended (success)", how)
+        self.assertIsNone(intent.read())
 
     def test_commit_reads_back_and_searches_on_google_text(self):
         settings, store, service, client, notifier = self.harness()
@@ -514,7 +552,7 @@ class PaperlessE2E(unittest.TestCase):
         self.assertIn(marker, after["content"])                                  # Paperless reads its text itself
 
     def test_a_document_that_belongs_to_another_user_is_seen_only_once_it_is_shared_with_the_app(self):
-        """A scan that has an owner, and the Physical Mail tag. Paperless hides an owned document from
+        """A scan that has an owner, and the Scanner tag. Paperless hides an owned document from
         every other user, so until it is shared with the app's user, or its owner is cleared, the app
         cannot know it exists. Shared with View and Change permission, it is picked up like any other,
         and stays its owner's."""
@@ -595,12 +633,12 @@ class PaperlessE2E(unittest.TestCase):
     def test_the_same_file_by_another_route_and_then_by_the_scanner_is_two_documents(self):
         """A scan takes for its own only a document the app stored. The same file stored some other way stays
         someone else's document: its owner, tags and versions are not the scan's to change. And with no
-        Physical Mail tag it is not the loop's either, though the app can see it."""
+        Scanner tag it is not the loop's either, though the app can see it."""
         if any(pair.startswith("PAPERLESS_CONSUMER_DELETE_DUPLICATES") for pair in PAPERLESS_ENV):
             self.skipTest("this Paperless refuses a file it already holds")
         settings, store, service, client, notifier = self.harness(loop=True)
         scan = numbered_letter(2, tag=uuid.uuid4().hex[:8])
-        theirs = self.stored_by_other_means(scan.pdf, "uploaded-by-hand.pdf", owner_cleared=False, physical_mail=False)
+        theirs = self.stored_by_other_means(scan.pdf, "uploaded-by-hand.pdf", owner_cleared=False, tagged=False)
         shared = {"view": {"users": [self.intake_id], "groups": []}, "change": {"users": [self.intake_id], "groups": []}}
         self.api.patch(f"{self.base}/api/documents/{theirs}/", json={"set_permissions": shared}).raise_for_status()
         self.assertIn(theirs, [row["id"] for row in client.documents()])         # in plain sight of the app
@@ -620,7 +658,7 @@ class PaperlessE2E(unittest.TestCase):
         self.assertFalse(self.documents.exists(theirs))
         self.assertEqual(len(client.versions(item.state["doc_id"])), 2)
 
-    def test_a_document_without_the_physical_mail_tag_is_left_alone_until_it_is_given_one(self):
+    def test_a_document_without_the_scanner_tag_is_left_alone_until_it_is_given_one(self):
         """The tag is the boundary, against real Paperless. The app asks Paperless only for documents with
         the tag, and this proves Paperless obeys that filter. A scanned file without the tag is not listed,
         fetched, read or added to, though the app can see it. Given the tag in Paperless, which is how a gap
@@ -628,7 +666,7 @@ class PaperlessE2E(unittest.TestCase):
         settings, store, service, client, notifier = self.harness(loop=True)
         marker = "ploverweir" + uuid.uuid4().hex[:6]
         scan = numbered_letter(2, tag=marker)
-        doc_id = self.stored_by_other_means(scan.pdf, f"no-tag-{marker}.pdf", physical_mail=False)
+        doc_id = self.stored_by_other_means(scan.pdf, f"no-tag-{marker}.pdf", tagged=False)
         row = next(row for row in client.documents() if row["id"] == doc_id)
         self.assertNotIn(self.tag, row["tags"])
         self.assertIn(doc_id, [row["id"] for row in client.documents()])                    # the app can see it

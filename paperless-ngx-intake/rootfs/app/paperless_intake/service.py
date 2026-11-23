@@ -1,4 +1,4 @@
-"""The running service: claim finished scans, work through items one at a time, tidy up."""
+"""The running service: claim finished scans, run the queue's jobs one at a time in a worker, tidy up."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from pypdf import PdfReader
 
 from .config import Settings
+from .jobs import TIMED_OUT, Queue
 from .notify import Notifier
 from .pipeline import Pipeline
 from .store import COMMITTED, COMMITTED_WARNING, HELD, Store, iso, now
@@ -42,6 +43,8 @@ class SubprocessRunner:
     timeout_seconds: float = 4 * 3600
     command: tuple[str, ...] = (sys.executable, "-m", "paperless_intake.worker")
     env: dict | None = None
+    stopping: bool = False
+    _child: subprocess.Popen | None = field(default=None, repr=False)
 
     def __call__(self, item) -> int:
         return self._run(item.sha)
@@ -49,15 +52,34 @@ class SubprocessRunner:
     def document(self, record) -> int:
         return self._run("document", str(record.doc_id))
 
+    def tidy(self, sha: str) -> int:
+        """Summarise a committed scan's Google answers and drop them (pipeline._tidy_after_commit)."""
+        return self._run("tidy", sha)
+
     def _run(self, *arguments: str) -> int:
+        child = subprocess.Popen([*self.command, *arguments], env=self.env)
+        self._child = child
         try:
-            return subprocess.run([*self.command, *arguments], timeout=self.timeout_seconds, env=self.env,
-                                  check=False).returncode
+            return child.wait(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
             return TIMED_OUT
+        finally:
+            self._child = None
 
+    def stop(self) -> None:
+        """The app is asked to stop (the Supervisor's SIGTERM). The worker is stopped at once, so the app exits
+        well inside the Supervisor's 10 seconds.
 
-TIMED_OUT = -1000
+        Nothing depends on this. The worker dies as it would in any kill, and the job it had is
+        resumed when the app starts again: every step looks before it acts. It only spares the
+        Supervisor a kill -9 and the log line that goes with it.
+        """
+        self.stopping = True
+        child = self._child
+        if child is not None and child.poll() is None:
+            child.terminate()
 
 
 @dataclass
@@ -70,8 +92,34 @@ class Service:
     runner: callable = None        # None: work in this process (the tests); SubprocessRunner in the app
     documents: object = None       # the documents loop (documents.py); None switches it off
     lock: threading.RLock = field(default_factory=threading.RLock)
+    queue: Queue | None = None
+    poke: callable = None          # told after anything that may change what Home Assistant shows
     _seen: dict = field(default_factory=dict)
+    _claim_failed: dict = field(default_factory=dict)
     _last_tidy: float = 0.0
+
+    def __post_init__(self):
+        if self.queue is None:
+            self.queue = Queue(self.settings, self.store, self.pipeline, self.documents, clock=self.clock)
+
+    def start(self) -> list[str]:
+        """Put every record back in a state the queue understands. Run once, before the loop."""
+        with self.lock:
+            done = self.queue.recover()
+            for sha in self.pipeline.left_to_tidy:
+                if self.runner is None:
+                    self.pipeline._tidy_after_commit(self.store.load(sha))
+                else:
+                    self.runner.tidy(sha)
+                done.append(f"summarised the Google answers of {sha[:12]}, left by a kill after it went in")
+            return done
+
+    def _told(self) -> None:
+        if self.poke is not None:
+            try:
+                self.poke()
+            except Exception:      # publishing is best effort and never stops the work
+                log.exception("couldn't hand the change on for Home Assistant")
 
     # Capture ----------------------------------------------------------------------
 
@@ -88,34 +136,49 @@ class Service:
                 continue
             present.add(name)
             try:
-                info = path.stat()
-            except FileNotFoundError:
-                continue
-            seen = self._seen.get(name)
-            if seen is None or seen.size != info.st_size or seen.mtime != info.st_mtime:
-                self._seen[name] = _Seen(info.st_size, info.st_mtime, self.clock())
-                continue
-            stable_for = self.clock() - seen.stable_since
-            if stable_for < self.settings.stable_seconds:
-                continue
-            # Read from the file rather than into memory: scans run to tens of MiB, and
-            # the service stays small while each scan's work happens in a worker process.
-            sha = _file_sha256(path)
-            pages = _pdf_pages(path)
-            if pages is None and stable_for < UNREADABLE_AFTER_SECONDS:
-                continue  # maybe still being written in a way that keeps size and time still
-            item_id = self._claim(path, sha, info.st_size, pages)
-            if item_id:
-                claimed.append(item_id)
-            self._seen.pop(name, None)
+                claimed += self._claim_if_ready(path)
+            except Exception as error:      # a full disk, say: this file waits, and nothing else stops
+                failure = f"{type(error).__name__}: {error}"
+                if self._claim_failed.get(name) != failure:
+                    log.exception("couldn't claim %s; trying again at the next look", name)
+                self._claim_failed[name] = failure
         for name in list(self._seen):
             if name not in present:
                 self._seen.pop(name, None)
+        for name in list(self._claim_failed):
+            if name not in present:
+                self._claim_failed.pop(name, None)
         return claimed
+
+    def _claim_if_ready(self, path: Path) -> list[str]:
+        """Claim one file from the capture folder once it has stopped changing. Returns the claimed item id, if any."""
+        name = path.name
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return []
+        seen = self._seen.get(name)
+        if seen is None or seen.size != info.st_size or seen.mtime != info.st_mtime:
+            self._seen[name] = _Seen(info.st_size, info.st_mtime, self.clock())
+            return []
+        stable_for = self.clock() - seen.stable_since
+        if stable_for < self.settings.stable_seconds:
+            return []
+        # Read from the file rather than into memory: scans run to tens of MiB, and
+        # the service stays small while each scan's work happens in a worker process.
+        sha = _file_sha256(path)
+        pages = _pdf_pages(path)
+        if pages is None and stable_for < UNREADABLE_AFTER_SECONDS:
+            return []  # maybe still being written in a way that keeps size and time still
+        item_id = self._claim(path, sha, info.st_size, pages)
+        self._seen.pop(name, None)
+        self._claim_failed.pop(name, None)
+        return [item_id] if item_id else []
 
     def _claim(self, path: Path, sha: str, size: int, pages: int | None) -> str | None:
         if _file_sha256(path) != sha:
             return None  # changed under us; look again next round
+        self.store.settle_partial(self.store.path_for(sha))
         if self.store.exists(sha):
             target = self.settings.duplicates_dir / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(self.clock()))}-{path.name}"
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -125,57 +188,48 @@ class Service:
             return None
         item = self.store.create(sha, path, original_name=path.name, page_count=pages, byte_count=size,
                                  at=self.clock())
-        item.state["started_sent"] = self.notifier.started(sha)
-        item.save()
+        self.pipeline.announce(item)
         log.info("claimed %s as %s (%s pages)", path.name, sha[:12], pages)
         return sha
 
     # Work -------------------------------------------------------------------------
 
     def next_item(self):
+        """The first scan that is due, in the order scans arrived. The queue decides whether it may start."""
         for item in self.store.all():
             if self.pipeline.due(item):
                 return item
         return None
 
     def step(self) -> bool:
-        """Claim, then advance one due item. Returns True if an item was worked on."""
+        """Claim, then run the one job the queue hands out, if any. True if a job ran."""
         with self.lock:
-            self.claim_captures()
-            item = self.next_item()
-            if item is None:
-                return self._step_documents()      # stored documents get a turn only when no scan is waiting
-            log.info("working on %s (%s)", item.sha[:12], item.status)
+            if self.claim_captures():
+                self._told()
+            held_before = dict(self.queue.held)
+            job = self.queue.next()
+            if job is None:
+                if self.queue.held != held_before:
+                    self._told()
+                return False
+            log.info("working on %s (%s)", job.label, job.record.status)
+            self._told()
             if self.runner is None:
-                self.pipeline.run(item)
+                code = 0
+                (self.pipeline.run if job.kind == "scan" else self.documents.run)(job.record)
             else:
-                code = self.runner(item)
-                item = self.store.load(item.sha)
-                if code != 0:
-                    self.pipeline.worker_stopped(item, code, timed_out=code == TIMED_OUT)
-            log.info("%s is now %s%s", item.sha[:12], item.status,
-                     f": {item.state.get('reason')}" if item.state.get("reason") else "")
+                code = self.runner(job.record) if job.kind == "scan" else self.runner.document(job.record)
+            self.queue.returned(job, code, stopping=bool(getattr(self.runner, "stopping", False)))
+            self._told()
+            if job.kind == "scan" and self.store.exists(job.record.sha):
+                record = self.store.load(job.record.sha)
+            elif job.kind == "document":
+                record = self.documents.load(job.record.doc_id)
+            else:
+                return True
+            log.info("%s is now %s%s", job.label, record.status,
+                     f": {record.state.get('reason')}" if record.state.get("reason") else "")
             return True
-
-    def _step_documents(self) -> bool:
-        """Work on one document that is already in Paperless, if one needs it. True if one was worked on."""
-        if self.documents is None:
-            return False
-        record = self.documents.step()
-        if record is None:
-            return False
-        log.info("working on %s", record.label)
-        if self.runner is None:
-            self.documents.run(record)
-        else:
-            code = self.runner.document(record)
-            record = self.documents.load(record.doc_id)
-            if code != 0:
-                self.documents.worker_stopped(record, code)
-        record = self.documents.load(record.doc_id)
-        log.info("%s is now %s%s", record.label, record.status,
-                 f": {record.state.get('reason')}" if record.state.get("reason") else "")
-        return True
 
     # Tidy -------------------------------------------------------------------------
 
@@ -184,6 +238,8 @@ class Service:
         keep = self.settings.keep_local_copies_days * 86400
         with self.lock:
             for item in self.store.all():
+                if item.state.get("outbox"):
+                    self.pipeline.settle(item)      # alerts Home Assistant didn't take earlier
                 if item.status not in {COMMITTED, COMMITTED_WARNING} or item.state.get("local_copies_removed_at"):
                     continue
                 if self.clock() - float(item.state.get("committed_at_unix", self.clock())) < keep:

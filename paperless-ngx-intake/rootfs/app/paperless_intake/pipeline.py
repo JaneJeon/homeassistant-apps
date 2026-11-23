@@ -34,7 +34,6 @@ import json
 import re
 import logging
 import shutil
-import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -48,13 +47,20 @@ from .docai.page_order import plan_page_order
 from .docai.pdf_renderer import ReviewRequired, describe_source
 from .docai.renderer_adapter import StackRenderer
 from .docai.validation import assert_unchanged, document_for_renderer, inspect_source, ordered_text, validate_result
+from .gate import Intent
 from .notify import Notifier
 from . import searchable
-from .paperless import Paperless, PaperlessError, PaperlessTaskFailed
+from .paperless import NO_TAG, Paperless, PaperlessError, PaperlessTaskFailed
 from .searchable import sha256
 from .store import (COMMITTED, COMMITTED_WARNING, COMMITTING, CAPTURED, DISCARDED, FAILED, HELD, READY, WAITING,
                     Item, Store,
-                    iso, now, write_atomic)
+                    copy_atomic, iso, now, write_atomic)
+from .usage import GoogleUsage
+
+# A scan has ended, for the watchdog's count, once it is in one of these.
+ENDED = {HELD, COMMITTED, COMMITTED_WARNING, FAILED, DISCARDED}
+# Waits the queue's gate records for a scan it keeps from starting (jobs.py).
+GATE_KINDS = {"memory_low", "disk_low", "io_pressure", "memory_pressure", "upload_in_doubt"}
 
 log = logging.getLogger(__name__)
 
@@ -137,11 +143,20 @@ THIS_SCAN_HTTP = {400, 413, 422}
 
 @dataclass
 class Wait(Exception):
-    """Something outside was unavailable. Try again later."""
+    """Something outside was unavailable. Try again later.
+
+    waits_on: "paperless" or "google" when the failure is about that service, not about this
+    scan, so the next job would meet it too. None otherwise, and for the day's page cap.
+    """
     reason: str
     kind: str
     stage: str
     alert: bool = False
+    waits_on: str | None = None
+
+
+def _on_paperless(error: PaperlessError) -> str | None:
+    return "paperless" if error.outside else None
 
 
 def _refused_as_duplicate(error: PaperlessTaskFailed) -> bool:
@@ -169,8 +184,11 @@ class Pipeline:
         self.backend_factory = backend_factory or self._google_backend
         self.renderer = StackRenderer()
         self.clock = clock
+        self.usage = GoogleUsage(settings.intake_dir / "google-usage.json", clock)
+        self.intent = Intent(settings.intake_dir / "upload-in-doubt.json", clock)
         # Set by wiring: where a scan's document is handed over once the scan has finished going in.
         self.documents = None
+        self.left_to_tidy: list[str] = []      # committed scans whose Google answers a worker summarises (recover)
 
     # Dispatch -------------------------------------------------------------------
 
@@ -189,7 +207,7 @@ class Pipeline:
                 if stage == "ocr" and item.state.get("retry_new_google_run"):
                     item.state["google_run"] = int(item.state.get("google_run", 1)) + 1
                     item.state["retry_new_google_run"] = False
-                item.set(CAPTURED if stage == "ocr" else READY, reason=None, reason_kind=None)
+                item.set(CAPTURED if stage == "ocr" else READY, reason=None, reason_kind=None, waits_on=None)
             if item.status == CAPTURED:
                 self.prepare(item)
             if item.status in {READY, COMMITTING}:
@@ -211,28 +229,9 @@ class Pipeline:
         config = GoogleBackendConfig(self.settings.processor_version, item.google_dir())
         return GoogleDocumentAIBackend(config, token_provider=self.token_provider)
 
-    def _usage_path(self) -> Path:
-        return self.settings.intake_dir / "google-usage.json"
-
-    def _pages_today(self) -> int:
-        try:
-            usage = json.loads(self._usage_path().read_text())
-        except (OSError, json.JSONDecodeError):
-            return 0
-        return int(usage.get(time.strftime("%Y-%m-%d", time.gmtime(self.clock())), 0))
-
     def pages_today(self) -> int:
-        """Pages sent to Google so far today, for scans and for stored documents together."""
-        return self._pages_today()
-
-    def _count_pages(self, pages: int) -> None:
-        day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
-        try:
-            usage = json.loads(self._usage_path().read_text())
-        except (OSError, json.JSONDecodeError):
-            usage = {}
-        usage = {day: int(usage.get(day, 0)) + pages}
-        write_atomic(self._usage_path(), json.dumps(usage).encode())
+        """Pages sent to Google so far today (the local day), for scans and for stored documents together."""
+        return self.usage.today()
 
     def prepare(self, item: Item) -> None:
         def seen(pages: int) -> None:
@@ -268,13 +267,10 @@ class Pipeline:
 
         Used for a scan on its way in (prepare) and for a document that is already in
         Paperless (documents.py). Raises Hold when the file isn't a PDF the app can read, and
-        Wait when something outside the file is in the way (disk, the Google key, the
-        day's page cap, Google not answering). Otherwise returns what it made: the copy,
-        or the reason there is none.
+        Wait when something outside the file is in the way (the Google key, the day's page
+        cap, Google not answering). Otherwise returns what it made: the copy, or the reason
+        there is none. Free disk and memory are the queue's to check, before the job starts.
         """
-        free_mib = shutil.disk_usage(self.settings.intake_dir).free // (1024 * 1024)
-        if free_mib < self.settings.min_free_mib:
-            raise Wait(f"only {free_mib} MiB free on the Green", "disk_low", "ocr")
         try:
             source = inspect_source(source_path)
         except ParserError as error:
@@ -282,11 +278,11 @@ class Pipeline:
         if on_pages:
             on_pages(source.page_count)
         if self.token_provider is None and self.backend_factory == self._google_backend:
-            raise Wait("the Google key isn't set in the app options", "config", "ocr", alert=True)
+            raise Wait("the Google key isn't set in the app options", "config", "ocr", alert=True, waits_on="google")
         # The one place the day's Google pages are rationed. A scan may use all of them. A caller
         # working on stored documents passes its smaller share.
         allowance = self.settings.daily_page_cap if page_allowance is None else page_allowance
-        if self._pages_today() + source.page_count > allowance:
+        if self.usage.today() + source.page_count > allowance:
             raise Wait(f"today's Google page cap ({self.settings.daily_page_cap}) is reached", "page_cap", "ocr")
 
         work_dir = work_dir_for()
@@ -296,18 +292,22 @@ class Pipeline:
             result = backend_for().process(source, work_dir)
         except GoogleBackendError as error:
             if error.code in TRANSIENT_GOOGLE:
-                raise Wait(f"Google OCR didn't answer ({error.code})", "google", "ocr")
+                raise Wait(f"Google OCR didn't answer ({error.code})", "google", "ocr", waits_on="google")
             if error.code in AUTH_GOOGLE:
-                raise Wait(f"Google refused the app's key ({error.code})", "auth", "ocr", alert=True)
+                raise Wait(f"Google refused the app's key ({error.code})", "auth", "ocr", alert=True,
+                           waits_on="google")
             status = getattr(error, "http_status", None)
             if error.code in THIS_SCAN_GOOGLE or (error.code == "post_http_error_fatal" and status in THIS_SCAN_HTTP):
                 detail = f"{error.code}, HTTP {status}" if status else error.code
                 return Made(source.page_count, why_not=f"Google couldn't read this scan ({detail})")
             detail = f"{error.code}, HTTP {status}" if status else error.code
-            raise Wait(f"Google OCR isn't working ({detail})", "google", "ocr", alert=True)
+            raise Wait(f"Google OCR isn't working ({detail})", "google", "ocr", alert=True, waits_on="google")
+        # Counted once per answer, by the file Google's answer was saved in. A job resumed after a
+        # kill reads the same files again and adds nothing. (Before 1.4.0: counted when any part
+        # of the answer was new, which could miss pages a kill had already paid for.)
         cache_hits = int(result.provenance.get("cache_hits", 0))
-        if cache_hits < len(result.chunks):
-            self._count_pages(source.page_count)
+        self.usage.count((str(chunk.provenance.get("response_path") or chunk.response_sha256), len(chunk.source_pages))
+                         for chunk in result.chunks)
 
         try:
             validate_result(result, source)
@@ -482,25 +482,26 @@ class Pipeline:
         try:
             live = self.paperless.server_version()
         except PaperlessError as error:
-            raise Wait(str(error), "paperless", "commit")
+            raise Wait(str(error), "paperless", "commit", waits_on=_on_paperless(error))
         if not self._version_accepted(live):
             raise Wait(f"Paperless is {live}, but the app was tested on {self.settings.tested_paperless_version}",
-                       "version_mismatch", "commit", alert=True)
+                       "version_mismatch", "commit", alert=True, waits_on="paperless")
         try:
             # The intake tag marks the upload as the app's own. Paperless's "document added"
             # trigger ignores the source filter (3.3.4 checks sources only for "consumption
             # started"), so Jane's ingest workflow excludes this tag instead.
-            tag_ids = [self.paperless.tag_id(self.settings.physical_mail_tag),
+            tag_ids = [self.paperless.tag_id(self.settings.scanner_tag),
                        self.paperless.tag_id(self.settings.intake_tag)]
         except PaperlessError as error:
-            raise Wait(str(error), "paperless", "commit", alert="tag" in str(error))
+            raise Wait(str(error), "paperless", "commit", alert=error.kind == NO_TAG, waits_on=_on_paperless(error))
         if item.status != COMMITTING:
             item.set(COMMITTING)
         mode = item.state.get("mode", WITH_GOOGLE)
         original = item.source_path.read_bytes()
         if sha256(original) != item.sha:
-            item.set(FAILED, reason="the local copy of the scan changed on disk", reason_kind="local_integrity")
-            self._finish(item, alert_kind="failed")
+            reason = "the local copy of the scan changed on disk"
+            item.set(FAILED, reason=reason, reason_kind="local_integrity", **self._queued(item, "failed", reason))
+            self.settle(item)
             return
 
         try:
@@ -525,21 +526,28 @@ class Pipeline:
             raise Wait(f"Paperless couldn't take the upload ({str(error)}: {error.result[:200]})",
                        "paperless_task", "commit", alert=True)
         except PaperlessError as error:
-            raise Wait(str(error), "paperless", "commit")
+            raise Wait(str(error), "paperless", "commit", waits_on=_on_paperless(error))
 
         if problems:
-            item.set(FAILED, reason="; ".join(problems), reason_kind="read_back", doc_id=doc_id)
-            self._finish(item, alert_kind="failed")
+            reason = "; ".join(problems)
+            item.set(FAILED, reason=reason, reason_kind="read_back", doc_id=doc_id,
+                     **self._queued(item, "failed", reason))
+            self.settle(item)
             return
         status = COMMITTED_WARNING if warnings else COMMITTED
-        item.set(status, reason="; ".join(warnings) or None, reason_kind="read_back" if warnings else None,
+        reason = "; ".join(warnings) or None
+        # The alert (or the message closing an earlier one) is written with the new state, in the same
+        # write, and sent from there. Killed in between, it is still owed, and is sent when the app is back.
+        told = self._queued(item, "warning", reason) if warnings else self._resolution(item, "committed")
+        item.set(status, reason=reason, reason_kind="read_back" if warnings else None,
                  doc_id=doc_id, committed_at=iso(self.clock()), committed_at_unix=self.clock(),
-                 waiting_since_unix=None, alerted_reason_kind=None)
+                 waiting_since_unix=None, alerted_reason_kind=None, waits_on=None, **told)
         self._tidy_after_commit(item)
-        self._finish(item, alert_kind="warning" if warnings else None)
+        self.settle(item)
         # The hand-over. The scan has finished going in. From here its document belongs to the
         # documents loop, which is also what gives it a better searchable version later, if
-        # this one reads back badly or couldn't be built.
+        # this one reads back badly or couldn't be built. Killed before this, the app writes the
+        # record when it starts again (documents.adopt_scans).
         if self.documents is not None:
             self.documents.record_scan(item)
 
@@ -547,10 +555,12 @@ class Pipeline:
         doc_id = item.state.get("doc_id")
         if doc_id:
             return int(doc_id)
+        name = item.state["original_name"]
         task_id = item.state.get("upload_task")
         if task_id:
             try:
-                task = self.paperless.wait_for_task(task_id)
+                task = searchable.await_upload(self.paperless, self.intent, task_id, what="original",
+                                               sha=item.sha, name=name)
                 doc_id = self.paperless.task_document_id(task)
             except PaperlessTaskFailed as error:
                 if not _refused_as_duplicate(error):
@@ -559,18 +569,24 @@ class Pipeline:
                     raise
         # Only a document the app stored itself is taken to be this scan's: it carries the intake tag.
         # The same file stored some other way is someone else's document. It is never this scan's, and it is
-        # the loop's only if it carries the Physical Mail tag.
+        # the loop's only if it carries the Scanner tag.
         mine = tag_ids[-1]
         doc_id = doc_id or self.paperless.find_by_checksum(item.sha, with_tag=mine)
         if not doc_id:
-            created = scan_date(item.state["original_name"], float(item.state.get("captured_at_unix") or self.clock()))
-            task_id = self.paperless.post_document(item.state["original_name"], original, tag_ids=tag_ids,
-                                                   created=created)
+            created = scan_date(name, float(item.state.get("captured_at_unix") or self.clock()))
+            # The intent mark goes down before the file goes out. Killed or timed out before the task id is
+            # written, the queue starts no upload until Paperless shows how this one ended (gate.Intent.settle),
+            # and then this step finds the document by its checksum instead of sending the file again.
+            self.intent.open(what="original", sha256=item.sha, name=name)
+            task_id = searchable.send(self.intent, lambda: self.paperless.post_document(name, original, tag_ids=tag_ids,
+                                                                                       created=created))
             item.event("uploaded_original", task=task_id)
             item.state["upload_task"] = task_id
             item.save()
+            self.intent.task(task_id)
             try:
-                task = self.paperless.wait_for_task(task_id)
+                task = searchable.await_upload(self.paperless, self.intent, task_id, what="original",
+                                               sha=item.sha, name=name)
                 doc_id = self.paperless.task_document_id(task)
             except PaperlessTaskFailed as error:
                 if not _refused_as_duplicate(error):
@@ -609,7 +625,7 @@ class Pipeline:
         stem = Path(item.state["original_name"]).stem
         return searchable.ensure_added(self.paperless, doc_id, item.state["searchable_sha256"],
                                        item.searchable_path.read_bytes, f"{stem}.searchable.pdf", self.version_label(),
-                                       task=item.state.get("version_task"), remember=remember)
+                                       task=item.state.get("version_task"), remember=remember, intent=self.intent)
 
     def _read_back(self, item: Item, doc_id: int, tag_ids: list[int], mode: str) -> tuple[list[str], list[str]]:
         """Problems mean the original isn't safely in Paperless. Warnings concern the searchable version only."""
@@ -627,7 +643,7 @@ class Pipeline:
         if document.get("owner") is not None:
             warnings.append("the document still has an owner, so other Paperless users may not see it")
         present = set(document.get("tags") or [])
-        for name, tag_id in zip((self.settings.physical_mail_tag, self.settings.intake_tag), tag_ids):
+        for name, tag_id in zip((self.settings.scanner_tag, self.settings.intake_tag), tag_ids):
             if tag_id not in present:
                 warnings.append(f"the {name} tag is missing")
         if mode == WITH_GOOGLE and not problems:
@@ -722,65 +738,135 @@ class Pipeline:
 
     # Outcomes ------------------------------------------------------------------------
 
-    def _finish(self, item: Item, *, alert_kind: str | None) -> None:
-        """The scan left the in-flight count: tell the watchdog, unless it has already given up."""
-        if item.state.get("started_sent") and not item.state.get("finished_sent"):
-            age_minutes = (self.clock() - float(item.state.get("captured_at_unix", 0))) / 60
-            if age_minutes <= self.settings.watchdog_minutes:
+    # Home Assistant: the watchdog's pair of webhooks, and alerts -------------------------
+    #
+    # Webhooks can't be taken back or asked about, so each is written down before it is sent.
+    # "started" and "finished" drive a counter in Home Assistant (minimum 0) that must stay
+    # paired. Each is sent at most once: the app writes that it is sending, sends, and writes the
+    # result. Killed in the instant between, the app takes it as sent. A lost "finished" costs a
+    # false 45-minute warning about one scan. A second one would hide another scan in flight.
+    # Alerts go out at least once. Each is queued in the scan's record (its outbox) in the same
+    # write as the change of state it is about, then sent. Killed before it went, it is sent when
+    # the app starts again. A repeated alert is a repeated message; a lost one could be a lost page.
+
+    @staticmethod
+    def _started(state: dict) -> bool:
+        """Whether "started" went out, or may have: written as being sent, with no result after it."""
+        return bool(state.get("started_sent")) or (bool(state.get("started_sending"))
+                                                    and state.get("started_sent") is None)
+
+    def announce(self, item: Item) -> None:
+        """Tell the watchdog a scan has started. Never twice for one scan."""
+        state = item.state
+        if state.get("started_sending") or state.get("started_sent") is not None:
+            return
+        if not self.notifier.has("started"):
+            state["started_sent"] = False
+            item.save()
+            return
+        state.update(started_sending=True, started_at_unix=self.clock())
+        item.save()
+        state["started_sent"] = self.notifier.started(item.sha)
+        item.save()
+
+    def settle(self, item: Item) -> None:
+        """Send what is owed to Home Assistant about this scan: "finished" once it has ended, and its queued alerts.
+
+        Safe to call at any time and as often as wanted. The app calls it after every change of
+        state, and for every scan when it starts.
+        """
+        state = item.state
+        if item.status not in ENDED and state.get("started_sent") is None and not state.get("started_sending"):
+            self.announce(item)                         # its claim failed before "started" could go out
+        if state.get("finished_sending") and not state.get("finished_sent"):
+            state["finished_sent"] = True               # killed while sending: taken as sent
+            item.save()
+        if item.status in ENDED and self._started(state) and not state.get("finished_sent"):
+            started_at = float(state.get("started_at_unix") or state.get("captured_at_unix") or 0)
+            if (self.clock() - started_at) / 60 <= self.settings.watchdog_minutes:
+                state["finished_sending"] = True
+                item.save()
                 self.notifier.finished(item.sha)
             else:
                 item.event("finished_not_sent", reason="the Home Assistant watchdog already reported this scan")
-            item.state["finished_sent"] = True
+            state["finished_sent"] = True
             item.save()
-        if alert_kind:
-            self._alert(item, alert_kind, item.state.get("reason") or "")
-        elif item.status in {COMMITTED, DISCARDED}:
-            self._resolve(item)
+        self._flush(item)
 
-    def _alert(self, item: Item, kind: str, gap: str) -> None:
-        self.notifier.alert(kind=kind, item_id=item.sha[:12], scanned_at=self._scanned_at(item),
-                            pages=item.state.get("page_count"), gap=gap)
-        item.state["alert_open"] = True
-        item.save()
+    def _flush(self, item: Item) -> None:
+        outbox = list(item.state.get("outbox") or [])
+        if not outbox:
+            return
+        if not self.notifier.has("alert"):
+            item.state["outbox"] = []
+            item.save()
+            return
+        while outbox:
+            entry = outbox[0]
+            if not self.notifier.alert(kind=entry["kind"], item_id=item.sha[:12], scanned_at=self._scanned_at(item),
+                                       pages=item.state.get("page_count"), gap=entry.get("gap") or ""):
+                return                                  # Home Assistant didn't take it: sent again later
+            outbox.pop(0)
+            item.state["outbox"] = outbox
+            item.save()
+
+    @staticmethod
+    def _queued(item: Item, kind: str, gap: str | None) -> dict:
+        """The fields that queue an alert. Written together with the change of state it is about."""
+        return {"outbox": [*(item.state.get("outbox") or []), {"kind": kind, "gap": gap or ""}],
+                "alert_open": kind != "resolved"}
+
+    def _resolution(self, item: Item, outcome: str) -> dict:
+        """The fields that close an earlier alert about this scan, if one is open."""
+        return self._queued(item, "resolved", outcome) if item.state.get("alert_open") else {}
 
     def close_alert(self, item: Item) -> None:
         """For documents.py: the cause of an earlier alert about this scan's document is gone."""
-        self._resolve(item)
-
-    def _resolve(self, item: Item) -> None:
-        """Close an earlier alert about this scan, so Home Assistant can clear its notification."""
-        if not item.state.get("alert_open"):
-            return
-        outcome = "discarded" if item.status == DISCARDED else "committed"
-        self.notifier.alert(kind="resolved", item_id=item.sha[:12], scanned_at=self._scanned_at(item),
-                            pages=item.state.get("page_count"), gap=outcome)
-        item.state["alert_open"] = False
-        item.save()
+        told = self._resolution(item, "committed")
+        if told:
+            item.state.update(told)
+            item.save()
+        self._flush(item)
 
     @staticmethod
     def _scanned_at(item: Item) -> str:
         return item.state.get("captured_at") or ""
 
     def _hold(self, item: Item, reason: str, kind: str) -> None:
-        item.set(HELD, reason=reason, reason_kind=kind, held_reason=reason, held_at=iso(self.clock()))
-        self._finish(item, alert_kind="held")
+        item.set(HELD, reason=reason, reason_kind=kind, held_reason=reason, held_at=iso(self.clock()),
+                 waiting_since_unix=None, waits_on=None, **self._queued(item, "held", reason))
+        self.settle(item)
 
-    def _wait(self, item: Item, wait: Wait) -> None:
+    def _wait(self, item: Item, wait: Wait, *, retry_at: float | None = None) -> None:
         since = float(item.state.get("waiting_since_unix") or self.clock())
         if self.clock() - since > self.settings.retry_hours * 3600:
-            item.state["waiting_since_unix"] = None
             self._hold(item, f"kept failing for {self.settings.retry_hours} hours: {wait.reason}", "gave_up")
             return
         already_alerted = item.state.get("alerted_reason_kind") == wait.kind
-        item.set(WAITING, reason=wait.reason, reason_kind=wait.kind, retry_stage=wait.stage,
-                 retry_new_google_run=wait.kind in {"google", "auth"},
-                 waiting_since_unix=since,
-                 next_attempt_at_unix=self.clock() + self.settings.retry_minutes * 60,
-                 next_attempt_at=iso(self.clock() + self.settings.retry_minutes * 60))
+        retry_at = retry_at if retry_at is not None else self.clock() + self.settings.retry_minutes * 60
+        told = {}
         if wait.alert and not already_alerted:
-            item.state["alerted_reason_kind"] = wait.kind
-            item.save()
-            self._alert(item, "waiting", wait.reason)
+            told = dict(self._queued(item, "waiting", wait.reason), alerted_reason_kind=wait.kind)
+        # A wait the queue's gate records keeps what Google's last failure asked for: a fresh run.
+        fresh_google = wait.kind in {"google", "auth"} or (wait.kind in GATE_KINDS
+                                                           and bool(item.state.get("retry_new_google_run")))
+        item.set(WAITING, reason=wait.reason, reason_kind=wait.kind, retry_stage=wait.stage,
+                 retry_new_google_run=fresh_google, waits_on=wait.waits_on,
+                 waiting_since_unix=since, next_attempt_at_unix=retry_at, next_attempt_at=iso(retry_at), **told)
+        if told:
+            self.settle(item)
+
+    def held_back(self, item: Item, reason: str, kind: str, waits_on: str | None, until: float) -> None:
+        """The queue's gate kept this scan from starting (memory, disk, I/O, an upload in doubt).
+
+        Recorded as a wait, not run: its next try, the 24-hour hold, and the Scans page stay true.
+        No alert of its own. If it lasts a day, the hold alerts.
+        """
+        if item.status == WAITING:
+            stage = item.state.get("retry_stage", "ocr")
+        else:
+            stage = "commit" if item.status in {READY, COMMITTING} else "ocr"
+        self._wait(item, Wait(reason, kind, stage, waits_on=waits_on), retry_at=until)
 
     def worker_stopped(self, item: Item, code: int, *, timed_out: bool = False) -> None:
         """The child process for this item died without finishing. Wait and retry, never loop."""
@@ -801,7 +887,7 @@ class Pipeline:
             stage = "commit" if item.status in {READY, COMMITTING} else "ocr"
         self._wait(item, Wait(reason, "worker", stage, alert=True))
 
-    # Jane's choices on the Mail intake page ---------------------------------------------
+    # Jane's choices on the Scans page ---------------------------------------------------
 
     def keep_as_it_is(self, item: Item) -> None:
         """Jane has judged the paper can go with this scan as it stands. Commit what there is.
@@ -853,7 +939,7 @@ class Pipeline:
                 path = item.root / name
                 kept = item.root / f"{name.split('.')[0]}.by-{earlier}.{name.split('.', 1)[1]}"
                 if path.exists() and not kept.exists():
-                    shutil.copy2(path, kept)
+                    copy_atomic(path, kept)
             item.event("prepared_again", by=__version__, was_by=earlier)
             item.set(CAPTURED, waiting_since_unix=None, alerted_reason_kind=None)
             again.append(item.sha)
@@ -898,10 +984,45 @@ class Pipeline:
         if item.status not in {HELD, WAITING}:
             raise ValueError("only held or waiting scans can be discarded")
         item.set(DISCARDED, reason=item.state.get("reason"), reason_kind=item.state.get("reason_kind"),
-                 jane_decision="discard")
-        self._finish(item, alert_kind=None)
+                 jane_decision="discard", **self._resolution(item, "discarded"))
+        self.settle(item)
         item.event("discarded")
+        return self._move_discarded(item)
+
+    def _move_discarded(self, item: Item) -> Path:
         target = self.settings.discarded_dir / f"{item.sha}-{int(self.clock())}"
         target.parent.mkdir(parents=True, exist_ok=True)
         item.root.rename(target)
         return target
+
+    # Starting again after a kill ---------------------------------------------------------
+
+    def recover(self) -> list[str]:
+        """When the app starts: finish what a kill left owed for every scan. Safe to run any number of times."""
+        done = []
+        self.left_to_tidy = []
+        for item in self.store.all():
+            state = item.state
+            if state.get("started_sending") and state.get("started_sent") is None:
+                state["started_sent"] = True             # killed while sending "started": taken as sent
+                item.save()
+            if item.status not in ENDED and state.get("started_sent") is None and not state.get("started_sending"):
+                self.announce(item)                      # claimed, then killed before "started" went out
+                done.append(f"sent the started webhook for {item.sha[:12]}")
+            owed = bool(state.get("outbox")) or (item.status in ENDED and self._started(state)
+                                                 and not state.get("finished_sent"))
+            self.settle(item)
+            if owed:
+                done.append(f"sent what was owed to Home Assistant for {item.sha[:12]}")
+            if item.status in {COMMITTED, COMMITTED_WARNING} and (item.root / "google").exists():
+                if (item.root / "google-summary.json.gz").exists():
+                    shutil.rmtree(item.root / "google", ignore_errors=True)       # nothing in them is needed
+                    shutil.rmtree(item.root / "work", ignore_errors=True)
+                else:
+                    # The summary is made from the raw answers, page images and all. That is a worker's job:
+                    # the service never loads large files (Service.start runs it).
+                    self.left_to_tidy.append(item.sha)
+            if item.status == DISCARDED:
+                self._move_discarded(item)               # discarded, then killed before it was moved aside
+                done.append(f"moved discarded {item.sha[:12]} aside")
+        return done

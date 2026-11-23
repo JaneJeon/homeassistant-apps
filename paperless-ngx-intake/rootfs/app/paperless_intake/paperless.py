@@ -8,14 +8,51 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import requests
 
 API_VERSION = "10"
+# An upload can take Paperless minutes to answer when the Green is short of memory. A short wait
+# here only means the app stops listening while Paperless goes on taking the file in.
+UPLOAD_TIMEOUT = (10.0, 600.0)          # seconds to connect, seconds to wait for the answer
+
+# What kind of failure it was. Some say something about Paperless itself, not about one document:
+UNREACHABLE = "unreachable"     # the connection failed or was refused
+TIMEOUT = "timeout"             # Paperless didn't answer in time
+BUSY = "busy"                   # HTTP 502, 503 or 504
+LOGIN = "login"                 # HTTP 401: Paperless refused the app's token, so every request fails
+NO_TAG = "no_tag"               # a tag the app needs isn't in Paperless (renamed, say), so every scan fails
+# ...and some are about one request or one document:
+NOT_FOUND = "not_found"         # HTTP 404
+REFUSED = "refused"             # any other HTTP error
+OUTSIDE = frozenset({UNREACHABLE, TIMEOUT, BUSY, LOGIN, NO_TAG})
+COMPLETE = frozenset({"success", "failure", "revoked"})
 
 
 class PaperlessError(RuntimeError):
-    """Paperless was unreachable or refused a request. The scan waits and retries."""
+    """Paperless was unreachable or refused a request.
+
+    kind says which. outside: the failure is about Paperless, not about the document the app was
+    working on, so the next document would meet it too.
+    """
+
+    def __init__(self, message: str, kind: str = REFUSED, *, answered: bool | None = True):
+        super().__init__(message)
+        self.kind = kind
+        # Whether the outcome of this request is known: True, Paperless answered it (with an error);
+        # False, it never reached Paperless (the connection was refused or never made); None, not known
+        # (no answer came, or a 502/503/504 that a proxy may have sent after passing the request on).
+        self.answered = answered
+
+    @property
+    def known(self) -> bool:
+        """Whether Paperless is known to have taken nothing from this request."""
+        return self.answered is not None
+
+    @property
+    def outside(self) -> bool:
+        return self.kind in OUTSIDE
 
 
 class PaperlessTaskFailed(RuntimeError):
@@ -24,6 +61,31 @@ class PaperlessTaskFailed(RuntimeError):
     def __init__(self, message: str, result: str | None = None):
         super().__init__(message)
         self.result = result or ""
+
+
+def _never_connected(error: Exception) -> bool:
+    """A connection that was refused or never made: nothing of the request reached Paperless."""
+    from urllib3.exceptions import NewConnectionError
+    seen, current = set(), error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, NewConnectionError):
+            return True
+        current = getattr(current, "reason", None) or (current.args[0] if getattr(current, "args", None)
+                                                       and isinstance(current.args[0], Exception) else None)
+    return False
+
+
+def _when(value) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() if value else None
+    except ValueError:
+        return None
+
+
+def _task(row: dict) -> dict:
+    return {"status": str(row.get("status", "")).lower(), "created": _when(row.get("date_created")),
+            "started": _when(row.get("date_started"))}
 
 
 @dataclass(frozen=True)
@@ -47,13 +109,22 @@ class Paperless:
         self._sleep = sleep
         self._monotonic = monotonic
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, path: str, *, timeout=None, **kwargs) -> requests.Response:
         try:
-            response = self.session.request(method, self.base_url + path, timeout=self.timeout, **kwargs)
+            response = self.session.request(method, self.base_url + path, timeout=timeout or self.timeout, **kwargs)
+        except requests.ConnectTimeout as error:
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", TIMEOUT, answered=False) from None
+        except requests.Timeout as error:
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", TIMEOUT, answered=None) from None
         except requests.RequestException as error:
-            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}") from None
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", UNREACHABLE,
+                                 answered=False if _never_connected(error) else None) from None
         if response.status_code >= 400:
-            raise PaperlessError(f"Paperless {method} {path} returned HTTP {response.status_code}")
+            status = response.status_code
+            kind = (LOGIN if status == 401 else NOT_FOUND if status == 404
+                    else BUSY if status in {502, 503, 504} else REFUSED)
+            raise PaperlessError(f"Paperless {method} {path} returned HTTP {status}", kind,
+                                 answered=None if kind == BUSY else True)
         return response
 
     # Version pin ---------------------------------------------------------------
@@ -72,7 +143,7 @@ class Paperless:
         response = self._request("GET", "/api/tags/", params={"name__iexact": name})
         results = response.json().get("results", [])
         if len(results) != 1:
-            raise PaperlessError(f"Expected exactly one tag named {name!r}, found {len(results)}")
+            raise PaperlessError(f"Expected exactly one tag named {name!r}, found {len(results)}", NO_TAG)
         return int(results[0]["id"])
 
     def find_by_checksum(self, sha256: str, *, with_tag: int | None = None) -> int | None:
@@ -129,13 +200,14 @@ class Paperless:
         if created:
             # Given a date, Paperless uses it and doesn't guess one from its own reading of the pages.
             form.append(("created", created))
-        response = self._request("POST", "/api/documents/post_document/", files=files, data=form)
+        response = self._request("POST", "/api/documents/post_document/", files=files, data=form,
+                                 timeout=UPLOAD_TIMEOUT)
         return str(response.json())
 
     def update_version(self, doc_id: int, filename: str, data: bytes, *, label: str) -> str:
         files = {"document": (filename, data, "application/pdf")}
         response = self._request("POST", f"/api/documents/{doc_id}/update_version/", files=files,
-                                 data={"version_label": label[:64]})
+                                 data={"version_label": label[:64]}, timeout=UPLOAD_TIMEOUT)
         return str(response.json())
 
     def set_owner(self, doc_id: int, owner: int | None) -> None:
@@ -164,8 +236,33 @@ class Paperless:
                 if status in {"failure", "revoked"}:
                     raise PaperlessTaskFailed(f"Paperless task {task_id} {status}", str(task.get("result")))
             if self._monotonic() >= deadline:
-                raise PaperlessError(f"Paperless task {task_id} did not finish in time")
+                raise PaperlessError(f"Paperless task {task_id} did not finish in time", TIMEOUT)
             self._sleep(poll)
+
+    def task(self, task_id: str) -> dict | None:
+        """A task's status (pending, started, success, failure, revoked) and when it was created. None if there is none."""
+        body = self._request("GET", "/api/tasks/", params={"task_id": task_id}).json()
+        results = body.get("results", body) if isinstance(body, dict) else body
+        return _task(results[0]) if results else None
+
+    def consume_tasks(self, *, created_after: float) -> list[dict]:
+        """The files Paperless was given after this time and hasn't finished taking in: its unfinished consume tasks.
+
+        Paperless shows this user its own tasks and those with no owner (the consume folder's).
+        The status is checked here as well, so a Paperless that ignored the filter can't make
+        the list empty by mistake.
+        """
+        params = {"task_type": "consume_file", "is_complete": "false", "page_size": 100,
+                  "date_created_after": datetime.fromtimestamp(created_after, timezone.utc).isoformat()}
+        tasks, page = [], 1
+        while page <= 10:
+            body = self._request("GET", "/api/tasks/", params={**params, "page": page}).json()
+            results = body.get("results", []) if isinstance(body, dict) else body
+            tasks += [_task(row) for row in results]
+            if not (isinstance(body, dict) and body.get("next")):
+                break
+            page += 1
+        return [task for task in tasks if task["status"] not in COMPLETE]
 
     @staticmethod
     def task_document_id(task: dict) -> int | None:
