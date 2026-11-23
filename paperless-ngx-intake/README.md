@@ -23,7 +23,7 @@ flowchart TD
         end
 
         subgraph paperless["Paperless-ngx app (stock)"]
-            v1["Version 1: the untouched scan<br/>Paperless runs its own OCR and rotation<br/>on this one, into its own archive file"]
+            v1["Version 1: the untouched scan<br/>With Paperless's default settings it also<br/>makes its own OCRed rendition of this one"]
             vn["Newest version: the searchable copy<br/>stored exactly as sent<br/>this is what is shown and searched"]
         end
 
@@ -48,7 +48,7 @@ Solid arrows are the path of a scan. Dotted arrows are alerts.
 
 ## Who does what
 
-Paperless-ngx has its own OCR, page rotation and deskew. They still run, but only on the untouched scan. This table says whose result you actually see.
+Paperless-ngx has its own OCR, page rotation and deskew. With Paperless's default settings they still run, but only on the untouched scan. With its OCR mode `off` they don't run at all. This table says whose result you actually see.
 
 | Job | Whose result counts | What Paperless's own feature does |
 | --- | --- | --- |

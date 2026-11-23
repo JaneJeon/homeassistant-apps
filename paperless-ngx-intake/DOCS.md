@@ -14,7 +14,7 @@ For each scan in `/share/paperless/capture`, the app:
 6. Commits to Paperless through the REST API: the untouched scan as version 1, the searchable copy as version 2. Then it reads both back and checks the bytes, the tags and the search text.
 7. Adds a note to the document saying what it decided. The evidence behind each decision is in the scan's `checks.json` (see Files).
 
-The document's date in Paperless is the day it was scanned. The app takes it from the scanner's file name (`20261122_144510_000353.pdf`), or uses the day it picked the file up. Paperless would otherwise guess a date from its own reading of the raw scan.
+When the app uploads a scan, it gives Paperless the day of the scan as the document's date. It takes the day from the scanner's file name (`20261122_144510_000353.pdf`), or uses the day it picked the file up. Paperless would otherwise guess a date from its own reading of the raw scan. Documents uploaded before version 1.2.0 keep the date Paperless guessed.
 
 ## Any way the stack goes in
 

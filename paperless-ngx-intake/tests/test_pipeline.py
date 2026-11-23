@@ -143,6 +143,30 @@ class HappyPathTests(unittest.TestCase):
         self.assertIn("no search text", note)
         self.assertNotIn("did its own OCR", note)
 
+    def test_a_scan_stored_without_its_copy_says_whether_anything_read_it(self):
+        """Three cases for the note on a scan that went in without Google's copy."""
+        h = Harness(self)
+        h.drop(numbered_letter(2))
+        h.settle()
+        item = h.only_item()
+        why = "Google couldn't read this scan (page_limit_exceeded)"
+        item.state.update(no_google_copy_reason=why, copy_not_built=False, paperless_read_it=True)
+        self.assertIn("Paperless did its own OCR", h.pipeline.note_text(item, "original_only", []))
+        # Paperless's own OCR is off and Google refused the scan: nothing will ever read it.
+        item.state.update(paperless_read_it=False)
+        note = h.pipeline.note_text(item, "original_only", [])
+        self.assertIn("It has no search text, and the pages are as the scanner saved them", note)
+        self.assertNotIn("newer version", note)
+        self.assertNotIn("did its own OCR", note)
+        # The app itself couldn't build the copy: the next version of the app tries again.
+        item.state.update(copy_not_built=True)
+        self.assertIn("until a newer version of the app builds the copy", h.pipeline.note_text(item, "original_only", []))
+
+    def test_a_warning_worded_by_an_earlier_version_counts_as_the_same_warning(self):
+        from paperless_intake.pipeline import COPY_RESAVED, _kinds
+        self.assertEqual(_kinds("Paperless re-ran its own OCR on the searchable copy"),
+                         _kinds(f"{COPY_RESAVED} (see Paperless's OCR mode and archive file generation settings)"))
+
     def test_the_scan_date_goes_to_paperless_as_the_document_date(self):
         h = Harness(self)
         h.drop(numbered_letter(2))                       # dropped as 20261101_093000_000400.pdf

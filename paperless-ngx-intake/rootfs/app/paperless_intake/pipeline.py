@@ -94,9 +94,15 @@ ORDER_WORDS = {
 
 # Reasons version 1.0 held a scan for that no longer hold one. Scans still held for
 # them are put back through the checks once, when this version starts.
+COPY_RESAVED = "Paperless made its own archive file of the searchable copy and shows that in its place"
+# The same warning as versions before 1.2.0 worded it, so a document that already carries it isn't alerted again.
+_EARLIER_WORDING = {"Paperless re-ran its own OCR on the searchable copy": COPY_RESAVED}
+
+
 def _kinds(reason: str | None) -> set[str]:
     """The warnings in a reason, without the figures in brackets: what they are about, not how much."""
-    return {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
+    kinds = {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
+    return {_EARLIER_WORDING.get(kind, kind) for kind in kinds}
 
 
 COPY_RETRIES = 3            # tries per app version to add a copy an earlier version couldn't build
@@ -634,8 +640,7 @@ class Pipeline:
                     # Paperless leaves a PDF that has text alone only while its OCR mode is auto or
                     # off and its archive file generation is auto or never. This is how the app
                     # notices that one of them changed: by what Paperless did, not by what it is set to.
-                    warnings.append("Paperless made its own archive file of the searchable copy and shows that "
-                                    "in its place (its OCR mode or archive file setting has changed)")
+                    warnings.append(f"{COPY_RESAVED} (see Paperless's OCR mode and archive file generation settings)")
                 google_text = (item.root / "text.txt").read_text(encoding="utf-8")
                 match = checks.text_matches(google_text, document.get("content") or "")
                 record["text_match"] = match
@@ -683,8 +688,10 @@ class Pipeline:
             if state.get("quality_notes"):
                 lines.append("Text layer: " + "; ".join(state["quality_notes"]) + ". The page images aren't affected.")
         elif state.get("no_google_copy_reason"):
+            # Only a copy the app itself failed to build is tried again, by the next version of the app.
             own = ("Paperless did its own OCR" if state.get("paperless_read_it", True)
-                   else "It has no search text until the copy is built")
+                   else "It has no search text until a newer version of the app builds the copy"
+                   if state.get("copy_not_built") else "It has no search text")
             lines.append(f"Only the original was stored, because {state['no_google_copy_reason']}. "
                          f"{own}, and the pages are as the scanner saved them.")
         elif state.get("short_text"):
