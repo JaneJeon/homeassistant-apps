@@ -776,6 +776,8 @@ class Pipeline:
         state, and for every scan when it starts.
         """
         state = item.state
+        if item.status not in ENDED and state.get("started_sent") is None and not state.get("started_sending"):
+            self.announce(item)                         # its claim failed before "started" could go out
         if state.get("finished_sending") and not state.get("finished_sent"):
             state["finished_sent"] = True               # killed while sending: taken as sent
             item.save()

@@ -95,6 +95,7 @@ class Service:
     queue: Queue | None = None
     poke: callable = None          # told after anything that may change what Home Assistant shows
     _seen: dict = field(default_factory=dict)
+    _claim_failed: dict = field(default_factory=dict)
     _last_tidy: float = 0.0
 
     def __post_init__(self):
@@ -135,34 +136,49 @@ class Service:
                 continue
             present.add(name)
             try:
-                info = path.stat()
-            except FileNotFoundError:
-                continue
-            seen = self._seen.get(name)
-            if seen is None or seen.size != info.st_size or seen.mtime != info.st_mtime:
-                self._seen[name] = _Seen(info.st_size, info.st_mtime, self.clock())
-                continue
-            stable_for = self.clock() - seen.stable_since
-            if stable_for < self.settings.stable_seconds:
-                continue
-            # Read from the file rather than into memory: scans run to tens of MiB, and
-            # the service stays small while each scan's work happens in a worker process.
-            sha = _file_sha256(path)
-            pages = _pdf_pages(path)
-            if pages is None and stable_for < UNREADABLE_AFTER_SECONDS:
-                continue  # maybe still being written in a way that keeps size and time still
-            item_id = self._claim(path, sha, info.st_size, pages)
-            if item_id:
-                claimed.append(item_id)
-            self._seen.pop(name, None)
+                claimed += self._claim_if_ready(path)
+            except Exception as error:      # a full disk, say: this file waits, and nothing else stops
+                failure = f"{type(error).__name__}: {error}"
+                if self._claim_failed.get(name) != failure:
+                    log.exception("couldn't claim %s; trying again at the next look", name)
+                self._claim_failed[name] = failure
         for name in list(self._seen):
             if name not in present:
                 self._seen.pop(name, None)
+        for name in list(self._claim_failed):
+            if name not in present:
+                self._claim_failed.pop(name, None)
         return claimed
+
+    def _claim_if_ready(self, path: Path) -> list[str]:
+        """Claim one file from the capture folder once it has stopped changing. Returns the claimed item id, if any."""
+        name = path.name
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return []
+        seen = self._seen.get(name)
+        if seen is None or seen.size != info.st_size or seen.mtime != info.st_mtime:
+            self._seen[name] = _Seen(info.st_size, info.st_mtime, self.clock())
+            return []
+        stable_for = self.clock() - seen.stable_since
+        if stable_for < self.settings.stable_seconds:
+            return []
+        # Read from the file rather than into memory: scans run to tens of MiB, and
+        # the service stays small while each scan's work happens in a worker process.
+        sha = _file_sha256(path)
+        pages = _pdf_pages(path)
+        if pages is None and stable_for < UNREADABLE_AFTER_SECONDS:
+            return []  # maybe still being written in a way that keeps size and time still
+        item_id = self._claim(path, sha, info.st_size, pages)
+        self._seen.pop(name, None)
+        self._claim_failed.pop(name, None)
+        return [item_id] if item_id else []
 
     def _claim(self, path: Path, sha: str, size: int, pages: int | None) -> str | None:
         if _file_sha256(path) != sha:
             return None  # changed under us; look again next round
+        self.store.settle_partial(self.store.path_for(sha))
         if self.store.exists(sha):
             target = self.settings.duplicates_dir / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(self.clock()))}-{path.name}"
             target.parent.mkdir(parents=True, exist_ok=True)

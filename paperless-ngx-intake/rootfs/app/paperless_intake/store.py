@@ -185,6 +185,7 @@ class Store:
         a kill cut short, so a scan is never lost between the capture folder and its record.
         """
         root = self.path_for(sha)
+        self.settle_partial(root)          # a claim of the same file that failed part way: finished or undone
         root.mkdir(parents=True, exist_ok=False)
         at = at if at is not None else now()
         claim = {"sha256": sha, "original_name": original_name, "page_count": page_count, "byte_count": byte_count,
@@ -222,29 +223,37 @@ class Store:
             if not child.is_dir():
                 continue
             remove_leftovers(child)
-            if (child / "state.json").exists():
-                continue
-            source = child / "source" / "original.pdf"
-            try:
-                claim = json.loads((child / "claim.json").read_text())
-            except (OSError, json.JSONDecodeError):
-                claim = None
-            if not source.exists():
-                # The file was never moved, so it is still in the capture folder and is claimed again.
-                shutil.rmtree(child, ignore_errors=True)
-                done.append(f"undid an unfinished claim of {child.name[:12]}")
-                continue
-            if claim is None:
-                # Claimed by a release before 1.4.0, which wrote no claim.json. The file's name is lost.
-                with source.open("rb") as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() != child.name:
-                        continue
-                claim = {"sha256": child.name, "original_name": f"recovered-{child.name[:12]}.pdf",
-                         "page_count": None, "byte_count": source.stat().st_size,
-                         "captured_at_unix": source.stat().st_mtime}
-            self._item_from_claim(child, claim)
-            done.append(f"finished the claim of {child.name[:12]}")
+            what = self.settle_partial(child)
+            if what:
+                done.append(what)
         return done
+
+    def settle_partial(self, root: Path) -> str | None:
+        """Finish or undo a claim that stopped part way (a kill, a full disk), so the folder never blocks a claim.
+
+        The file not yet moved: the folder goes, and the file in the capture folder is claimed again.
+        The file moved: the record is written from claim.json. Returns what it did, or None.
+        """
+        if not root.is_dir() or (root / "state.json").exists():
+            return None
+        source = root / "source" / "original.pdf"
+        try:
+            claim = json.loads((root / "claim.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            claim = None
+        if not source.exists():
+            shutil.rmtree(root, ignore_errors=True)
+            return f"undid an unfinished claim of {root.name[:12]}"
+        if claim is None:
+            # Claimed by a release before 1.4.0, which wrote no claim.json. The file's name is lost.
+            with source.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != root.name:
+                    return None
+            claim = {"sha256": root.name, "original_name": f"recovered-{root.name[:12]}.pdf",
+                     "page_count": None, "byte_count": source.stat().st_size,
+                     "captured_at_unix": source.stat().st_mtime}
+        self._item_from_claim(root, claim)
+        return f"finished the claim of {root.name[:12]}"
 
     def load(self, sha: str) -> Item:
         root = self.path_for(sha)

@@ -837,6 +837,36 @@ class StartingAgainTests(unittest.TestCase):
         self.assertFalse((item.root / "google").exists())
         self.assertEqual(h.pipeline.left_to_tidy, [])
 
+    def test_a_claim_that_fails_part_way_blocks_nothing_and_is_tried_again(self):
+        import errno
+        import paperless_intake.store as store
+        h = Harness(self)
+        first = make_scan(letter(1, "a"))
+        h.drop(first, name="20261101_093000_000400.pdf")
+        h.drop(make_scan(letter(1, "b")), name="20261101_093100_000401.pdf")
+        failing = __import__("hashlib").sha256(first.pdf).hexdigest()
+        real = store.write_atomic
+        full = [True]
+
+        def disk_full_for_the_first(path, data, *args, **kwargs):
+            if path.name == "claim.json" and full[0] and path.parent.name == failing:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, data, *args, **kwargs)
+        h.service.claim_captures()
+        h.clock.advance(31)
+        with unittest.mock.patch.object(store, "write_atomic", disk_full_for_the_first), \
+                self.assertLogs("paperless_intake.service", "ERROR") as logged:
+            for _ in range(3):                                              # poll after poll: logged once
+                h.service.step()
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("No space left on device", logged.output[0])
+        self.assertEqual(len(h.store.all()), 1)                             # the other file went on regardless
+        self.assertTrue((h.settings.items_dir / failing).exists())          # the half-made folder blocks nothing
+        full[0] = False
+        h.settle()
+        self.assertEqual([item.status for item in h.store.all()], [COMMITTED, COMMITTED])
+        self.assertEqual(sorted(kind for kind, _ in h.notifier.sent), ["finished"] * 2 + ["started"] * 2)
+
     def test_records_from_132_are_resumed_as_they_are(self):
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
