@@ -41,20 +41,44 @@ class Harness:
         test.addCleanup(shutil.rmtree, self.root, True)
         values = dict(
             paperless_url="http://paperless.invalid", paperless_token="x", google_service_account=None,
-            processor_version=VERSION, physical_mail_tag="Physical Mail", intake_tag="Mail intake", ha_url="http://ha.invalid",
+            processor_version=VERSION, scanner_tag="Scanner", intake_tag="Mail Intake", ha_url="http://ha.invalid",
             webhook_started="s", webhook_finished="f", webhook_alert="a", daily_page_cap=200, min_free_mib=0,
             keep_local_copies_days=7, watchdog_minutes=45, capture_dir=self.root / "capture",
             intake_dir=self.root / "intake", tested_paperless_version="3.3.4",
             stable_seconds=30, poll_seconds=0,
+            # The Green as the gate sees it, in files a test can change. Plenty of memory, no stalls.
+            meminfo_path=self.root / "meminfo", pressure_dir=self.root / "pressure",
+            pace_seconds=0,                 # the pause between stored documents has tests of its own
         )
         values.update(overrides)
         self.settings = Settings(**values)
         self.settings.capture_dir.mkdir(parents=True)
+        self.green(available_mib=2048)
         self.clock = Clock()
         self.google = FakeGoogle()
         self.paperless = FakePaperless()
         self.notifier = RecordingNotifier()
         self.build()
+
+    def green(self, *, available_mib: int | None = None, io: float = 0.0, memory: float = 0.0,
+              psi: bool = True) -> None:
+        """Set what the gate reads: available memory, and the last minute's I/O and memory stalls in %."""
+        if available_mib is not None:
+            self.settings.meminfo_path.write_text(f"MemTotal:        4014000 kB\nMemFree:          100000 kB\n"
+                                                  f"MemAvailable:    {available_mib * 1024} kB\n")
+        folder = self.settings.pressure_dir
+        if not psi:
+            shutil.rmtree(folder, ignore_errors=True)
+            return
+        folder.mkdir(exist_ok=True)
+        for name, value in (("io", io), ("memory", memory)):
+            (folder / name).write_text(f"some avg10={value:.2f} avg60={value:.2f} avg300={value:.2f} total=1\n"
+                                       f"full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+    def restart(self):
+        """The app was killed and starts again: new objects, a new run of the queue, and its start-up recovery."""
+        self.build()
+        return self.service.start()
 
     def build(self):
         """(Re)create the app objects, as a restart would."""

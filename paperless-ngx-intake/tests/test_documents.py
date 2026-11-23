@@ -1,7 +1,7 @@
 """Every scan in Paperless gets the same question: does it have a searchable version that reads back right?
 
 The scans are the ones the app stored itself and the ones stored before the app.
-The app knows them by the Physical Mail tag, and by nothing else. These tests put
+The app knows them by the Scanner tag, and by nothing else. These tests put
 documents into a stand-in Paperless, with and without the tag, and end at what
 Jane would see on the document.
 """
@@ -15,7 +15,8 @@ import unittest.mock
 from paperless_intake import __version__
 from paperless_intake.docai import glyphless
 from paperless_intake.documents import DONE, GAVE_UP, LATER, LET_GO, NEXT_RELEASE, NOT_NEEDED, WORKING, Record
-from paperless_intake.paperless import PaperlessError
+from paperless_intake.jobs import RESTART_BOUND
+from paperless_intake.paperless import REFUSED, PaperlessError
 from paperless_intake.service import Service
 from paperless_intake.store import COMMITTED, COMMITTED_WARNING, HELD, WAITING
 
@@ -35,6 +36,12 @@ def letter(count: int, tag: str = "") -> list[PageSpec]:
 
 def alert_kinds(h) -> list[str]:
     return [payload["kind"] for kind, payload in h.notifier.sent if kind == "alert"]
+
+
+def lease(h):
+    """What the service does before it hands a job to a worker: the queue chooses one and leases it."""
+    job = h.service.queue.next()
+    return job.record if job is not None else None
 
 
 def look(h, after=301):
@@ -312,7 +319,7 @@ class ScansHandedOverTests(Base):
         doc = h.paperless.docs[doc_id]
         as_stored_before_this_release(h, item)
         h.paperless.crash_after.add("update_version")
-        record = h.documents.step()
+        record = lease(h)
         with self.assertRaises(Crash):                                      # the app dies part way through
             h.documents._work(record)
         self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (WORKING, 3, 1))
@@ -328,7 +335,7 @@ class ScansHandedOverTests(Base):
         doc = h.paperless.docs[doc_id]
         as_stored_before_this_release(h, item)
         h.paperless.crash_after.add("add_note")
-        record = h.documents.step()
+        record = lease(h)
         with self.assertRaises(Crash):
             h.documents._work(record)
         self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (WORKING, 3, 2))
@@ -498,9 +505,9 @@ class ScansHandedOverTests(Base):
 
 
 class OnlyWhatCameFromTheScannerTests(Base):
-    """The Physical Mail tag is the boundary. A document without it is not this app's, whatever is in the file."""
+    """The Scanner tag is the boundary. A document without it is not this app's, whatever is in the file."""
 
-    def test_a_document_without_the_physical_mail_tag_is_never_looked_at(self):
+    def test_a_document_without_the_scanner_tag_is_never_looked_at(self):
         h = Harness(self)
         scan = make_scan(letter(2))                                         # a scan in every way but the tag
         doc_id = h.paperless.add_foreign(scan.pdf, name="from my phone.pdf", tags=[9])
@@ -523,7 +530,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         doc_id = h.paperless.add_foreign(make_scan(letter(2)).pdf, name="20260101_120000_000001.pdf")
         look(h)
         self.assertFalse(h.documents.exists(doc_id))                        # the scanner's file name decides nothing
-        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Scanner"])
         look(h)
         self.assertEqual(self.record(h, doc_id).status, DONE)
         self.assertEqual(len(h.paperless.docs[doc_id]["versions"]), 2)
@@ -531,10 +538,10 @@ class OnlyWhatCameFromTheScannerTests(Base):
     def test_the_tag_itself_missing_from_paperless_is_only_a_wait(self):
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
-        number = h.paperless.tags.pop("Physical Mail")                      # renamed or deleted in Paperless
+        number = h.paperless.tags.pop("Scanner")                      # renamed or deleted in Paperless
         h.settle()
         self.assertEqual((h.documents.all(), h.google.calls, h.notifier.sent), ([], 0, []))
-        h.paperless.tags["Physical Mail"] = number
+        h.paperless.tags["Scanner"] = number
         look(h)
         self.assertEqual(self.record(h, doc_id).status, DONE)
 
@@ -554,7 +561,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         return doc_id
 
     def take_the_tag_off(self, h, doc_id):
-        h.paperless.docs[doc_id]["tags"].remove(h.paperless.tags["Physical Mail"])
+        h.paperless.docs[doc_id]["tags"].remove(h.paperless.tags["Scanner"])
 
     def test_a_scan_whose_tag_is_taken_off_while_it_waits_is_let_go_and_nothing_is_sent(self):
         h = Harness(self)
@@ -575,7 +582,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         self.take_the_tag_off(h, doc_id)
         look(h, HOUR)
         self.assertEqual(self.record(h, doc_id).status, LET_GO)
-        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Scanner"])
         look(h)
         doc = h.paperless.docs[doc_id]
         record = self.record(h, doc_id)
@@ -611,7 +618,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         doc_id = h.paperless.add_old_scan(make_scan(letter(2)).pdf)
         doc = h.paperless.docs[doc_id]
         h.paperless.crash_after.add("update_version")
-        record = h.documents.step()
+        record = lease(h)
         with self.assertRaises(Crash):                                      # the app dies just after Paperless took it
             h.documents._work(record)
         self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (WORKING, 2, 0))
@@ -619,7 +626,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         h.build()                                                           # the next start
         h.settle()
         self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (LET_GO, 2, 0))
-        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Scanner"])
         look(h)
         self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (DONE, 2, 1))
 
@@ -640,12 +647,12 @@ class OnlyWhatCameFromTheScannerTests(Base):
         self.assertEqual((len(doc["versions"]), doc["notes"], h.notifier.sent), (1, [], []))
         self.assertEqual(self.record(h, doc_id).status, LET_GO)
         asked = h.google.calls
-        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Scanner"])
         look(h)
         self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (DONE, 2, 1))
         self.assertEqual(h.google.calls, asked)                             # the copy it built was kept
 
-    def test_the_app_asks_paperless_only_for_documents_with_the_physical_mail_tag(self):
+    def test_the_app_asks_paperless_only_for_documents_with_the_scanner_tag(self):
         h = Harness(self)
         h.paperless.add_old_scan(make_scan(letter(1)).pdf)
         asked_with = []
@@ -654,7 +661,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         h.settle()
         look(h)
         self.assertTrue(asked_with)
-        self.assertEqual(asked_with, [{"with_tag": h.paperless.tags["Physical Mail"]}] * len(asked_with))
+        self.assertEqual(asked_with, [{"with_tag": h.paperless.tags["Scanner"]}] * len(asked_with))
 
     def test_a_document_without_the_tag_is_left_alone_even_if_paperless_ignores_the_filter(self):
         h = Harness(self)
@@ -670,7 +677,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
 
 
 class ScansStoredBeforeTheAppTests(Base):
-    """Stored through Paperless's own folder before the app existed, and tagged Physical Mail by Jane's rule there."""
+    """Stored through Paperless's own folder before the app existed, and tagged Scanner by Jane's rule there."""
 
     def test_a_scan_stored_before_the_app_gets_a_searchable_version(self):
         h = Harness(self)
@@ -739,7 +746,7 @@ class ScansStoredBeforeTheAppTests(Base):
         self.assertEqual((h.google.calls, h.notifier.sent), (1, []))
 
     def test_a_tagged_file_that_isnt_a_pdf_is_set_aside_for_good_with_the_reason(self):
-        # A photo that was given the Physical Mail tag. The tag makes it the app's to look at. The scanner saves
+        # A photo that was given the Scanner tag. The tag makes it the app's to look at. The scanner saves
         # PDFs, so the tag is probably the mistake, and giving a photo the tag must not be a way to get it read.
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(b"\x89PNG\r\n\x1a\n" + b"0" * 64, name="photo.png")
@@ -874,7 +881,7 @@ class WhoOwnsADocumentTests(Base):
             h.pipeline.commit(item)
         self.assertEqual(item.status, "committing")
         h.build()
-        self.assertIsNone(h.documents.step())                               # not the loop's yet
+        self.assertIsNone(h.service.queue._next_document(h.documents.all()))   # not the loop's yet
         h.settle()
         doc = h.paperless.docs[item.state["doc_id"]]
         self.assertEqual((h.only_item().status, len(doc["versions"]), len(doc["notes"])), (COMMITTED, 2, 1))
@@ -1076,10 +1083,10 @@ class HowMuchAtOnceTests(Base):
     def test_a_second_try_also_keeps_to_the_days_share(self):
         h = Harness(self, daily_page_cap=10)                                # their share is 7 pages
         first = h.paperless.add_old_scan(make_scan(letter(3, "a")).pdf)
-        h.google.fail = [503] * 200
+        # A fault about this one document, before Google is asked. (A Google outage would pause the others.)
+        h.paperless.fail_once["download_original"] = PaperlessError("Paperless GET returned HTTP 500", REFUSED)
         h.settle()
         self.assertEqual(self.record(h, first).status, LATER)
-        h.google.fail = []
         others = [h.paperless.add_old_scan(make_scan(letter(3, tag)).pdf) for tag in ("b", "c")]
         for _ in range(3):
             look(h)
@@ -1137,17 +1144,19 @@ class WorkerTests(Base):
         self.assertEqual((record.status, runner.runs), (NEXT_RELEASE, 3))
         self.assertEqual((h.notifier.sent, len(h.paperless.docs[doc_id]["versions"])), ([], 1))
 
-    def test_work_that_keeps_being_cut_short_together_with_the_whole_app_is_set_aside(self):
-        # A power cut is one of these. A document that takes the app down every time must not do it for ever.
+    def test_work_that_keeps_taking_the_whole_app_down_at_the_same_step_is_set_aside(self):
+        # A power cut is one of these, and being in hand then is not a try. But a document that takes the
+        # app down every time, at the same step, must not do it for ever.
         h = Harness(self)
         doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
         handed_out = 0
-        for _ in range(8):                                                  # each time the app dies with it in hand
-            handed_out += h.documents.step() is not None
+        for _ in range(RESTART_BOUND + 3):                                  # each time the app dies with it in hand
+            handed_out += lease(h) is not None
             h.build()
         record = self.record(h, doc_id)
-        self.assertEqual((handed_out, record.status), (4, NEXT_RELEASE))    # once, and three more tries
-        self.assertIn("the app stopped 3 times while working on it", record.state["reason"])
+        self.assertEqual((handed_out, record.status), (RESTART_BOUND, NEXT_RELEASE))
+        self.assertIn(f"the app stopped {RESTART_BOUND} times while working on it", record.state["reason"])
+        self.assertEqual(record.state["tries"], {})                         # none of it was counted as a try
         self.assertEqual((h.google.calls, h.notifier.sent, len(h.paperless.docs[doc_id]["versions"])), (0, [], 1))
         a_newer_release_starts(h)
         h.settle()

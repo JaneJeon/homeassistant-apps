@@ -1,4 +1,4 @@
-"""The Mail intake page, served only through Home Assistant ingress.
+"""The Scans page, served only through Home Assistant ingress.
 
 Requests are accepted only from Supervisor's ingress proxy, which has already
 checked the Home Assistant login. Forms carry a per-process token as well.
@@ -61,15 +61,16 @@ class Page:
         failed = [i for i in items if i.status == FAILED]
         done = [i for i in items if i.status in {COMMITTED, COMMITTED_WARNING}]
         done.sort(key=lambda i: i.state.get("committed_at_unix", 0), reverse=True)
-        parts = [f"<main><h1>Mail intake</h1><p class='muted'>Scans are checked here before they go into Paperless. "
+        parts = [f"<main><h1>Scans</h1><p class='muted'>Scans are checked here before they go into Paperless. "
                  f"A scan is held when a page looks missing or the file can't be read, "
                  f"or after a day of failed tries. "
                  f"Paperless {html.escape(self.settings.tested_paperless_version)} is the tested version. "
-                 f"paperless-intake {__version__}.</p>"]
+                 f"Paperless-ngx Scanner {__version__}.</p>"]
+        parts += self._holding()
         parts.append("<h2>Held: keep these papers out of the shred tray</h2>")
         parts += [self._card(i, "held") for i in held] or ["<p class='muted'>Nothing held.</p>"]
-        parts.append("<h2>Waiting to retry</h2>")
-        parts += [self._card(i, "waiting") for i in waiting] or ["<p class='muted'>Nothing waiting.</p>"]
+        parts.append("<h2>Retrying</h2>")
+        parts += [self._card(i, "waiting") for i in waiting] or ["<p class='muted'>Nothing retrying.</p>"]
         if failed:
             parts.append("<h2>Commit failed: keep the paper</h2>")
             parts += [self._card(i, "held") for i in failed]
@@ -85,8 +86,23 @@ class Page:
         parts += self._other_documents()
         parts.append("</main>")
         return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,"
-                f"initial-scale=1'><title>Mail intake</title><style>{STYLE}</style></head><body>{''.join(parts)}"
+                f"initial-scale=1'><title>Scans</title><style>{STYLE}</style></head><body>{''.join(parts)}"
                 f"</body></html>")
+
+    def _holding(self) -> list[str]:
+        """What the queue's gate is holding back right now, and why, in plain words."""
+        queue = getattr(self.service, "queue", None)
+        if queue is None:
+            return []
+        lines = []
+        for lane, what in (("scan", "Scans"), ("document", "Stored scans")):
+            hold = queue.held.get(lane)
+            if hold is None:
+                continue
+            css = "gap" if hold.outside else "muted"
+            lines.append(f"<div class='card waiting'><span class='{css}'>{what} wait: {html.escape(hold.reason)}."
+                         f"</span> <span class='muted'>The app looks again at {_when(hold.until)}.</span></div>")
+        return lines
 
     def _since(self, item) -> str:
         """What has happened to a scan's document since the scan went in, if anything has."""
@@ -96,8 +112,8 @@ class Page:
             return ""
         record = documents.load(doc_id)
         if record.status == "let_go":
-            return (". <span class='muted'>The Physical Mail tag has since been taken off, so the app has let "
-                    "the document go.</span>")
+            return (f". <span class='muted'>The {html.escape(self.settings.scanner_tag)} tag has since been taken "
+                    f"off, so the app has let the document go.</span>")
         if record.state.get("by") in {None, item.state.get("prepared_by")}:
             return ""
         if record.status == "done":
@@ -171,6 +187,9 @@ class Page:
             else:
                 raise ValueError("unknown action")
             log.info("Jane chose %s for %s", action, sha[:12])
+        told = getattr(self.service, "_told", None)
+        if told is not None:
+            told()
 
 
 def make_handler(page: Page, allowed_clients: tuple[str, ...]):

@@ -11,9 +11,9 @@ configuration:
   processor_version:
     name: Document AI processor version
     description: Full resource name of the pinned OCR processor version.
-  physical_mail_tag:
-    name: Physical Mail tag
-    description: Paperless tag that marks what came out of the scanner. The app adds it to every scan it stores, and looks after a stored document only if it carries this tag.
+  scanner_tag:
+    name: Scanner tag
+    description: Paperless tag that marks what came out of the scanner (called Physical Mail before 1.4.0). The app adds it to every scan it stores, and looks after a stored document only if it carries this tag.
   intake_tag:
     name: Intake tag
     description: Paperless tag marking documents this app uploaded. The Paperless ingest workflow excludes it, so it doesn't also signal Home Assistant.
@@ -22,19 +22,28 @@ configuration:
     description: Where the ingest webhooks are sent.
   webhook_started:
     name: Started webhook ID
-    description: Existing "consume started" webhook; starts the 45-minute watchdog.
+    description: Existing "consume started" webhook; starts the 45-minute watchdog. Empty means don't send.
   webhook_finished:
     name: Finished webhook ID
-    description: Existing "document added" webhook; sent when a scan is committed, held or failed.
+    description: Existing "document added" webhook; sent when a scan is committed, held or failed. Empty means don't send.
   webhook_alert:
     name: Alert webhook ID
-    description: Webhook for holds, commit failures, commit warnings and long waits, plus a "resolved" message once an alerted scan is committed or discarded.
+    description: Webhook for holds, commit failures, commit warnings and long waits, plus a "resolved" message once an alerted scan is committed or discarded. Empty means don't send.
   daily_page_cap:
     name: Daily Google page cap
     description: Scans wait once this many pages have gone to Google today.
   min_free_mib:
     name: Minimum free disk (MiB)
-    description: Scans wait while free space on the Green is below this.
+    description: No new work starts while free space on the Green is below this.
+  min_available_mib:
+    name: Minimum available memory (MiB)
+    description: No new work starts while the Green has less memory available than this (MemAvailable).
+  max_io_pressure:
+    name: Maximum I/O pressure (%)
+    description: No new work starts while work on the Green waited on disk I/O for this share of the last minute or more.
+  max_memory_pressure:
+    name: Maximum memory pressure (%)
+    description: No new work starts while work on the Green waited on memory for this share of the last minute or more.
   keep_local_copies_days:
     name: Days to keep local copies
     description: Local PDF copies are deleted this many days after a verified commit.

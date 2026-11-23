@@ -1,4 +1,4 @@
-"""The added checks, and the Mail intake page."""
+"""The added checks, and the Scans page."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ class WebTests(unittest.TestCase):
         h.clock.advance(301)
         h.settle()
         h.google.fail = []
-        h.paperless.docs[untagged_later]["tags"].remove(h.paperless.tags["Physical Mail"])
+        h.paperless.docs[untagged_later]["tags"].remove(h.paperless.tags["Scanner"])
         h.clock.advance(3600)
         h.settle()
         html = page.render()
@@ -151,7 +151,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("0 left for the next release of the app. 1 can't be done.", html)
         self.assertIn("1 let go, because the tag was taken off.", html)
         self.assertIn("Document 2: it isn&#x27;t a PDF. The scanner saves PDFs", html)
-        self.assertIn(f"Document {untagged_later}: it doesn&#x27;t carry the Physical Mail tag", html)
+        self.assertIn(f"Document {untagged_later}: it doesn&#x27;t carry the Scanner tag", html)
         self.assertNotIn("<b>photo", html)
 
     def test_a_scan_whose_copy_a_later_release_mended_says_so(self):
@@ -176,8 +176,8 @@ class WebTests(unittest.TestCase):
         h.settle()
         self.assertIn("has since given it a searchable version that reads back right", page.render())
         record = h.documents.load(item.state["doc_id"])
-        record.set("let_go", reason="it doesn't carry the Physical Mail tag")
-        self.assertIn("The Physical Mail tag has since been taken off, so the app has let the document go",
+        record.set("let_go", reason="it doesn't carry the Scanner tag")
+        self.assertIn("The Scanner tag has since been taken off, so the app has let the document go",
                       page.render())
 
     def test_only_the_ingress_proxy_may_connect(self):

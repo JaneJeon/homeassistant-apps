@@ -29,7 +29,8 @@ class WorkerProcessTest(unittest.TestCase):
         # No Google key: the child gets as far as "waiting for configuration" without any network.
         options.write_text(json.dumps({"paperless_token": "x", "paperless_url": "http://127.0.0.1:9",
                                        "google_service_account": "-", "ha_url": "http://127.0.0.1:9",
-                                       "webhook_alert": "a"}))
+                                       "webhook_alert": "a", "min_available_mib": 0, "max_io_pressure": 100,
+                                       "max_memory_pressure": 100}))
         self.env = dict(os.environ, INTAKE_OPTIONS=str(options), INTAKE_CAPTURE_DIR=str(self.root / "capture"),
                         INTAKE_DIR=str(self.root / "intake"), INTAKE_STABLE_SECONDS="0",
                         PYTHONPATH=str(APP))

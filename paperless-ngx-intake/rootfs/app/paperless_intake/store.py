@@ -13,8 +13,10 @@ items/<sha256>/
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -45,7 +47,21 @@ def iso(ts: float | None) -> str | None:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def fsync_dir(path: Path) -> None:
+    """Make a rename or a new file in this folder survive a power cut."""
+    dir_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def write_atomic(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Every record is written this way: a temporary file, fsync, rename over the old one, fsync of the folder.
+
+    Killed at any point, the file is either the old one or the new one, never half of each.
+    A temporary file left by a kill is removed when the app next starts (remove_leftovers).
+    """
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
@@ -54,13 +70,35 @@ def write_atomic(path: Path, data: bytes, mode: int = 0o644) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        fsync_dir(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def append_line(path: Path, line: str) -> None:
+    """One line onto a history file. A kill can leave the last line cut off; readers skip it."""
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def read_lines(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            lines.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue                    # the last line of a write a kill cut off
+    return lines
+
+
+def remove_leftovers(folder: Path) -> None:
+    """Temporary files that a kill left behind in one record's folder."""
+    for path in folder.glob(".*.tmp"):
+        path.unlink(missing_ok=True)
 
 
 @dataclass
@@ -97,11 +135,8 @@ class Item:
         write_atomic(self.root / "state.json", (json.dumps(self.state, indent=2, sort_keys=True) + "\n").encode())
 
     def event(self, kind: str, **details) -> None:
-        record = {"at": iso(now()), "event": kind, **details}
-        with (self.root / "events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, sort_keys=True) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        append_line(self.root / "events.jsonl", json.dumps({"at": iso(now()), "event": kind, **details},
+                                                           sort_keys=True))
 
     def set(self, status: str, *, reason: str | None = None, reason_kind: str | None = None, **fields) -> None:
         """Record a state change: the event first, then the state file."""
@@ -113,10 +148,7 @@ class Item:
         self.save()
 
     def events(self) -> list[dict]:
-        path = self.root / "events.jsonl"
-        if not path.exists():
-            return []
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return read_lines(self.root / "events.jsonl")
 
 
 class Store:
@@ -132,25 +164,73 @@ class Store:
 
     def create(self, sha: str, captured_file: Path, *, original_name: str, page_count: int | None,
                byte_count: int, at: float | None = None) -> Item:
-        """Move the captured file into a new item. The move is a rename on one filesystem."""
+        """Move the captured file into a new item. The move is a rename on one filesystem.
+
+        Three durable steps, each safe to be killed after: claim.json says what is being claimed,
+        the rename moves the file, state.json makes it an item. recover() finishes or undoes a claim
+        a kill cut short, so a scan is never lost between the capture folder and its record.
+        """
         root = self.path_for(sha)
-        (root / "source").mkdir(parents=True, exist_ok=False)
+        root.mkdir(parents=True, exist_ok=False)
+        at = at if at is not None else now()
+        claim = {"sha256": sha, "original_name": original_name, "page_count": page_count, "byte_count": byte_count,
+                 "captured_at_unix": at}
+        write_atomic(root / "claim.json", json.dumps(claim).encode())
+        (root / "source").mkdir()
         os.rename(captured_file, root / "source" / "original.pdf")
+        fsync_dir(root / "source")
+        fsync_dir(captured_file.parent)
+        return self._item_from_claim(root, claim)
+
+    @staticmethod
+    def _item_from_claim(root: Path, claim: dict) -> Item:
         item = Item(root, {
-            "sha256": sha,
-            "original_name": original_name,
-            "page_count": page_count,
-            "byte_count": byte_count,
-            "captured_at": iso(at if at is not None else now()),
-            "captured_at_unix": at if at is not None else now(),
+            "sha256": claim["sha256"],
+            "original_name": claim["original_name"],
+            "page_count": claim.get("page_count"),
+            "byte_count": claim.get("byte_count"),
+            "captured_at": iso(claim["captured_at_unix"]),
+            "captured_at_unix": claim["captured_at_unix"],
             "google_run": 1,
             "status": CAPTURED,
             "reason": None,
             "reason_kind": None,
         })
         item.save()
-        item.event("captured", original_name=original_name, page_count=page_count, byte_count=byte_count)
+        item.event("captured", original_name=claim["original_name"], page_count=claim.get("page_count"),
+                   byte_count=claim.get("byte_count"))
         return item
+
+    def recover(self) -> list[str]:
+        """At start: finish claims a kill cut short, and remove temporary files kills left. Returns what it did."""
+        done = []
+        for child in sorted(self.items_dir.iterdir()) if self.items_dir.is_dir() else []:
+            if not child.is_dir():
+                continue
+            remove_leftovers(child)
+            if (child / "state.json").exists():
+                continue
+            source = child / "source" / "original.pdf"
+            try:
+                claim = json.loads((child / "claim.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                claim = None
+            if not source.exists():
+                # The file was never moved, so it is still in the capture folder and is claimed again.
+                shutil.rmtree(child, ignore_errors=True)
+                done.append(f"undid an unfinished claim of {child.name[:12]}")
+                continue
+            if claim is None:
+                # Claimed by a release before 1.4.0, which wrote no claim.json. The file's name is lost.
+                with source.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != child.name:
+                        continue
+                claim = {"sha256": child.name, "original_name": f"recovered-{child.name[:12]}.pdf",
+                         "page_count": None, "byte_count": source.stat().st_size,
+                         "captured_at_unix": source.stat().st_mtime}
+            self._item_from_claim(child, claim)
+            done.append(f"finished the claim of {child.name[:12]}")
+        return done
 
     def load(self, sha: str) -> Item:
         root = self.path_for(sha)

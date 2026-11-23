@@ -38,7 +38,7 @@ class Settings:
     paperless_token: str
     google_service_account: dict | None
     processor_version: str
-    physical_mail_tag: str
+    scanner_tag: str
     intake_tag: str
     ha_url: str
     webhook_started: str
@@ -58,6 +58,14 @@ class Settings:
     poll_seconds: float = 5.0
     retry_minutes: int = 30
     retry_hours: int = 24
+    # The queue's gate (jobs.py, gate.py): no job starts below this much available memory, or at or
+    # above these shares of the last minute stalled on disk I/O or on memory.
+    min_available_mib: int = 500
+    max_io_pressure: float = 30.0
+    max_memory_pressure: float = 20.0
+    pace_seconds: float = 120.0     # between stored documents: Paperless goes on working on a version after taking it
+    meminfo_path: Path = Path("/proc/meminfo")
+    pressure_dir: Path = Path("/proc/pressure")
     extra: dict = field(default_factory=dict)
 
     @property
@@ -103,8 +111,10 @@ def load(options_path: Path | None = None) -> Settings:
         paperless_token=token,
         google_service_account=_service_account(options.get("google_service_account")),
         processor_version=options.get("processor_version") or DEFAULT_PROCESSOR_VERSION,
-        physical_mail_tag=options.get("physical_mail_tag", "Physical Mail"),
-        intake_tag=options.get("intake_tag", "Mail intake"),
+        # physical_mail_tag (before 1.4.0) left the schema. The Supervisor drops a stored option that
+        # isn't in the schema, with a warning in its log, so it doesn't reach this file.
+        scanner_tag=options.get("scanner_tag") or "Scanner",
+        intake_tag=options.get("intake_tag") or "Mail Intake",
         ha_url=options.get("ha_url", "http://homeassistant:8123").rstrip("/"),
         webhook_started=options.get("webhook_started", ""),
         webhook_finished=options.get("webhook_finished", ""),
@@ -112,6 +122,11 @@ def load(options_path: Path | None = None) -> Settings:
         daily_page_cap=int(options.get("daily_page_cap", 200)),
         min_free_mib=int(options.get("min_free_mib", 1024)),
         keep_local_copies_days=int(options.get("keep_local_copies_days", 7)),
+        min_available_mib=int(options.get("min_available_mib", 500)),
+        max_io_pressure=float(options.get("max_io_pressure", 30)),
+        max_memory_pressure=float(options.get("max_memory_pressure", 20)),
+        meminfo_path=Path(os.environ.get("INTAKE_MEMINFO", "/proc/meminfo")),
+        pressure_dir=Path(os.environ.get("INTAKE_PRESSURE_DIR", "/proc/pressure")),
         watchdog_minutes=int(options.get("watchdog_minutes", 45)),
         capture_dir=Path(os.environ.get("INTAKE_CAPTURE_DIR", "/share/paperless/capture")),
         intake_dir=Path(os.environ.get("INTAKE_DIR", "/share/paperless/intake")),

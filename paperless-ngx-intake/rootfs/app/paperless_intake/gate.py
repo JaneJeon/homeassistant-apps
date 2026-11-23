@@ -1,0 +1,177 @@
+"""What the queue looks at before it starts a job: memory, disk, and an upload whose outcome isn't known.
+
+Memory. The app's container sees the Green's own /proc/meminfo: the Supervisor sets no
+memory limit on app containers, so the figure is the host's. MemAvailable is what the
+kernel could hand out without swapping. A worker peaks at about 350 MiB on a big scan,
+and Paperless grows while it takes in a new file version.
+
+An upload whose outcome isn't known. Before the app sends Paperless a file it writes an
+intent mark, and it removes the mark once it knows how the upload ended. A mark that is
+still there means the app timed out, or was killed, with the upload in flight. Paperless
+may still be taking that file in, minutes later. While the mark is there no job starts,
+because a job that uploads could send the same file again, or pile more work onto a
+Paperless that is already struggling. The mark is settled by looking at Paperless.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+from typing import Callable
+
+from .paperless import COMPLETE, NOT_FOUND, Paperless, PaperlessError
+from .store import write_atomic
+
+MEMINFO = Path("/proc/meminfo")
+CGROUP_LIMITS = (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+NO_LIMIT_V1 = 1 << 62               # cgroup v1 writes "no limit" as a number this big
+HOST_AT_LEAST_MIB = 3.5 * 1024      # the Green has 4 GB. Less than this means the container isn't seeing the host
+SETTLE_AFTER_SECONDS = 300          # an upload with no task id is taken not to have landed only after this long
+
+
+def meminfo(path: Path = MEMINFO) -> dict[str, int]:
+    """The fields of /proc/meminfo, in kB."""
+    fields = {}
+    try:
+        for line in path.read_text().splitlines():
+            name, _, rest = line.partition(":")
+            value = rest.split()
+            if value and value[0].isdigit():
+                fields[name.strip()] = int(value[0])
+    except OSError:
+        pass
+    return fields
+
+
+def available_mib(path: Path = MEMINFO) -> int | None:
+    kb = meminfo(path).get("MemAvailable")
+    return None if kb is None else kb // 1024
+
+
+def free_disk_mib(path: Path) -> int:
+    return shutil.disk_usage(path).free // (1024 * 1024)
+
+
+# Pressure stall information. /proc/pressure/io and /proc/pressure/memory are the kernel's
+# system-wide figures; each cgroup has io.pressure and memory.pressure files of its own
+# (Documentation/accounting/psi.rst). The "some" line's avg60 is the share of the last minute,
+# in %, in which at least one task waited on that resource. With swap full, memory pressure is
+# paid as disk I/O, which MemAvailable doesn't show. Since Linux 5.6 the files exist only when
+# PSI is on, so a missing file means: no figure, and the gate goes by MemAvailable alone.
+PRESSURE = Path("/proc/pressure")
+
+
+def pressure(resource: str, root: Path = PRESSURE) -> float | None:
+    """avg60 of the "some" line for "io" or "memory", or None without PSI."""
+    try:
+        text = (root / resource).read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("some "):
+            for field in line.split()[1:]:
+                name, _, value = field.partition("=")
+                if name == "avg60":
+                    try:
+                        return float(value)
+                    except ValueError:
+                        return None
+    return None
+
+
+def describe_memory(path: Path = MEMINFO, limits: tuple[Path, ...] = CGROUP_LIMITS,
+                    pressure_root: Path = PRESSURE) -> tuple[str, list[str]]:
+    """One line for the start-up log, and warnings if the figures can't be the Green's or PSI is missing."""
+    fields = meminfo(path)
+    total = fields.get("MemTotal", 0) // 1024
+    limit = None
+    for candidate in limits:
+        try:
+            limit = candidate.read_text().strip()
+            break
+        except OSError:
+            continue
+    present = [name for name in ("io", "memory") if (pressure_root / name).exists()]
+    line = (f"memory: MemTotal {total} MiB, MemAvailable {fields.get('MemAvailable', 0) // 1024} MiB, "
+            f"cgroup memory limit {limit or 'not found'}; pressure files: {', '.join(present) or 'none'}")
+    warnings = []
+    if len(present) < 2:
+        warnings.append(f"{pressure_root} has no io or memory file (a kernel without PSI): the gate goes by "
+                        f"MemAvailable alone")
+    if total < HOST_AT_LEAST_MIB:
+        warnings.append(f"MemTotal is {total} MiB. The Green has 4 GB, so this container may not be seeing "
+                        f"the host's memory, and the memory check may be wrong")
+    if limit and limit != "max" and limit.isdigit() and int(limit) < NO_LIMIT_V1:
+        warnings.append(f"the container has a memory limit of {int(limit) // (1024 * 1024)} MiB, so MemAvailable "
+                        f"is the host's, not the container's")
+    return line, warnings
+
+
+class Intent:
+    """The mark for an upload whose outcome isn't known yet. At most one: the app runs one job at a time."""
+
+    def __init__(self, path: Path, clock: Callable[[], float]):
+        self.path = path
+        self.clock = clock
+
+    def read(self) -> dict | None:
+        try:
+            return json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def open(self, *, what: str, sha256: str, name: str, doc_id: int | None = None) -> None:
+        """Written before the upload goes out. what: "original" (a scan's new document) or "version"."""
+        write_atomic(self.path, json.dumps({"what": what, "sha256": sha256, "name": name, "doc_id": doc_id,
+                                            "task": None, "at": self.clock()}).encode())
+
+    def task(self, task_id: str) -> None:
+        """Paperless answered the upload with its task. Kept, so the mark can be settled by asking about the task."""
+        intent = self.read()
+        if intent is not None:
+            intent["task"] = task_id
+            write_atomic(self.path, json.dumps(intent).encode())
+
+    def close(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+    def settle(self, paperless: Paperless, intake_tag: str) -> str | None:
+        """Look at Paperless. How the upload ended, in words, once that is known (and the mark is removed); else None.
+
+        Raises PaperlessError when Paperless doesn't answer: that is an outside wait, and the
+        caller backs off. It never settles a mark by guessing.
+        """
+        intent = self.read()
+        if intent is None:
+            return "no upload was in doubt"
+        paperless.server_version()                  # the cheap question: is Paperless there at all
+        sha = intent["sha256"]
+        if intent.get("doc_id"):
+            try:
+                landed = any(version.checksum == sha for version in paperless.versions(int(intent["doc_id"])))
+            except PaperlessError as error:
+                if error.kind != NOT_FOUND:
+                    raise
+                self.close()
+                return "it did not land: the document is no longer in Paperless"
+        else:
+            landed = paperless.find_by_checksum(sha, with_tag=paperless.tag_id(intake_tag)) is not None
+        if landed:
+            self.close()
+            return "it landed"
+        task = intent.get("task")
+        if task:
+            status = paperless.task_status(task)
+            if status in COMPLETE:
+                # The job has the same task in its own record, and deals with a failed one by its own rules.
+                self.close()
+                return f"Paperless's task for it ended ({status}); the job looks for the file itself"
+            if status is not None:
+                return None                         # Paperless is still working on it
+        if self.clock() - float(intent.get("at") or 0) < SETTLE_AFTER_SECONDS:
+            return None
+        if paperless.unfinished_uploads() == 0:
+            self.close()
+            return "it did not land: Paperless has nothing left to take in"
+        return None

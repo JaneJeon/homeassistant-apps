@@ -46,7 +46,7 @@ jobs:
         working-directory: paperless-ngx-intake/tests
         env:
           PYTHONPATH: ../rootfs/app:.
-        run: python -m unittest -v test_google_backend test_page_order test_stack test_checks_and_web test_pipeline test_worker test_documents
+        run: python -m unittest -v test_google_backend test_page_order test_stack test_checks_and_web test_pipeline test_worker test_documents test_queue test_publisher test_kills
 
       - name: End-to-end tests against stock Paperless at the tested version
         working-directory: paperless-ngx-intake/tests

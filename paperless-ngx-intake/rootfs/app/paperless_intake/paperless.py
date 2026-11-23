@@ -12,10 +12,37 @@ from dataclasses import dataclass
 import requests
 
 API_VERSION = "10"
+# An upload can take Paperless minutes to answer when the Green is short of memory. A short wait
+# here only means the app stops listening while Paperless goes on taking the file in.
+UPLOAD_TIMEOUT = (10.0, 600.0)          # seconds to connect, seconds to wait for the answer
+
+# What kind of failure it was. Some say something about Paperless itself, not about one document:
+UNREACHABLE = "unreachable"     # the connection failed or was refused
+TIMEOUT = "timeout"             # Paperless didn't answer in time
+BUSY = "busy"                   # HTTP 502, 503 or 504
+LOGIN = "login"                 # HTTP 401: Paperless refused the app's token, so every request fails
+NO_TAG = "no_tag"               # a tag the app needs isn't in Paperless (renamed, say), so every scan fails
+# ...and some are about one request or one document:
+NOT_FOUND = "not_found"         # HTTP 404
+REFUSED = "refused"             # any other HTTP error
+OUTSIDE = frozenset({UNREACHABLE, TIMEOUT, BUSY, LOGIN, NO_TAG})
+COMPLETE = frozenset({"success", "failure", "revoked"})
 
 
 class PaperlessError(RuntimeError):
-    """Paperless was unreachable or refused a request. The scan waits and retries."""
+    """Paperless was unreachable or refused a request.
+
+    kind says which. outside: the failure is about Paperless, not about the document the app was
+    working on, so the next document would meet it too.
+    """
+
+    def __init__(self, message: str, kind: str = REFUSED):
+        super().__init__(message)
+        self.kind = kind
+
+    @property
+    def outside(self) -> bool:
+        return self.kind in OUTSIDE
 
 
 class PaperlessTaskFailed(RuntimeError):
@@ -47,13 +74,18 @@ class Paperless:
         self._sleep = sleep
         self._monotonic = monotonic
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, path: str, *, timeout=None, **kwargs) -> requests.Response:
         try:
-            response = self.session.request(method, self.base_url + path, timeout=self.timeout, **kwargs)
+            response = self.session.request(method, self.base_url + path, timeout=timeout or self.timeout, **kwargs)
+        except requests.Timeout as error:
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", TIMEOUT) from None
         except requests.RequestException as error:
-            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}") from None
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", UNREACHABLE) from None
         if response.status_code >= 400:
-            raise PaperlessError(f"Paperless {method} {path} returned HTTP {response.status_code}")
+            status = response.status_code
+            kind = (LOGIN if status == 401 else NOT_FOUND if status == 404
+                    else BUSY if status in {502, 503, 504} else REFUSED)
+            raise PaperlessError(f"Paperless {method} {path} returned HTTP {status}", kind)
         return response
 
     # Version pin ---------------------------------------------------------------
@@ -72,7 +104,7 @@ class Paperless:
         response = self._request("GET", "/api/tags/", params={"name__iexact": name})
         results = response.json().get("results", [])
         if len(results) != 1:
-            raise PaperlessError(f"Expected exactly one tag named {name!r}, found {len(results)}")
+            raise PaperlessError(f"Expected exactly one tag named {name!r}, found {len(results)}", NO_TAG)
         return int(results[0]["id"])
 
     def find_by_checksum(self, sha256: str, *, with_tag: int | None = None) -> int | None:
@@ -129,13 +161,14 @@ class Paperless:
         if created:
             # Given a date, Paperless uses it and doesn't guess one from its own reading of the pages.
             form.append(("created", created))
-        response = self._request("POST", "/api/documents/post_document/", files=files, data=form)
+        response = self._request("POST", "/api/documents/post_document/", files=files, data=form,
+                                 timeout=UPLOAD_TIMEOUT)
         return str(response.json())
 
     def update_version(self, doc_id: int, filename: str, data: bytes, *, label: str) -> str:
         files = {"document": (filename, data, "application/pdf")}
         response = self._request("POST", f"/api/documents/{doc_id}/update_version/", files=files,
-                                 data={"version_label": label[:64]})
+                                 data={"version_label": label[:64]}, timeout=UPLOAD_TIMEOUT)
         return str(response.json())
 
     def set_owner(self, doc_id: int, owner: int | None) -> None:
@@ -164,8 +197,28 @@ class Paperless:
                 if status in {"failure", "revoked"}:
                     raise PaperlessTaskFailed(f"Paperless task {task_id} {status}", str(task.get("result")))
             if self._monotonic() >= deadline:
-                raise PaperlessError(f"Paperless task {task_id} did not finish in time")
+                raise PaperlessError(f"Paperless task {task_id} did not finish in time", TIMEOUT)
             self._sleep(poll)
+
+    def task_status(self, task_id: str) -> str | None:
+        """pending, started, success, failure or revoked. None when Paperless has no such task."""
+        body = self._request("GET", "/api/tasks/", params={"task_id": task_id}).json()
+        results = body.get("results", body) if isinstance(body, dict) else body
+        return str(results[0].get("status", "")).lower() if results else None
+
+    def unfinished_uploads(self) -> int:
+        """How many files Paperless has been given and hasn't finished taking in: its consume tasks that haven't ended.
+
+        Paperless shows this user its own tasks and those with no owner (the consume folder's).
+        The status is checked here as well, so a Paperless that ignored the filter can't make
+        the answer zero by mistake.
+        """
+        body = self._request("GET", "/api/tasks/", params={"task_type": "consume_file", "is_complete": "false",
+                                                           "page_size": 100}).json()
+        results = body.get("results", []) if isinstance(body, dict) else body
+        unfinished = [task for task in results if str(task.get("status", "")).lower() not in COMPLETE]
+        more = isinstance(body, dict) and bool(body.get("next"))
+        return len(unfinished) + (1 if more else 0)
 
     @staticmethod
     def task_document_id(task: dict) -> int | None:

@@ -24,6 +24,10 @@ class Notifier:
         self.timeout = timeout
         self.session = session or requests.Session()
 
+    def has(self, which: str) -> bool:
+        """Whether this webhook is set. An empty one means: don't send."""
+        return bool(self.ids.get(which))
+
     def _post(self, which: str, payload: dict) -> bool:
         webhook_id = self.ids.get(which)
         if not webhook_id:
