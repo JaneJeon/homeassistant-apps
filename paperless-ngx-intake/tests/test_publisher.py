@@ -190,7 +190,7 @@ class PublisherTests(unittest.TestCase):
             lambda b: json.loads(b.retained[entities.STATE_TOPIC])["scans_held"] == 1))
         publisher.stop(2)
         self.assertTrue(self.broker.wait_for(lambda b: b.retained[entities.AVAILABILITY_TOPIC] == b"offline"))
-        self.assertEqual(self.broker.clean_disconnects, 1)
+        self.assertTrue(self.broker.wait_for(lambda b: b.clean_disconnects == 1))
 
     def test_no_broker_is_only_a_wait_and_the_app_connects_once_there_is_one(self):
         configs = [None, self.config]
