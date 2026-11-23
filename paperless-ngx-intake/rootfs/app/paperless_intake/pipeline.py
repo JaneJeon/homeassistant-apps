@@ -30,7 +30,6 @@ document once it is stored.
 from __future__ import annotations
 
 import gzip
-import hashlib
 import json
 import re
 import logging
@@ -52,7 +51,7 @@ from .docai.validation import assert_unchanged, document_for_renderer, inspect_s
 from .notify import Notifier
 from . import searchable
 from .paperless import Paperless, PaperlessError, PaperlessTaskFailed
-from .searchable import COPY_RESAVED, sha256  # noqa: F401  (used here and by callers of this module)
+from .searchable import sha256
 from .store import (COMMITTED, COMMITTED_WARNING, COMMITTING, CAPTURED, DISCARDED, FAILED, HELD, READY, WAITING,
                     Item, Store,
                     iso, now, write_atomic)
@@ -143,6 +142,12 @@ class Wait(Exception):
     kind: str
     stage: str
     alert: bool = False
+
+
+def _refused_as_duplicate(error: PaperlessTaskFailed) -> bool:
+    """Paperless refused an upload because it already holds the file. Only when it is set to refuse duplicates."""
+    result = str(error.result or "").lower()
+    return "duplicate" in result or "already exists" in result
 
 
 @dataclass
@@ -257,7 +262,8 @@ class Pipeline:
         item.set(READY, **fields)
 
     def make_copy(self, source_path: Path, backend_for: Callable[[], object], work_dir_for: Callable[[], Path],
-                  label: str, on_pages: Callable[[int], None] | None = None) -> "Made":
+                  label: str, on_pages: Callable[[int], None] | None = None,
+                  page_allowance: int | None = None) -> "Made":
         """One try at the searchable copy of one file. It writes nothing about any document.
 
         Used for a scan on its way in (prepare) and for a document that is already in
@@ -277,7 +283,10 @@ class Pipeline:
             on_pages(source.page_count)
         if self.token_provider is None and self.backend_factory == self._google_backend:
             raise Wait("the Google key isn't set in the app options", "config", "ocr", alert=True)
-        if self._pages_today() + source.page_count > self.settings.daily_page_cap:
+        # The one place the day's Google pages are rationed. A scan may use all of them. A caller
+        # working on stored documents passes its smaller share.
+        allowance = self.settings.daily_page_cap if page_allowance is None else page_allowance
+        if self._pages_today() + source.page_count > allowance:
             raise Wait(f"today's Google page cap ({self.settings.daily_page_cap}) is reached", "page_cap", "ocr")
 
         work_dir = work_dir_for()
@@ -544,11 +553,14 @@ class Pipeline:
                 task = self.paperless.wait_for_task(task_id)
                 doc_id = self.paperless.task_document_id(task)
             except PaperlessTaskFailed as error:
-                if "duplicate" not in error.result.lower():
+                if not _refused_as_duplicate(error):
                     item.state["upload_task"] = None
                     item.save()
                     raise
-        doc_id = doc_id or self.paperless.find_by_checksum(item.sha)
+        # Only a document the app stored itself is taken to be this scan's: it carries the intake tag.
+        # The same file stored some other way is someone else's document, and the loop's to look after.
+        mine = tag_ids[-1]
+        doc_id = doc_id or self.paperless.find_by_checksum(item.sha, with_tag=mine)
         if not doc_id:
             created = scan_date(item.state["original_name"], float(item.state.get("captured_at_unix") or self.clock()))
             task_id = self.paperless.post_document(item.state["original_name"], original, tag_ids=tag_ids,
@@ -560,11 +572,13 @@ class Pipeline:
                 task = self.paperless.wait_for_task(task_id)
                 doc_id = self.paperless.task_document_id(task)
             except PaperlessTaskFailed as error:
-                if "duplicate" not in error.result.lower():
+                if not _refused_as_duplicate(error):
                     raise
-            doc_id = doc_id or self.paperless.find_by_checksum(item.sha)
+            doc_id = doc_id or self.paperless.find_by_checksum(item.sha, with_tag=mine)
             if not doc_id:
-                raise PaperlessError("Paperless finished the upload but the document can't be found by checksum")
+                raise PaperlessError("Paperless finished the upload but the app can't find its document by checksum "
+                                     "(if Paperless is set to refuse duplicates, the same file is already stored "
+                                     "as a document the app didn't upload)")
         item.state["doc_id"] = int(doc_id)
         item.save()
         item.event("original_in_paperless", doc_id=int(doc_id))
@@ -634,7 +648,11 @@ class Pipeline:
     def _ensure_note(self, item: Item, doc_id: int, mode: str, warnings: list[str]) -> None:
         if item.state.get("note_added"):
             return
-        self.paperless.add_note(doc_id, self.note_text(item, mode, warnings))
+        text = self.note_text(item, mode, warnings)
+        # Looked for before it is written: the app may have been cut short just after writing it.
+        opening = text.split(". ", 1)[0]
+        if not any(str(note.get("note") or "").startswith(opening) for note in self.paperless.notes(doc_id)):
+            self.paperless.add_note(doc_id, text)
         item.state["note_added"] = True
         item.save()
 
@@ -722,6 +740,10 @@ class Pipeline:
                             pages=item.state.get("page_count"), gap=gap)
         item.state["alert_open"] = True
         item.save()
+
+    def close_alert(self, item: Item) -> None:
+        """For documents.py: the cause of an earlier alert about this scan's document is gone."""
+        self._resolve(item)
 
     def _resolve(self, item: Item) -> None:
         """Close an earlier alert about this scan, so Home Assistant can clear its notification."""
@@ -818,13 +840,13 @@ class Pipeline:
         again = []
         for item in self.store.all():
             state = item.state
-            if state.get("prepared_by") in {None, __version__}:
+            if state.get("prepared_by") == __version__:      # none recorded: a release too old to say, so not this one
                 continue
             in_flight = item.status in {READY, COMMITTING} or (item.status == WAITING
                                                                 and state.get("retry_stage") == "commit")
             if not in_flight or state.get("doc_id") or state.get("upload_task"):
                 continue
-            earlier = str(state.get("prepared_by"))
+            earlier = str(state.get("prepared_by") or "earlier-release")
             for name in ("checks.json", "google-summary.json.gz"):      # keep what the earlier try recorded
                 path = item.root / name
                 kept = item.root / f"{name.split('.')[0]}.by-{earlier}.{name.split('.', 1)[1]}"

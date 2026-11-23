@@ -68,7 +68,7 @@ class Harness:
 
         self.pipeline = Pipeline(self.settings, self.store, self.paperless, self.notifier,
                                  token_provider=token_provider, backend_factory=backend, clock=self.clock)
-        self.documents = Documents(self.settings, self.store, self.paperless, self.pipeline, self.notifier,
+        self.documents = Documents(self.settings, self.store, self.paperless, self.pipeline,
                                    clock=self.clock, limit=self.document_limit)
         self.pipeline.documents = self.documents
         self.service = Service(self.settings, self.store, self.pipeline, self.notifier, clock=self.clock,

@@ -25,7 +25,7 @@ import requests
 from paperless_intake.config import Settings, tested_paperless_version
 from paperless_intake.docai.google_backend import GoogleBackendConfig, GoogleDocumentAIBackend
 from paperless_intake.documents import DONE, NOT_NEEDED, Documents
-from paperless_intake.paperless import Paperless
+from paperless_intake.paperless import Paperless, PaperlessError
 from paperless_intake.pipeline import Pipeline
 from paperless_intake.service import Service
 from paperless_intake.store import COMMITTED, COMMITTED_WARNING, WAITING, Store
@@ -227,7 +227,7 @@ class PaperlessE2E(unittest.TestCase):
                                            token_provider=token_provider, transport=google)
 
         pipeline = Pipeline(settings, store, client, notifier, token_provider=token_provider, backend_factory=backend)
-        self.documents = Documents(settings, store, client, pipeline, notifier, limit=None)
+        self.documents = Documents(settings, store, client, pipeline, limit=None)
         pipeline.documents = self.documents
         self.google = google
         self.backend = backend
@@ -480,7 +480,6 @@ class PaperlessE2E(unittest.TestCase):
         made = service.pipeline.make_copy(source, lambda: self.backend(answers), lambda: scratch / "work",
                                           "a PDF with text")
         self.assertIsNotNone(made.searchable, made.why_not)
-        asked = self.google.calls
         doc_id = self.stored_by_other_means(made.searchable, f"statement-{marker}.pdf")
         before = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
         record = self.loop_until(service, doc_id)
@@ -532,6 +531,68 @@ class PaperlessE2E(unittest.TestCase):
         self.assertEqual((record.status, record.state["source"]), (DONE, "paperless"))
         self.assertEqual(len(client.versions(doc_id)), 2)                        # nothing was added
         self.assertEqual(len(self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json()), 1)
+
+    def test_a_scan_that_is_half_way_in_is_left_to_the_scan(self):
+        """One owner at a time, against real Paperless. The original is stored and the searchable version
+        is not yet: the loop must recognise that document as the scan's and keep its hands off it."""
+        settings, store, service, client, notifier = self.harness(loop=True)
+        scan = numbered_letter(2, tag=uuid.uuid4().hex[:8])
+        (settings.capture_dir / "20261101_120000_000800.pdf").write_bytes(scan.pdf)
+        add_version = client.update_version
+
+        def paperless_stops_answering(*args, **kwargs):
+            raise PaperlessError("Paperless POST update_version returned HTTP 502")
+
+        client.update_version = paperless_stops_answering
+        service.claim_captures()
+        self.assertTrue(service.step())
+        item = store.all()[0]
+        doc_id = item.state["doc_id"]
+        self.assertEqual((item.status, item.state["retry_stage"]), (WAITING, "commit"))
+        # How the loop tells: Paperless's list names the file each document holds.
+        row = next(row for row in client.documents() if row["id"] == doc_id)
+        root = next(version for version in row["versions"] if version["is_root"])
+        self.assertEqual(root["checksum"], scan.sha256)
+        for _ in range(40):                                                      # the loop gets its turns
+            self.documents._look_again_at = 0.0
+            if not service.step():
+                break
+        self.assertFalse(self.documents.exists(doc_id))
+        self.assertEqual(len(client.versions(doc_id)), 1)
+        client.update_version = add_version                                      # Paperless answers again
+        service.pipeline.run(store.load(item.sha))
+        self.assertEqual(store.load(item.sha).status, COMMITTED, store.load(item.sha).state.get("reason"))
+        self.assertEqual(len(client.versions(doc_id)), 2)
+        self.assertEqual(len(self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json()), 1)
+        self.assertEqual(self.documents.load(doc_id).status, DONE)               # handed over, with nothing left to do
+        self.documents._look_again_at = 0.0
+        service.step()
+        self.assertEqual(len(client.versions(doc_id)), 2)
+
+    def test_the_same_file_by_another_route_and_then_by_the_scanner_is_two_documents(self):
+        """A scan takes for its own only a document the app stored. The same file stored some other way stays
+        someone else's document: its owner, tags and versions are not the scan's to change."""
+        if any(pair.startswith("PAPERLESS_CONSUMER_DELETE_DUPLICATES") for pair in PAPERLESS_ENV):
+            self.skipTest("this Paperless refuses a file it already holds")
+        settings, store, service, client, notifier = self.harness(loop=True)
+        scan = numbered_letter(2, tag=uuid.uuid4().hex[:8])
+        theirs = self.stored_by_other_means(scan.pdf, "uploaded-by-hand.pdf", owner_cleared=False)
+        shared = {"view": {"users": [self.intake_id], "groups": []}, "change": {"users": [self.intake_id], "groups": []}}
+        self.api.patch(f"{self.base}/api/documents/{theirs}/", json={"set_permissions": shared}).raise_for_status()
+        self.assertEqual(self.loop_until(service, theirs).status, DONE)
+        before = self.api.get(f"{self.base}/api/documents/{theirs}/").json()
+        self.assertEqual(len(before["versions"]), 2)
+        (settings.capture_dir / "20261101_130000_000900.pdf").write_bytes(scan.pdf)   # the same bytes, scanned in
+        self.run_until_quiet(service, rounds=40)
+        item = store.all()[0]
+        self.assertEqual(item.status, COMMITTED, item.state.get("reason"))
+        self.assertNotEqual(item.state["doc_id"], theirs)                        # a document of its own
+        after = self.api.get(f"{self.base}/api/documents/{theirs}/").json()
+        for name in (*self.FIELDS_THAT_ARE_JANES, "versions"):
+            self.assertEqual(after.get(name), before.get(name), name)            # theirs is untouched
+        self.assertEqual(len(self.api.get(f"{self.base}/api/documents/{theirs}/notes/").json()), 1)
+        self.assertEqual(self.documents.load(theirs).state["source"], "paperless")
+        self.assertEqual(len(client.versions(item.state["doc_id"])), 2)
 
     def test_api_upload_without_the_intake_tag_signals_document_added(self):
         """Why the intake tag exists. If this starts failing, Paperless now honours sources on

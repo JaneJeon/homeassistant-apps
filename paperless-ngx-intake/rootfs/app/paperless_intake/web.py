@@ -100,7 +100,7 @@ class Page:
         if record.status == "done":
             return (f". <span class='ok'>Release {html.escape(str(record.state['by']))} has since given it "
                     f"a searchable version that reads back right.</span>")
-        if record.status in {"redo", "gave_up"}:
+        if record.status in {"next_release", "gave_up"}:
             return (f". <span class='muted'>Release {html.escape(str(record.state['by']))} tried to improve its "
                     f"searchable version: {html.escape(record.state.get('reason') or 'no reason recorded')}.</span>")
         return ""
@@ -121,10 +121,10 @@ class Page:
         parts.append(f"<div class='card'>{len(records)} looked at. "
                      f"{count('done')} given a searchable version. "
                      f"{count('not_needed')} left as they are, with nothing for Google to read. "
-                     f"{count('not_yet')} of a kind this release can't read. "
-                     f"{count('redo', 'gave_up')} couldn't be done. "
+                     f"{count('next_release')} left for the next release of the app. "
+                     f"{count('gave_up')} can't be done. "
                      f"{count('later', 'working')} in progress.</div>")
-        open_ones = [record for record in records if record.status in {"redo", "gave_up", "later", "not_yet"}]
+        open_ones = [record for record in records if record.status in {"next_release", "gave_up", "later"}]
         if open_ones:
             parts.append("<div class='card'>" + "<br>".join(
                 f"Document {record.doc_id}: {html.escape(record.state.get('reason') or record.status)}"

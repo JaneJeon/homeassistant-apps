@@ -36,6 +36,7 @@ class FakePaperless:
         self.own_ocr = True          # False: Paperless's OCR mode is off, so a raw scan gets no text
         self.archive_everything = False    # True: archive file generation is "always", even for a PDF with text
         self.me = 7                  # the app's own Paperless user; it sees its own documents and unowned ones
+        self.refuse_duplicates = False     # True: Paperless is set to refuse a file it already holds
 
     def add_foreign(self, data: bytes, *, name="upload.pdf", owner=None, tags=(), pages=None) -> int:
         """A document that reached Paperless some other way than through the app."""
@@ -89,10 +90,11 @@ class FakePaperless:
             raise PaperlessError(f"Expected exactly one tag named {name!r}, found 0")
         return self.tags[name]
 
-    def find_by_checksum(self, sha):
+    def find_by_checksum(self, sha, *, with_tag=None):
         self._check("find_by_checksum")
         for doc_id, doc in self.docs.items():
-            if doc["versions"][-1]["checksum"] == sha:
+            if (doc["versions"][-1]["checksum"] == sha and self._visible(doc_id)
+                    and (with_tag is None or with_tag in doc["tags"])):
                 return doc_id
         return None
 
@@ -116,8 +118,10 @@ class FakePaperless:
         self._check("post_document")
         sha = hashlib.sha256(data).hexdigest()
         task = f"t{next(self.task_ids)}"
-        if self.find_by_checksum(sha):
-            self.tasks[task] = {"status": "failure", "result": "Not consuming: It is a duplicate"}
+        # Paperless 3 takes a file it already holds and makes a second document of it, unless it is
+        # set to refuse duplicates (PAPERLESS_CONSUMER_DELETE_DUPLICATES), which was the rule before 3.0.
+        if self.refuse_duplicates and any(doc["versions"][-1]["checksum"] == sha for doc in self.docs.values()):
+            self.tasks[task] = {"status": "failure", "result": f"Not consuming {filename}: Document already exists"}
         else:
             doc_id = next(self.ids)
             self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "owner": self.me, "created": created,

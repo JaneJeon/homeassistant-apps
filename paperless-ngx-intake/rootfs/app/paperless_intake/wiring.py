@@ -38,6 +38,6 @@ def build(settings: Settings, *, announce: bool = False) -> App:
     notifier = Notifier(settings.ha_url, started=settings.webhook_started, finished=settings.webhook_finished,
                         alert=settings.webhook_alert)
     pipeline = Pipeline(settings, store, paperless, notifier, token_provider=token_provider)
-    documents = Documents(settings, store, paperless, pipeline, notifier)
+    documents = Documents(settings, store, paperless, pipeline)
     pipeline.documents = documents
     return App(settings, store, notifier, pipeline, documents)

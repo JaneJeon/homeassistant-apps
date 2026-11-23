@@ -58,18 +58,20 @@ Every five minutes, when no scan is waiting, the app asks Paperless for its list
 - **A PDF that already has text** (made on a computer, or read before it was stored) is left exactly as it is. There is nothing to turn, reorder or read.
 - **Anything that isn't a PDF** (a photo) is left for a later version of the app that can read images.
 
-The app keeps one small record per document (see Files) saying which of these it was, what was done and by which version of the app, or why nothing was. The Mail intake page has a section listing them.
+The app keeps one small record per document (see Files). Every document ends in one of four outcomes: **done**, **not needed** (for good), **gave up** (for good, with the reason), or **next release** (this version of the app couldn't, and the next one tries once). The Mail intake page has a section listing them.
 
 The same loop is what improves a searchable version later. If Paperless couldn't read all the words of one, or the app failed to build one, the next version of the app tries once, working from version 1 as Paperless holds it. If it works, the better copy is added as a newer version, a second note says so, and any earlier warning about that scan is closed. If it doesn't, the document stays exactly as it was.
 
+**The same file by two routes.** A scan takes for its own only a document the app stored (it holds the scan's file and carries the `Mail intake` tag). If the same file is already in Paperless some other way and then comes through the scanner's folder, the scan becomes a second document, and Paperless flags the two as duplicates. If Paperless is set to refuse duplicates (`PAPERLESS_CONSUMER_DELETE_DUPLICATES`, off by default), that scan waits with an alert that says why.
+
 What the app may change on a stored document: it adds one file version and one note. It never touches the owner, tags, date or title, and it never deletes anything. It adds a version only when every other file version on the document is one the app added itself. If you have added one of your own (by rotating pages in Paperless's editor, say), the app leaves that document alone for good.
 
-A stored document is never held and never raises an alert, because nothing depends on an answer: the document is already safe. A page that looks missing goes into the document's note. If something is in the way (Google or Paperless not answering, the day's Google page limit), the app tries again each hour for a day, then leaves the document until the next version of the app. An unexpected error gets three tries.
+A stored document is never held and never raises an alert, because nothing depends on an answer: the document is already safe. A page that looks missing goes into the document's note. If Google or Paperless isn't answering, the app tries again each hour for a day, then leaves the document for the next version of the app. An unexpected error gets three tries. So does work that is cut short because the whole app stopped.
 
 Three limits apply:
 
 - **Scans go first.** The app works on one thing at a time, and a stored document gets a turn only when no scan is waiting.
-- **Stored documents use at most three quarters of `daily_page_cap`** in a day, so a scan always has room.
+- **Stored documents use at most three quarters of `daily_page_cap`** in a day, so a scan always has room. A document that doesn't fit today waits for tomorrow, and smaller ones behind it still go. Waiting for tomorrow isn't counted as a failed try.
 - **Version 1.3.0 starts on only three documents** that didn't come from the scanner, so the result can be looked at in Paperless first. The version after it removes that limit.
 
 **Documents the app can't see.** Paperless hides a document that has an owner from every other user who isn't a superuser. A file uploaded on Paperless's web page belongs to whoever uploaded it, so the app's user can't see it and the app can't know it exists. A file from Paperless's consume folder has no owner and is visible. To have web uploads covered, give the app's user View and Change permission on the document, by hand or with a Paperless workflow that does it for every new document (trigger: document added; action: assign permissions). The end-to-end tests check both halves: an owned document is invisible, and it is picked up once those two permissions are given.

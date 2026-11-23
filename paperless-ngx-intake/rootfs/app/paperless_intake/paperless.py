@@ -75,10 +75,13 @@ class Paperless:
             raise PaperlessError(f"Expected exactly one tag named {name!r}, found {len(results)}")
         return int(results[0]["id"])
 
-    def find_by_checksum(self, sha256: str) -> int | None:
-        response = self._request("GET", "/api/documents/", params={"checksum__iexact": sha256, "fields": "id"})
-        results = response.json().get("results", [])
-        return int(results[0]["id"]) if results else None
+    def find_by_checksum(self, sha256: str, *, with_tag: int | None = None) -> int | None:
+        """A document whose first file is this one. with_tag: only one that also carries this tag."""
+        response = self._request("GET", "/api/documents/", params={"checksum__iexact": sha256, "fields": "id,tags"})
+        for row in response.json().get("results", []):
+            if with_tag is None or with_tag in (row.get("tags") or []):
+                return int(row["id"])
+        return None
 
     def document(self, doc_id: int) -> dict:
         return self._request("GET", f"/api/documents/{doc_id}/").json()

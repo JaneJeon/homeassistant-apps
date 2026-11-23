@@ -139,7 +139,7 @@ class WebTests(unittest.TestCase):
         html = page.render()
         self.assertIn("Other documents in Paperless", html)
         self.assertIn("2 looked at. 1 given a searchable version.", html)
-        self.assertIn("1 of a kind this release can't read.", html)
+        self.assertIn("1 left for the next release of the app.", html)
         self.assertIn("Document 2: it isn&#x27;t a PDF, and this release reads only PDFs", html)
         self.assertNotIn("<b>photo", html)
 

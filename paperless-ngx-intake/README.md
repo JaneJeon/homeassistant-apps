@@ -25,7 +25,7 @@ flowchart TD
             subgraph second["After storing. The same question for every document, however it arrived"]
                 need{"Was it scanned, and does it<br/>lack a searchable version?"}
                 add["Make one the same way<br/>and add it"]
-                record["One record per document:<br/>done, not needed, or why not"]
+                record["One record per document:<br/>done, not needed, gave up,<br/>or left for the next release"]
             end
         end
 
@@ -73,7 +73,7 @@ Paperless-ngx has its own OCR, page rotation and deskew. With Paperless's defaul
 | Documents that didn't come from the scanner | This app asks Paperless every few minutes what it holds, and gives each scanned PDF it can see a searchable version. A PDF that already has text is left alone | Nothing. With its OCR mode `off`, Paperless reads nothing itself |
 | Search text | Paperless reads it out of the copy with `pdftotext`. This app then compares it with Google's | |
 | Document date | This app passes the day of the scan, from the scanner's file name | Not used. Paperless would guess a date from its own reading of version 1 |
-| Duplicates | This app asks Paperless for the scan's SHA-256 before it uploads, so the same file is never stored twice by the app. The same letter scanned twice is two different files, and nothing catches that yet | |
+| Duplicates | The same file dropped in the scanner's folder twice is stored once. A file that is already in Paperless by another route and then comes through the scanner's folder becomes a second document. The same letter scanned twice is two different files, and this app does nothing about that yet | Paperless 3 stores a file it already holds and flags both on its Duplicates tab |
 | Alerts | This app, through a Home Assistant automation | Paperless workflows must not match `Mail intake` documents (see [DOCS.md](DOCS.md)) |
 
 Two Paperless settings keep it this way. Both are in Paperless under Configuration, OCR Settings:
