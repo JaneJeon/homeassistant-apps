@@ -28,6 +28,7 @@ options:
   min_available_mib: 500
   max_io_pressure: 30
   max_memory_pressure: 20
+  paperless_worker_timeout: 1800
   keep_local_copies_days: 7
   watchdog_minutes: 45
 schema:
@@ -46,6 +47,7 @@ schema:
   min_available_mib: int(0,)
   max_io_pressure: int(1,100)
   max_memory_pressure: int(1,100)
+  paperless_worker_timeout: int(60,)
   keep_local_copies_days: int(1,)
   watchdog_minutes: int(1,)
 image: ghcr.io/janejeon/paperless-intake

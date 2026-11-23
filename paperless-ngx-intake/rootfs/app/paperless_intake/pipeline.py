@@ -577,7 +577,8 @@ class Pipeline:
             # written, the queue starts no upload until Paperless shows how this one ended (gate.Intent.settle),
             # and then this step finds the document by its checksum instead of sending the file again.
             self.intent.open(what="original", sha256=item.sha, name=name)
-            task_id = self.paperless.post_document(name, original, tag_ids=tag_ids, created=created)
+            task_id = searchable.send(self.intent, lambda: self.paperless.post_document(name, original, tag_ids=tag_ids,
+                                                                                       created=created))
             item.event("uploaded_original", task=task_id)
             item.state["upload_task"] = task_id
             item.save()

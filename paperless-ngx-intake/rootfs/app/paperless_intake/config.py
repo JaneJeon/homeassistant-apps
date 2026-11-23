@@ -63,6 +63,9 @@ class Settings:
     min_available_mib: int = 500
     max_io_pressure: float = 30.0
     max_memory_pressure: float = 20.0
+    # Paperless's own limit on one task (its PAPERLESS_WORKER_TIMEOUT). A task it leaves unfinished for
+    # longer, with 15 minutes more, was lost with its worker (gate.Intent.settle).
+    paperless_worker_timeout: float = 1800.0
     pace_seconds: float = 120.0     # between stored documents: Paperless goes on working on a version after taking it
     meminfo_path: Path = Path("/proc/meminfo")
     pressure_dir: Path = Path("/proc/pressure")
@@ -125,6 +128,7 @@ def load(options_path: Path | None = None) -> Settings:
         min_available_mib=int(options.get("min_available_mib", 500)),
         max_io_pressure=float(options.get("max_io_pressure", 30)),
         max_memory_pressure=float(options.get("max_memory_pressure", 20)),
+        paperless_worker_timeout=float(options.get("paperless_worker_timeout", 1800)),
         meminfo_path=Path(os.environ.get("INTAKE_MEMINFO", "/proc/meminfo")),
         pressure_dir=Path(os.environ.get("INTAKE_PRESSURE_DIR", "/proc/pressure")),
         watchdog_minutes=int(options.get("watchdog_minutes", 45)),

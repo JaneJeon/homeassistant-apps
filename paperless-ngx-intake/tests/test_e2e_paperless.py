@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -296,19 +297,31 @@ class PaperlessE2E(unittest.TestCase):
         (settings.capture_dir / "20261101_100000_000501.pdf").write_bytes(numbered_letter(1, tag=uuid.uuid4().hex[:8]).pdf)
         self.run_until_quiet(service)
         item = store.all()[0]
-        self.assertEqual(client.task_status(item.state["upload_task"]), "success")
-        self.assertIsNone(client.task_status(str(uuid.uuid4())))
+        task = client.task(item.state["upload_task"])
+        self.assertEqual(task["status"], "success")
+        self.assertLess(abs(task["created"] - time.time()), 600)           # Paperless's own time, as a timestamp
+        self.assertIsNone(client.task(str(uuid.uuid4())))
         deadline = time.time() + 120
-        while client.unfinished_uploads() and time.time() < deadline:
+        while client.consume_tasks(created_after=time.time() - 3600) and time.time() < deadline:
             time.sleep(2)
-        self.assertEqual(client.unfinished_uploads(), 0)
-        # A mark for an upload that landed is settled by its checksum; one Paperless never got, once it is idle.
+        self.assertEqual(client.consume_tasks(created_after=time.time() - 3600), [])
+        # The filter consume_tasks relies on is honoured: the app's finished upload is listed without it,
+        # and not when asked only for tasks made after it.
+        def listed(**params):
+            body = client._request("GET", "/api/tasks/", params={"task_type": "consume_file", **params}).json()
+            return body.get("count", len(body.get("results", [])))
+        later = datetime.fromtimestamp(task["created"] + 60, timezone.utc).isoformat()
+        self.assertGreaterEqual(listed(), 1)
+        self.assertEqual(listed(date_created_after=later), 0)
+        # A mark for an upload that landed is settled by its checksum; one whose task ended, by the task.
         intent = service.pipeline.intent
         intent.open(what="original", sha256=item.sha, name="landed.pdf")
-        self.assertEqual(intent.settle(client, settings.intake_tag), "it landed")
+        self.assertEqual(intent.settle(client, settings.intake_tag, stale_after=2700), ("landed", "it landed"))
         intent.open(what="version", sha256="0" * 64, name="lost.pdf", doc_id=item.state["doc_id"])
         intent.task(item.state["version_task"])
-        self.assertIn("task for it ended (success)", intent.settle(client, settings.intake_tag))
+        outcome, how = intent.settle(client, settings.intake_tag, stale_after=2700)
+        self.assertEqual(outcome, "ended")
+        self.assertIn("task for it ended (success)", how)
         self.assertIsNone(intent.read())
 
     def test_commit_reads_back_and_searches_on_google_text(self):

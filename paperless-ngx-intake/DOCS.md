@@ -91,7 +91,13 @@ The app works on one thing at a time, from a queue kept in its own records: new 
 
 Nothing starts while:
 
-- **An upload may still be on its way into Paperless.** When an upload times out, or the app is stopped with one in flight, Paperless may still be taking the file in minutes later. Until Paperless shows how that upload ended (the file has appeared, its task has ended, or Paperless has nothing left to take in), the app sends nothing else, so the same file is never sent twice and a struggling Paperless isn't given more. Uploads get 10 minutes to answer.
+- **An upload may still be on its way into Paperless.** When an upload times out, or the app is stopped with one in flight, Paperless may still be taking the file in minutes later. Until Paperless shows how that upload ended, the app sends nothing else, so the same file is never sent twice and a struggling Paperless isn't given more. Uploads get 10 minutes to answer. How it ends:
+  - **It landed:** the file is in Paperless (found by its checksum).
+  - **Its task ended:** the job goes on by its own rules.
+  - **It never landed:** its task is still unfinished past Paperless's own time limit (`paperless_worker_timeout`, 30 minutes unless Paperless is set otherwise) and 15 minutes more, or, when the app never got a task id, Paperless has no unfinished upload from after this one. Paperless's worker can die while it takes a file in (a power cut, a restart), and Paperless then leaves the task unfinished for good. The job sends the file again.
+  - **You forget it:** the Scans page has a "Forget this upload" button while one is in doubt, for when you know Paperless will never finish it. It counts as never landed, at once, and the log says you chose it.
+
+  A file that never lands three times is set aside: a new scan is held with an alert ("Paperless never finished taking this file in"), and a stored scan is set aside as gave up.
 - **The Green is short of memory:** less than `min_available_mib` available (MemAvailable, default 500 MiB).
 - **The disk is low:** less than `min_free_mib` free (default 1024 MiB).
 - **The Green is stalling:** in the last minute, work waited on disk I/O for `max_io_pressure` % of the time or more (default 30), or on memory for `max_memory_pressure` % or more (default 20). These are the kernel's pressure figures (`/proc/pressure/io` and `/proc/pressure/memory`). With swap full, a shortage of memory shows up as disk I/O, which the memory figure alone doesn't see. On a kernel without these files the app goes by available memory alone, and says so once in its log at start.
@@ -201,6 +207,7 @@ paperless_intake_google_key: |
 - **Webhook IDs**, none of which has a default. An empty one means: don't send.
   - `webhook_started` and `webhook_finished` are the existing ingest-watchdog webhooks.
   - `webhook_alert` feeds the alert automation.
+- **Paperless worker timeout** (`paperless_worker_timeout`, default 1800 seconds): the same as Paperless's own `PAPERLESS_WORKER_TIMEOUT`. Set it to match if Paperless is set otherwise. See When the app waits.
 - **Limits**:
   - `daily_page_cap` stops runaway Google use. New scans may use all of it. Stored scans may use three quarters of it.
   - `min_free_mib`, `min_available_mib`, `max_io_pressure` and `max_memory_pressure`: no new work starts while the Green is past one of them (see When the app waits).
@@ -227,7 +234,7 @@ All on `/share`, so the nightly backup covers them:
 - `/share/paperless/intake/items/<sha256>/`: one folder per new scan, holding the original, the searchable version, `checks.json`, `events.jsonl`, `claim.json` and `state.json`. `checks.json` records what was measured for each page: the turn applied and why, the order decision and its votes, and how the text layer was placed. The PDFs are removed `keep_local_copies_days` after a verified upload; the rest of the record stays.
 - `/share/paperless/intake/documents/<Paperless document id>/`: one folder per document, holding `record.json` (what kind of file it is, whether it has its searchable version, which version of the app last worked on it, and the reason when nothing was done), `events.jsonl` (every change of that record) and `checks.json` (what was measured the last time a searchable version was made for it). Working files are removed when the work ends.
 - `/share/paperless/intake/google-usage.json`: Google pages today and this month, and which of Google's answers have been counted.
-- `/share/paperless/intake/upload-in-doubt.json`: there only while an upload's outcome isn't known (When the app waits).
+- `/share/paperless/intake/upload-in-doubt.json`: there only while an upload's outcome isn't known (When the app waits). `upload-strikes.json` beside it counts the uploads of each file that never landed.
 - `/share/paperless/intake/paperless-listing.json`: the ids of the tagged documents Paperless last listed, for the count of stored scans still to re-read.
 - `/share/paperless/intake/duplicates/` and `/share/paperless/intake/discarded/`: kept for 30 days.
 

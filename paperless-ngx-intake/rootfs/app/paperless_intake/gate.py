@@ -136,15 +136,23 @@ class Intent:
     def close(self) -> None:
         self.path.unlink(missing_ok=True)
 
-    def settle(self, paperless: Paperless, intake_tag: str) -> str | None:
-        """Look at Paperless. How the upload ended, in words, once that is known (and the mark is removed); else None.
+    def settle(self, paperless: Paperless, intake_tag: str, *, stale_after: float) -> tuple[str, str] | None:
+        """Look at Paperless. Once it is known how the upload ended: (outcome, in words), and the mark is removed.
 
-        Raises PaperlessError when Paperless doesn't answer: that is an outside wait, and the
-        caller backs off. It never settles a mark by guessing.
+        The outcome is "landed" (the file is in Paperless), "ended" (its task ended; the job, which
+        has the same task in its record, deals with a failed one by its own rules), or "lost" (it did
+        not land, and the job sends it again). None while it isn't known yet.
+
+        A task Paperless left pending or started for longer than stale_after (its own time limit
+        and a margin) is taken as lost: Paperless's worker died with it, in a power cut say, and
+        Paperless leaves such a task as it was for good.
+
+        Raises PaperlessError when Paperless doesn't answer: that is an outside wait, and the caller
+        backs off. It never settles a mark by guessing.
         """
         intent = self.read()
         if intent is None:
-            return "no upload was in doubt"
+            return "none", "no upload was in doubt"
         paperless.server_version()                  # the cheap question: is Paperless there at all
         sha = intent["sha256"]
         if intent.get("doc_id"):
@@ -154,24 +162,38 @@ class Intent:
                 if error.kind != NOT_FOUND:
                     raise
                 self.close()
-                return "it did not land: the document is no longer in Paperless"
+                return "lost", "it did not land: the document is no longer in Paperless"
         else:
             landed = paperless.find_by_checksum(sha, with_tag=paperless.tag_id(intake_tag)) is not None
         if landed:
             self.close()
-            return "it landed"
-        task = intent.get("task")
-        if task:
-            status = paperless.task_status(task)
-            if status in COMPLETE:
-                # The job has the same task in its own record, and deals with a failed one by its own rules.
+            return "landed", "it landed"
+        now = self.clock()
+        at = float(intent.get("at") or 0)
+        task = paperless.task(intent["task"]) if intent.get("task") else None
+        if task is not None:
+            if task["status"] in COMPLETE:
                 self.close()
-                return f"Paperless's task for it ended ({status}); the job looks for the file itself"
-            if status is not None:
+                return "ended", f"Paperless's task for it ended ({task['status']}); the job looks for the file itself"
+            age = now - (task["created"] or at)
+            if age < stale_after:
                 return None                         # Paperless is still working on it
-        if self.clock() - float(intent.get("at") or 0) < SETTLE_AFTER_SECONDS:
-            return None
-        if paperless.unfinished_uploads() == 0:
             self.close()
-            return "it did not land: Paperless has nothing left to take in"
-        return None
+            return "lost", (f"it did not land: Paperless's task for it was still {task['status']} after "
+                            f"{age / 60:.0f} minutes, past Paperless's own time limit")
+        if now - at < SETTLE_AFTER_SECONDS:
+            return None
+        # Only files Paperless was given after the mark went down can be this one. A task stuck from
+        # long before (its worker died) must not keep the mark for ever, and nor can one stuck since.
+        live = [task for task in paperless.consume_tasks(created_after=at - 60)
+                if now - (task["created"] or now) < stale_after]
+        if live:
+            return None
+        self.close()
+        return "lost", "it did not land: Paperless has nothing left to take in"
+
+    def forget(self) -> dict | None:
+        """Jane's choice on the Scans page: Paperless will never finish this upload. Taken as lost at once."""
+        intent = self.read()
+        self.close()
+        return intent

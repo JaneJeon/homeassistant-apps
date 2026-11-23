@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import itertools
+import time
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +45,7 @@ class FakePaperless:
         self.upload_times_out = False      # True: the next upload's answer doesn't come before the app stops waiting
         self.on_effect = None              # told after every call that changed something (the kill harness)
         self.fail_once: dict = {}          # call name: the PaperlessError that call raises, once
+        self.clock = time.time             # when tasks are created; the harness gives it the test's clock
 
     def add_old_scan(self, data: bytes, *, name="20261014_101500_000042.pdf", owner=None, tags=(), pages=None) -> int:
         """A scan stored before the app, through Paperless's own consume folder. Jane's rule tagged it Scanner."""
@@ -92,7 +94,7 @@ class FakePaperless:
         if name in self.fail_once:
             raise self.fail_once.pop(name)
         if self.unreachable:
-            raise PaperlessError("Paperless unreachable: ConnectionError", UNREACHABLE)
+            raise PaperlessError("Paperless unreachable: ConnectionError", UNREACHABLE, answered=False)
 
     def _effect(self, name):
         """After a call has changed something in Paperless: where a test may have the app die."""
@@ -105,7 +107,7 @@ class FakePaperless:
     def _answer_lost(self):
         if self.upload_times_out:
             self.upload_times_out = False
-            raise PaperlessError("Paperless unreachable: ReadTimeout", TIMEOUT)
+            raise PaperlessError("Paperless unreachable: ReadTimeout", TIMEOUT, answered=None)   # it went; no answer
 
     def land(self):
         """Paperless gets round to filing the uploads it took while it was slow."""
@@ -155,7 +157,8 @@ class FakePaperless:
         # Paperless 3 takes a file it already holds and makes a second document of it, unless it is
         # set to refuse duplicates (PAPERLESS_CONSUMER_DELETE_DUPLICATES), which was the rule before 3.0.
         if self.refuse_duplicates and any(doc["versions"][-1]["checksum"] == sha for doc in self.docs.values()):
-            self.tasks[task] = {"status": "failure", "result": f"Not consuming {filename}: Document already exists"}
+            self.tasks[task] = {"status": "failure", "result": f"Not consuming {filename}: Document already exists",
+                                "created": self.clock(), "type": "consume_file"}
         else:
             def apply():
                 doc_id = next(self.ids)
@@ -163,8 +166,8 @@ class FakePaperless:
                                      "name": filename, "pages": None, "versions": [
                     {"id": doc_id, "checksum": sha, "label": None, "data": data, "archive": self.own_ocr,
                      "content": "TESSERACT TEXT" if self.own_ocr else ""}]}
-                self.tasks[task] = {"status": "success", "related_document": doc_id}
-            self.tasks[task] = {"status": "pending"}
+                self.tasks[task].update(status="success", related_document=doc_id)
+            self.tasks[task] = {"status": "pending", "created": self.clock(), "type": "consume_file"}
             self.pending.append(apply) if self.slow_uploads else apply()
         self._effect("post_document")
         self._answer_lost()
@@ -183,8 +186,8 @@ class FakePaperless:
             self.docs[doc_id]["versions"].insert(0, {
                 "id": version_id, "checksum": hashlib.sha256(data).hexdigest(), "label": label, "data": data,
                 "archive": short or self.archive_everything, "content": "TESSERACT TEXT" if short else text})
-            self.tasks[task] = {"status": "success", "related_document": doc_id}
-        self.tasks[task] = {"status": "pending"}
+            self.tasks[task].update(status="success", related_document=doc_id)
+        self.tasks[task] = {"status": "pending", "created": self.clock(), "type": "consume_file"}
         self.pending.append(apply) if self.slow_uploads else apply()
         self._effect("update_version")
         self._answer_lost()
@@ -196,17 +199,20 @@ class FakePaperless:
         if task["status"] == "failure":
             raise PaperlessTaskFailed(f"Paperless task {task_id} failure", task["result"])
         if task["status"] == "pending":
-            raise PaperlessError(f"Paperless task {task_id} did not finish in time", TIMEOUT)
+            raise PaperlessError(f"Paperless task {task_id} did not finish in time", TIMEOUT, answered=None)
         return task
 
-    def task_status(self, task_id):
-        self._check("task_status")
+    def task(self, task_id):
+        self._check("task")
         task = self.tasks.get(task_id)
-        return task["status"] if task else None
+        return {"status": task["status"], "created": task.get("created"), "started": None} if task else None
 
-    def unfinished_uploads(self):
-        self._check("unfinished_uploads")
-        return sum(1 for task in self.tasks.values() if task["status"] in {"pending", "started"})
+    def consume_tasks(self, *, created_after):
+        self._check("consume_tasks")
+        return [{"status": task["status"], "created": task.get("created"), "started": None}
+                for task in self.tasks.values()
+                if task.get("type", "consume_file") == "consume_file" and task["status"] in {"pending", "started"}
+                and (task.get("created") is None or task["created"] >= created_after)]
 
     @staticmethod
     def task_document_id(task):

@@ -43,20 +43,23 @@ What the queue does, and where:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
 from typing import Callable
 
 from . import __version__
-from .documents import LATER, NEXT_RELEASE, WORKING, Documents, Record
+from .documents import GAVE_UP, LATER, NEXT_RELEASE, WORKING, Documents, Record
 from .gate import available_mib, free_disk_mib, pressure
 from .paperless import Paperless, PaperlessError
-from .pipeline import GATE_KINDS, Pipeline
-from .store import CAPTURED, COMMITTED, COMMITTED_WARNING, COMMITTING, READY, WAITING, Item, Store, iso
+from .pipeline import ENDED, GATE_KINDS, Pipeline
+from .store import CAPTURED, COMMITTED, COMMITTED_WARNING, COMMITTING, READY, WAITING, Item, Store, iso, write_atomic
 
 log = logging.getLogger(__name__)
 
+STALE_MARGIN = 15 * 60      # beyond Paperless's own task time limit, before a task it left unfinished counts as lost
+UPLOAD_STRIKES = 3          # uploads of one file Paperless never finished, before its job is set aside
 TIMED_OUT = -1000           # the exit code SubprocessRunner reports for a worker it stopped after 4 hours
 RESTART_BOUND = 10          # restarts of the whole app, with this job in hand and no step forward, before it is set aside
 RECHECK_SECONDS = 120       # how long a job the gate holds waits before the gate looks again
@@ -242,7 +245,8 @@ class Queue:
         if now < self._settle_at and self._settle_hold is not None:
             return self._settle_hold
         try:
-            how = self.pipeline.intent.settle(self.paperless, self.settings.intake_tag)
+            settled = self.pipeline.intent.settle(self.paperless, self.settings.intake_tag,
+                                                  stale_after=self.settings.paperless_worker_timeout + STALE_MARGIN)
         except PaperlessError as error:
             # Paperless doesn't answer the question: an outside wait, backing off to the scans' retry time.
             self._settle_backoff = min(self._settle_backoff * 2, self.settings.retry_minutes * 60)
@@ -252,9 +256,8 @@ class Queue:
                                      self._settle_at, True)
             return self._settle_hold
         self._settle_backoff = RECHECK_SECONDS
-        if how is not None:
-            log.info("the upload of %s that was in doubt is settled: %s", intent.get("name"), how)
-            self._note_settled(intent, how)
+        if settled is not None:
+            self._settled(intent, *settled)
             self._settle_hold = None
             return None
         self._settle_at = now + RECHECK_SECONDS
@@ -263,18 +266,71 @@ class Queue:
                                  "upload_in_doubt", "paperless", self._settle_at, True)
         return self._settle_hold
 
-    def _note_settled(self, intent: dict, how: str) -> None:
-        """Written into the history of the job the upload belonged to. Its own rules decide what happens next."""
-        if intent.get("what") == "original" and self.store.exists(intent["sha256"]):
-            self.store.load(intent["sha256"]).event("upload_settled", how=how)
-            return
-        for item in self.store.all():
-            if intent.get("doc_id") and item.state.get("doc_id") == intent["doc_id"]:
-                item.event("upload_settled", how=how)
-        if self.documents is not None and intent.get("doc_id") and self.documents.exists(intent["doc_id"]):
-            record = self.documents.load(intent["doc_id"])
-            record.state["upload_settled"] = {"at": iso(self.clock()), "how": how}
+    def forget_upload(self) -> bool:
+        """Jane's button on the Scans page: Paperless will never finish this upload. As if it was found lost."""
+        intent = self.pipeline.intent.forget()
+        if intent is None:
+            return False
+        log.warning("Jane chose to forget the upload of %s; it is taken as not landed", intent.get("name"))
+        self._settled(intent, "lost", "Jane chose to forget it on the Scans page")
+        self._settle_hold = None
+        return True
+
+    def _settled(self, intent: dict, outcome: str, how: str) -> None:
+        """Written into the history of the job the upload belonged to. Its own rules decide what happens next.
+
+        A file Paperless never finishes taking in, three times over, would be sent for ever: the
+        third time, its job is set aside with the reason (a new scan is held, with an alert).
+        """
+        log.info("the upload of %s that was in doubt is settled: %s", intent.get("name"), how)
+        item, record = self._owner(intent)
+        if item is not None:
+            item.event("upload_settled", outcome=outcome, how=how)
+        if record is not None:
+            record.state["upload_settled"] = {"at": iso(self.clock()), "outcome": outcome, "how": how}
             record.save()
+        strikes = self._strikes()
+        sha = intent["sha256"]
+        if outcome != "lost":
+            if strikes.pop(sha, None) is not None:
+                write_atomic(self._strikes_path(), json.dumps(strikes).encode())
+            return
+        strikes[sha] = int(strikes.get(sha, 0)) + 1
+        count = strikes[sha]
+        if count >= UPLOAD_STRIKES:
+            strikes.pop(sha)                     # a fresh start if Jane tries the job again
+        write_atomic(self._strikes_path(), json.dumps(strikes).encode())
+        if count < UPLOAD_STRIKES:
+            return
+        why = f"Paperless never finished taking this file in ({count} times)"
+        log.warning("%s: %s", intent.get("name"), why)
+        if item is not None:
+            item.state.pop("lease", None)
+            self.pipeline._hold(item, why, "gave_up")
+        elif record is not None:
+            self.documents._finish(record, GAVE_UP, why, lease=None)
+
+    def _owner(self, intent: dict):
+        """The job an upload belonged to: a new scan (its original, or its version), or a stored scan."""
+        sha, doc_id = intent.get("sha256"), intent.get("doc_id")
+        if intent.get("what") == "original" and sha and self.store.exists(sha):
+            return self.store.load(sha), None
+        if doc_id:
+            for item in self.store.all():
+                if item.state.get("doc_id") == doc_id and item.status not in ENDED:
+                    return item, None
+            if self.documents is not None and self.documents.exists(doc_id):
+                return None, self.documents.load(doc_id)
+        return None, None
+
+    def _strikes_path(self):
+        return self.settings.intake_dir / "upload-strikes.json"
+
+    def _strikes(self) -> dict:
+        try:
+            return json.loads(self._strikes_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
 
     def _scan_first(self) -> Hold | None:
         held = [item for item in self.store.all() if item.status == WAITING

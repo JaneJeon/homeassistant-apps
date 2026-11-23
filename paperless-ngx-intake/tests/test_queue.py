@@ -61,6 +61,22 @@ class TypedPaperlessErrorTests(unittest.TestCase):
             self.assertEqual(self.kind(status), (REFUSED, False))
         self.assertTrue(PaperlessError("no tag", NO_TAG).outside)
 
+    def test_whether_paperless_can_have_taken_anything_from_a_failed_request_is_known(self):
+        from urllib3.exceptions import MaxRetryError, NewConnectionError
+        refused = requests.ConnectionError(MaxRetryError(None, "/", reason=NewConnectionError(None, "refused")))
+
+        def answered(outcome):
+            with self.assertRaises(PaperlessError) as caught:
+                Paperless("http://paperless.invalid", "x", session=self.Session(outcome)).document(1)
+            return caught.exception.answered
+        self.assertIs(answered(refused), False)                             # never reached Paperless
+        self.assertIs(answered(requests.ConnectTimeout()), False)
+        self.assertIsNone(answered(requests.ReadTimeout()))                 # sent; no answer came
+        self.assertIsNone(answered(requests.ConnectionError("reset")))
+        self.assertIsNone(answered(502))                                    # a proxy may have passed it on
+        self.assertIs(answered(400), True)
+        self.assertIs(answered(500), True)
+
     def test_an_upload_waits_minutes_for_paperless_to_answer_and_other_calls_a_minute(self):
         seen = []
 
@@ -339,6 +355,114 @@ class UploadInDoubtTests(unittest.TestCase):
         asked = h.paperless.calls.count("server_version")
         self.assertLessEqual(asked, 6)                                      # 2, 4, 8, 16, 30, 30 minutes: never a spin
         self.assertTrue(h.service.queue.held["scan"] is None and h.pipeline.intent.read() is not None)
+
+
+class UploadAnsweredTests(unittest.TestCase):
+    def test_an_upload_paperless_answered_with_an_error_leaves_no_mark(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
+
+        def refuse(*args, **kwargs):
+            raise PaperlessError("Paperless POST returned HTTP 400", REFUSED)
+        h.paperless.update_version = refuse
+        h.settle()
+        self.assertIsNone(h.pipeline.intent.read())
+        self.assertEqual(h.documents.load(doc_id).state["tries"]["odd"], 1)
+
+
+class StuckTaskTests(unittest.TestCase):
+    """Paperless's worker can die while it takes a file in (a power cut), and leaves the task unfinished for good."""
+
+    LIMIT = 1800 + 15 * 60                                                 # Paperless's time limit, and the margin
+
+    def test_a_task_left_started_is_taken_as_lost_after_paperlesss_time_limit(self):
+        h = Harness(self)
+        h.paperless.slow_uploads = True                                     # Paperless answers with a task, then
+        h.drop(make_scan(letter(1)))                                        # doesn't finish it in time
+        h.settle()
+        self.assertTrue(h.pipeline.intent.read()["task"])
+        [task] = [name for name, task in h.paperless.tasks.items() if task["status"] == "pending"]
+        h.paperless.tasks[task]["status"] = "started"                       # its worker died with it
+        h.paperless.pending = []                                            # and the file is gone
+        h.paperless.slow_uploads = False
+        h.clock.advance(self.LIMIT - 120)
+        h.settle()
+        self.assertIsNotNone(h.pipeline.intent.read())                      # not yet: it could still finish
+        self.assertEqual(h.paperless.calls.count("post_document"), 1)
+        h.clock.advance(240)
+        h.settle()
+        self.assertIsNone(h.pipeline.intent.read())
+        h.clock.advance(31 * 60)
+        h.settle()
+        self.assertEqual((h.only_item().status, len(h.paperless.docs)), (COMMITTED, 1))
+        self.assertIn("past Paperless's own time limit",
+                      [e for e in h.only_item().events() if e["event"] == "upload_settled"][0]["how"])
+
+    def test_without_a_task_id_only_tasks_made_after_the_mark_count_and_none_for_ever(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
+        h.paperless.tasks["stuck-before"] = {"status": "started", "created": h.clock() - 10 * HOUR,
+                                             "type": "consume_file"}       # stuck since long before
+        h.pipeline.intent.open(what="version", sha256="0" * 64, name="lost.pdf", doc_id=doc_id)
+        h.clock.advance(60)
+        h.paperless.tasks["stuck-after"] = {"status": "started", "created": h.clock(), "type": "consume_file"}
+        look(h)
+        self.assertIsNotNone(h.pipeline.intent.read())                      # one made after the mark might be ours
+        h.clock.advance(self.LIMIT)
+        look(h)
+        self.assertIsNone(h.pipeline.intent.read())                         # but not once it is past the limit
+        self.assertEqual(h.documents.load(doc_id).status, DONE)
+
+    def test_a_file_paperless_never_takes_in_three_times_holds_the_scan_with_an_alert(self):
+        h = Harness(self)
+        h.paperless.slow_uploads = True
+        h.drop(make_scan(letter(1)))
+        for _ in range(3):
+            h.paperless.upload_times_out = True
+            h.settle()
+            h.paperless.pending = []                                        # Paperless never files it
+            for task in h.paperless.tasks.values():
+                task["status"] = "started" if task["status"] == "pending" else task["status"]
+            h.clock.advance(self.LIMIT + 60)
+            h.settle()
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["reason_kind"]), (HELD, "gave_up"))
+        self.assertIn("Paperless never finished taking this file in (3 times)", item.state["reason"])
+        self.assertEqual(alert_kinds(h), ["held"])
+        self.assertEqual(h.paperless.calls.count("post_document"), 3)
+        self.assertEqual(json.loads((h.settings.intake_dir / "upload-strikes.json").read_text()), {})
+
+    def test_a_stored_scan_whose_file_paperless_never_takes_in_is_set_aside_without_an_alert(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(1)).pdf)
+        for _ in range(3):
+            lease(h)
+            record = h.documents.load(doc_id)
+            h.pipeline.intent.open(what="version", sha256="0" * 64, name="v.pdf", doc_id=doc_id)
+            h.service.queue.forget_upload()
+            if h.documents.load(doc_id).status == WORKING:
+                h.documents.run(h.documents.load(doc_id))
+                record = h.documents.load(doc_id)
+            h.clock.advance(HOUR)
+        record = h.documents.load(doc_id)
+        self.assertEqual(record.status, GAVE_UP)
+        self.assertIn("Paperless never finished taking this file in", record.state["reason"])
+        self.assertEqual(h.notifier.sent, [])
+
+    def test_forgetting_an_upload_on_the_scans_page_settles_it_at_once_and_is_logged(self):
+        from paperless_intake.web import Page
+        h = Harness(self)
+        h.pipeline.intent.open(what="original", sha256="0" * 64, name="scan.pdf")
+        page = Page(h.service, h.pipeline, h.settings)
+        self.assertIn("Forget this upload", page.render())
+        with self.assertLogs("paperless_intake.jobs", "WARNING") as logged:
+            page.forget_upload()
+        self.assertIn("Jane chose to forget the upload of scan.pdf", logged.output[0])
+        self.assertIsNone(h.pipeline.intent.read())
+        self.assertNotIn("Forget this upload", page.render())
+        self.assertEqual(json.loads((h.settings.intake_dir / "upload-strikes.json").read_text()), {"0" * 64: 1})
+        with self.assertRaises(ValueError):
+            page.forget_upload()
 
 
 class PaceTests(unittest.TestCase):

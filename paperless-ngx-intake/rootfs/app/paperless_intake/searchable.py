@@ -20,6 +20,23 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def send(intent, upload: Callable[[], str]) -> str:
+    """Send an upload whose intent mark is down. When its outcome is known at once, the mark goes at once.
+
+    Paperless answered with an error, or the connection was never made: nothing was taken in.
+    Only an upload whose answer never came keeps its mark, for the queue to settle.
+    """
+    try:
+        return upload()
+    except PaperlessTaskFailed:
+        intent.close()
+        raise
+    except PaperlessError as error:
+        if error.known:
+            intent.close()
+        raise
+
+
 def await_upload(paperless: Paperless, intent, task: str, *, what: str, sha: str, name: str,
                  doc_id: int | None = None) -> dict:
     """Wait for Paperless to take in an upload, and settle its intent mark once the outcome is known.
@@ -69,7 +86,7 @@ def ensure_added(paperless: Paperless, doc_id: int, wanted: str, read: Callable[
     if sha256(data) != wanted:
         return False
     intent.open(what="version", sha256=wanted, name=name, doc_id=doc_id)
-    task = paperless.update_version(doc_id, name, data, label=label)
+    task = send(intent, lambda: paperless.update_version(doc_id, name, data, label=label))
     remember(task)
     intent.task(task)
     await_upload(paperless, intent, task, what="version", sha=wanted, name=name, doc_id=doc_id)

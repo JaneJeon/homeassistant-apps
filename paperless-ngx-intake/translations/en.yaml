@@ -44,6 +44,9 @@ configuration:
   max_memory_pressure:
     name: Maximum memory pressure (%)
     description: No new work starts while work on the Green waited on memory for this share of the last minute or more.
+  paperless_worker_timeout:
+    name: Paperless worker timeout (seconds)
+    description: The same as Paperless's own PAPERLESS_WORKER_TIMEOUT (1800 unless it is set). An upload whose task Paperless leaves unfinished this long, and 15 minutes more, is taken as never landed.
   keep_local_copies_days:
     name: Days to keep local copies
     description: Local PDF copies are deleted this many days after a verified commit.

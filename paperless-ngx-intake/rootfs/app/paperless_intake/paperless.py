@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import requests
 
@@ -36,9 +37,18 @@ class PaperlessError(RuntimeError):
     working on, so the next document would meet it too.
     """
 
-    def __init__(self, message: str, kind: str = REFUSED):
+    def __init__(self, message: str, kind: str = REFUSED, *, answered: bool | None = True):
         super().__init__(message)
         self.kind = kind
+        # Whether the outcome of this request is known: True, Paperless answered it (with an error);
+        # False, it never reached Paperless (the connection was refused or never made); None, not known
+        # (no answer came, or a 502/503/504 that a proxy may have sent after passing the request on).
+        self.answered = answered
+
+    @property
+    def known(self) -> bool:
+        """Whether Paperless is known to have taken nothing from this request."""
+        return self.answered is not None
 
     @property
     def outside(self) -> bool:
@@ -51,6 +61,31 @@ class PaperlessTaskFailed(RuntimeError):
     def __init__(self, message: str, result: str | None = None):
         super().__init__(message)
         self.result = result or ""
+
+
+def _never_connected(error: Exception) -> bool:
+    """A connection that was refused or never made: nothing of the request reached Paperless."""
+    from urllib3.exceptions import NewConnectionError
+    seen, current = set(), error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, NewConnectionError):
+            return True
+        current = getattr(current, "reason", None) or (current.args[0] if getattr(current, "args", None)
+                                                       and isinstance(current.args[0], Exception) else None)
+    return False
+
+
+def _when(value) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() if value else None
+    except ValueError:
+        return None
+
+
+def _task(row: dict) -> dict:
+    return {"status": str(row.get("status", "")).lower(), "created": _when(row.get("date_created")),
+            "started": _when(row.get("date_started"))}
 
 
 @dataclass(frozen=True)
@@ -77,15 +112,19 @@ class Paperless:
     def _request(self, method: str, path: str, *, timeout=None, **kwargs) -> requests.Response:
         try:
             response = self.session.request(method, self.base_url + path, timeout=timeout or self.timeout, **kwargs)
+        except requests.ConnectTimeout as error:
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", TIMEOUT, answered=False) from None
         except requests.Timeout as error:
-            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", TIMEOUT) from None
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", TIMEOUT, answered=None) from None
         except requests.RequestException as error:
-            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", UNREACHABLE) from None
+            raise PaperlessError(f"Paperless unreachable: {type(error).__name__}", UNREACHABLE,
+                                 answered=False if _never_connected(error) else None) from None
         if response.status_code >= 400:
             status = response.status_code
             kind = (LOGIN if status == 401 else NOT_FOUND if status == 404
                     else BUSY if status in {502, 503, 504} else REFUSED)
-            raise PaperlessError(f"Paperless {method} {path} returned HTTP {status}", kind)
+            raise PaperlessError(f"Paperless {method} {path} returned HTTP {status}", kind,
+                                 answered=None if kind == BUSY else True)
         return response
 
     # Version pin ---------------------------------------------------------------
@@ -200,25 +239,30 @@ class Paperless:
                 raise PaperlessError(f"Paperless task {task_id} did not finish in time", TIMEOUT)
             self._sleep(poll)
 
-    def task_status(self, task_id: str) -> str | None:
-        """pending, started, success, failure or revoked. None when Paperless has no such task."""
+    def task(self, task_id: str) -> dict | None:
+        """A task's status (pending, started, success, failure, revoked) and when it was created. None if there is none."""
         body = self._request("GET", "/api/tasks/", params={"task_id": task_id}).json()
         results = body.get("results", body) if isinstance(body, dict) else body
-        return str(results[0].get("status", "")).lower() if results else None
+        return _task(results[0]) if results else None
 
-    def unfinished_uploads(self) -> int:
-        """How many files Paperless has been given and hasn't finished taking in: its consume tasks that haven't ended.
+    def consume_tasks(self, *, created_after: float) -> list[dict]:
+        """The files Paperless was given after this time and hasn't finished taking in: its unfinished consume tasks.
 
         Paperless shows this user its own tasks and those with no owner (the consume folder's).
         The status is checked here as well, so a Paperless that ignored the filter can't make
-        the answer zero by mistake.
+        the list empty by mistake.
         """
-        body = self._request("GET", "/api/tasks/", params={"task_type": "consume_file", "is_complete": "false",
-                                                           "page_size": 100}).json()
-        results = body.get("results", []) if isinstance(body, dict) else body
-        unfinished = [task for task in results if str(task.get("status", "")).lower() not in COMPLETE]
-        more = isinstance(body, dict) and bool(body.get("next"))
-        return len(unfinished) + (1 if more else 0)
+        params = {"task_type": "consume_file", "is_complete": "false", "page_size": 100,
+                  "date_created_after": datetime.fromtimestamp(created_after, timezone.utc).isoformat()}
+        tasks, page = [], 1
+        while page <= 10:
+            body = self._request("GET", "/api/tasks/", params={**params, "page": page}).json()
+            results = body.get("results", []) if isinstance(body, dict) else body
+            tasks += [_task(row) for row in results]
+            if not (isinstance(body, dict) and body.get("next")):
+                break
+            page += 1
+        return [task for task in tasks if task["status"] not in COMPLETE]
 
     @staticmethod
     def task_document_id(task: dict) -> int | None:

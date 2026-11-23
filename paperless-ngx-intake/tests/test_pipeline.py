@@ -57,6 +57,7 @@ class Harness:
         self.clock = Clock()
         self.google = FakeGoogle()
         self.paperless = FakePaperless()
+        self.paperless.clock = self.clock
         self.notifier = RecordingNotifier()
         self.build()
 
