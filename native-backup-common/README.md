@@ -6,7 +6,9 @@ The VictoriaMetrics and VictoriaLogs apps use this shared runtime to keep servin
 
 `/data/live` holds the running database and `/data/work` holds temporary files. Both directories are excluded from the app archive. `/data/backup` contains a complete, stable native export and its manifest. `/data/installation.json` identifies the installation. The manifest records the engine and format versions, snapshot interval, partition set, generation and file checksums.
 
-The hot backup hook creates a fresh export before Supervisor copies the app. VictoriaMetrics uses its snapshot API and version-matched `vmbackup`. VictoriaLogs snapshots its active partitions and materializes their contents. The hook publishes an export only after checking the files. It does not restart the database or change the committed export after returning.
+The hot backup hook creates a fresh export before Supervisor archives the app. VictoriaMetrics uses its snapshot API and version-matched `vmbackup`. VictoriaLogs links the immutable files from the engine's partition snapshots into the export and hashes each file once. The hook checks the complete file layout and identity before and after publishing, and leaves the committed export stable while Supervisor reads it.
+
+The VictoriaLogs export can share storage with the live database. Its links keep the captured files available when compaction or retention removes their original paths. Supervisor stores the files as regular members in the app archive, which is a complete, independent copy. The B2 validator and restore path verify the actual bytes against the manifest.
 
 Supervisor skips hooks for stopped apps. An older export can therefore appear in a later archive. The `native_snapshot_backups` integration in `homeassistant-config` checks the actual B2 artifact and rejects stale or missing snapshots. Home Assistant's completed event alone is insufficient evidence of a complete backup.
 

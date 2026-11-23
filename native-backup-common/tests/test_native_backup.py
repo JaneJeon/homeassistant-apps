@@ -29,6 +29,11 @@ class BackupTests(unittest.TestCase):
     def do_export(self):
         def api(path, params=None): return [str(self.snapshot)] if path.endswith('/create') else {}
         with patch.object(m, 'api', side_effect=api): m.export()
+    def rotate_snapshot_data(self):
+        data = self.snapshot / 'data'
+        replacement = self.snapshot / 'replacement'
+        replacement.write_text('test logs'); replacement.replace(data)
+
     def test_export_restore_and_corruption(self):
         self.do_export(); manifest = m.validate_backup()
         self.assertEqual(manifest['partitions'], ['20261030'])
@@ -86,6 +91,161 @@ class BackupTests(unittest.TestCase):
             with self.assertRaises(OSError): self.do_export()
         self.assertTrue(m.JOURNAL.exists())
         with self.assertRaises(ValueError): m.startup('restore_only')
+
+    def test_staged_same_size_corruption_preserves_published_backup(self):
+        self.do_export(); previous = (m.BACKUP / 'manifest.json').read_bytes()
+        self.rotate_snapshot_data()
+        verify = m.verify_vl_payload
+        def corrupt_stage(root, expected):
+            if root == m.WORK / 'export' / 'payload':
+                (root / 'partitions/20261030/data').write_text('bad logs!')
+            return verify(root, expected)
+        with patch.object(m, 'verify_vl_payload', side_effect=corrupt_stage):
+            with self.assertRaises(ValueError): self.do_export()
+        self.assertFalse(m.JOURNAL.exists())
+        self.assertEqual(previous, (m.BACKUP / 'manifest.json').read_bytes())
+        m.validate_backup()
+
+    def test_staged_sync_walk_error_preserves_published_backup(self):
+        self.do_export()
+        previous = m.validate_backup()
+        scandir = m.os.scandir
+        partition = m.WORK / 'export/payload/partitions/20261030'
+
+        def fail_partition_scan(path):
+            if Path(path) == partition:
+                raise PermissionError('injected sync traversal failure')
+            return scandir(path)
+
+        with patch.object(m.os, 'scandir', side_effect=fail_partition_scan):
+            with self.assertRaisesRegex(PermissionError, 'sync traversal failure'):
+                self.do_export()
+        self.assertFalse(m.JOURNAL.exists())
+        self.assertEqual(m.validate_backup(), previous)
+
+    def test_published_corruption_keeps_previous_and_fails_closed(self):
+        self.do_export(); previous = (m.BACKUP / 'manifest.json').read_bytes()
+        self.rotate_snapshot_data()
+        verify = m.verify_vl_payload
+        def corrupt_published(root, expected):
+            if root == m.BACKUP / 'payload':
+                (root / 'partitions/20261030/data').write_text('bad logs!')
+            return verify(root, expected)
+        with patch.object(m, 'verify_vl_payload', side_effect=corrupt_published):
+            with self.assertRaises(ValueError): self.do_export()
+        self.assertTrue(m.JOURNAL.exists())
+        self.assertEqual(previous, (m.WORK / 'previous-backup/manifest.json').read_bytes())
+        with self.assertRaises(ValueError): m.startup('restore_only')
+        with patch.object(m, 'BACKUP', m.WORK / 'previous-backup'): m.validate_backup()
+
+    def test_clock_step_cannot_publish_an_unrestorable_manifest(self):
+        self.do_export()
+        previous = m.validate_backup()
+        times = [
+            '2026-11-23T08:00:00.000000Z',
+            '2026-11-23T08:00:10.000000Z',
+            '2026-11-23T07:59:00.000000Z',
+        ]
+        with patch.object(m, 'now', side_effect=times):
+            with self.assertRaisesRegex(ValueError, 'invalid timestamp order'):
+                self.do_export()
+        self.assertFalse(m.JOURNAL.exists())
+        self.assertEqual(m.validate_backup(), previous)
+
+    def test_publish_rename_interruptions_preserve_previous_and_fail_closed(self):
+        for fail_at in ('retire', 'promote'):
+            with self.subTest(fail_at=fail_at):
+                self.do_export(); previous = (m.BACKUP / 'manifest.json').read_bytes()
+                rename = m.os.rename
+                def fail_rename(src, dst):
+                    if (fail_at == 'retire' and Path(src) == m.BACKUP or
+                            fail_at == 'promote' and Path(src) == m.WORK / 'export'):
+                        raise OSError('injected rename failure')
+                    return rename(src, dst)
+                with patch.object(m.os, 'rename', side_effect=fail_rename):
+                    with self.assertRaises(OSError): self.do_export()
+                old = m.BACKUP if fail_at == 'retire' else m.WORK / 'previous-backup'
+                self.assertEqual(previous, (old / 'manifest.json').read_bytes())
+                self.assertTrue(m.JOURNAL.exists())
+                with self.assertRaises(ValueError): m.startup('restore_only')
+                with patch.object(m, 'BACKUP', old): m.validate_backup()
+                m.JOURNAL.unlink()
+                if old != m.BACKUP: old.rename(m.BACKUP)
+
+    def test_publish_journal_interruptions_preserve_previous(self):
+        for journal_written in (False, True):
+            with self.subTest(journal_written=journal_written):
+                self.do_export()
+                previous = m.validate_backup()
+                write_json = m.durable_json
+
+                def interrupt_journal(path, value):
+                    if path != m.JOURNAL:
+                        return write_json(path, value)
+                    if journal_written:
+                        write_json(path, value)
+                    raise OSError('injected journal interruption')
+
+                with patch.object(m, 'durable_json', side_effect=interrupt_journal):
+                    with self.assertRaises(OSError):
+                        self.do_export()
+                self.assertEqual(m.validate_backup(), previous)
+                self.assertEqual(m.JOURNAL.exists(), journal_written)
+                if journal_written:
+                    with self.assertRaises(ValueError):
+                        m.startup('restore_only')
+                else:
+                    m.startup('restore_only')
+
+    def test_link_failures_preserve_published_backup(self):
+        for failure in ('omit', 'error'):
+            with self.subTest(failure=failure):
+                self.do_export(); previous = m.validate_backup()
+                link = m.os.link
+                def fail_link(src, dst, *args, **kwargs):
+                    if Path(src) == self.snapshot / 'data':
+                        if failure == 'error': raise OSError('injected link failure')
+                        return None
+                    return link(src, dst, *args, **kwargs)
+                with patch.object(m.os, 'link', side_effect=fail_link):
+                    with self.assertRaises((ValueError, OSError)): self.do_export()
+                self.assertFalse(m.JOURNAL.exists())
+                self.assertEqual(m.validate_backup(), previous)
+
+    def test_snapshot_changes_during_link_preserve_published_backup(self):
+        for change in ('modify', 'remove'):
+            with self.subTest(change=change):
+                self.rotate_snapshot_data()
+                self.do_export(); previous = m.validate_backup()
+                self.rotate_snapshot_data()
+                data = self.snapshot / 'data'; link = m.os.link; changed = []
+                def change_source(src, dst, *args, **kwargs):
+                    result = link(src, dst, *args, **kwargs)
+                    if Path(src) == data and not changed:
+                        changed.append(True)
+                        if change == 'modify': data.write_text('bad logs!')
+                        else: data.unlink()
+                    return result
+                with patch.object(m.os, 'link', side_effect=change_source):
+                    with self.assertRaises((ValueError, OSError)): self.do_export()
+                self.assertTrue(changed)
+                self.assertFalse(m.JOURNAL.exists())
+                self.assertEqual(m.validate_backup(), previous)
+
+    def test_snapshot_alias_rejected_before_publication(self):
+        self.do_export(); previous = m.validate_backup()
+        os.link(self.snapshot / 'data', self.snapshot / 'alias')
+        with self.assertRaises(ValueError): self.do_export()
+        self.assertFalse(m.JOURNAL.exists())
+        self.assertEqual(m.validate_backup(), previous)
+
+    def test_snapshot_symlink_rejected_before_publication(self):
+        self.do_export(); previous = (m.BACKUP / 'manifest.json').read_bytes()
+        (self.snapshot / 'extra').symlink_to(self.snapshot / 'data')
+        with self.assertRaises(ValueError): self.do_export()
+        self.assertFalse(m.JOURNAL.exists())
+        self.assertEqual(previous, (m.BACKUP / 'manifest.json').read_bytes())
+        m.validate_backup()
 
     def test_missing_native_part_fails(self):
         (self.snapshot / 'datadb' / 'parts.json').write_text('["ABCDEF1234567890"]')

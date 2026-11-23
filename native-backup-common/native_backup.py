@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -42,8 +43,8 @@ def remove(path):
     elif path.exists() or path.is_symlink(): path.unlink()
 
 
-def fsync_tree(root):
-    for directory, dirs, files in os.walk(root, topdown=False, followlinks=False):
+def fsync_tree(root, *, onerror=None):
+    for directory, dirs, files in os.walk(root, topdown=False, onerror=onerror, followlinks=False):
         for name in files:
             path = Path(directory) / name
             if not stat.S_ISREG(path.lstat().st_mode): raise ValueError(f'not a regular file: {path}')
@@ -53,10 +54,10 @@ def fsync_tree(root):
         syncdir(directory)
 
 
-def inventory(root):
+def inventory(root, *, onerror=None):
     result = []
     if not root.is_dir() or root.is_symlink(): raise ValueError('payload missing')
-    for directory, dirs, files in os.walk(root, followlinks=False):
+    for directory, dirs, files in os.walk(root, onerror=onerror, followlinks=False):
         for d in dirs:
             if (Path(directory) / d).is_symlink(): raise ValueError('symlink directory')
         for name in files:
@@ -127,8 +128,7 @@ def validate_native(root):
             check_part_list(path.parent, kind)
 
 
-def validate_backup():
-    identity = ident(); manifest = json.loads((BACKUP / 'manifest.json').read_text())
+def validate_manifest(manifest, identity):
     for key in ('schema_version', 'engine', 'engine_version', 'installation_id'):
         if manifest.get(key) != identity[key]: raise ValueError('manifest identity mismatch')
     if str(uuid.UUID(manifest['generation'])) != manifest['generation']: raise ValueError('invalid generation')
@@ -138,7 +138,12 @@ def validate_backup():
         if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z', value): raise ValueError('invalid timestamp')
         times.append(dt.datetime.fromisoformat(value.replace('Z', '+00:00')))
     if times != sorted(times): raise ValueError('invalid timestamp order')
-    files = inventory(BACKUP / 'payload')
+
+
+def validate_backup(*, onerror=None):
+    identity = ident(); manifest = json.loads((BACKUP / 'manifest.json').read_text())
+    validate_manifest(manifest, identity)
+    files = inventory(BACKUP / 'payload', onerror=onerror)
     if not files or files != manifest['files']: raise ValueError('missing or corrupt backup files')
     parts = manifest['partitions']
     if ENGINE == 'victoriametrics':
@@ -156,6 +161,118 @@ def copy_verified(source, dest):
     shutil.copytree(source, dest, symlinks=True)
     if inventory(dest) != before or inventory(source) != before: raise ValueError('source changed or copy failed verification')
     fsync_tree(dest)
+
+
+def snapshot_metadata(info):
+    # Access time and hardlink count can change while the frozen bytes stay put.
+    return info.st_mode, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def raise_walk_error(error):
+    raise error
+
+
+def snapshot_tree(root):
+    root_info = root.lstat()
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError(f'not a snapshot directory: {root}')
+    entries = {Path('.'): root_info}
+    for directory, dirs, files in os.walk(root, onerror=raise_walk_error, followlinks=False):
+        parent = Path(directory)
+        for names, has_type in ((dirs, stat.S_ISDIR), (files, stat.S_ISREG)):
+            for name in names:
+                path = parent / name
+                info = path.lstat()
+                if not has_type(info.st_mode):
+                    raise ValueError(f'unexpected snapshot file type: {path}')
+                entries[path.relative_to(root)] = info
+    return entries
+
+
+def link_vl_snapshot(source, dest, payload):
+    """Stage a frozen native snapshot and hash each payload inode once."""
+    before = snapshot_tree(source)
+    files = []
+    expected = {}
+    directories = []
+    for relative, info in before.items():
+        src, dst = source / relative, dest / relative
+        key = dst.relative_to(payload)
+        if stat.S_ISDIR(info.st_mode):
+            dst.mkdir()
+            directories.append((src, dst))
+            continue
+        stamp = snapshot_metadata(info)
+        os.link(src, dst, follow_symlinks=False)
+        fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as reader:
+            if snapshot_metadata(os.fstat(fd)) != stamp:
+                raise ValueError(f'snapshot source changed while linking: {src}')
+            digest = hashlib.file_digest(reader, 'sha256').hexdigest()
+            if snapshot_metadata(os.fstat(fd)) != stamp:
+                raise ValueError(f'snapshot source changed while hashing: {src}')
+        expected[key] = stamp
+        files.append({
+            'path': 'payload/' + key.as_posix(),
+            'size': info.st_size,
+            'sha256': digest,
+        })
+
+    if not files:
+        raise ValueError(f'empty snapshot source: {source}')
+    after = snapshot_tree(source)
+    if (before.keys() != after.keys()
+            or any(snapshot_metadata(info) != snapshot_metadata(after[path])
+                   for path, info in before.items())):
+        raise ValueError(f'snapshot source changed: {source}')
+    for src, dst in reversed(directories):
+        shutil.copystat(src, dst, follow_symlinks=False)
+        expected[dst.relative_to(payload)] = snapshot_metadata(dst.lstat())
+    return files, expected
+
+
+def verify_vl_payload(payload, expected):
+    entries = snapshot_tree(payload)
+    if {path: snapshot_metadata(info) for path, info in entries.items()} != expected:
+        raise ValueError('snapshot payload paths or file identity changed')
+    # Supervisor archives these inodes as regular files because other links to
+    # them are outside the included tree. A second included name would become
+    # a tar hardlink, which the B2 validator rejects.
+    inodes = [(info.st_dev, info.st_ino) for info in entries.values()
+              if stat.S_ISREG(info.st_mode)]
+    if len(inodes) != len(set(inodes)):
+        raise ValueError('multiple snapshot payload paths refer to the same file')
+
+
+def vl_snapshot_sources(reply, owned):
+    if not isinstance(reply, list) or not reply:
+        raise ValueError('no partition snapshots')
+    root = LIVE / 'partitions'
+    resolved_root = root.resolve(strict=True)
+    sources = {}
+    invalid = False
+    for item in reply:
+        try:
+            if not isinstance(item, str):
+                raise ValueError('invalid snapshot path')
+            path = Path(item)
+            rel = path.relative_to(root)
+            if (len(rel.parts) != 3 or not re.fullmatch(r'\d{8}', rel.parts[0])
+                    or rel.parts[1] != 'snapshots' or rel.parts[2] in ('.', '..')
+                    or not re.fullmatch(r'[A-Za-z0-9._-]+', rel.parts[2])
+                    or path.resolve(strict=True) != resolved_root / rel):
+                raise ValueError('invalid snapshot path')
+        except (ValueError, OSError, RuntimeError):
+            invalid = True
+            continue
+        if item not in owned:
+            owned.append(item)
+        if rel.parts[0] in sources:
+            invalid = True
+        sources[rel.parts[0]] = path
+    if invalid:
+        raise ValueError('invalid, missing, or duplicate partition snapshot path')
+    return sources
 
 
 def promote_live(staged, identity, operation):
@@ -177,7 +294,7 @@ def startup(mode):
         if ENGINE == 'victoriametrics':
             subprocess.run(['/vmrestore-prod', '-src=fs://' + str(BACKUP / 'payload'), '-storageDataPath=' + str(staged), '-concurrency=1'], check=True)
             if not inventory(staged): raise ValueError('restored database is empty')
-            fsync_tree(staged)
+            fsync_tree(staged, onerror=raise_walk_error)
             validate_native(staged)
             validate_backup()
         else:
@@ -217,44 +334,87 @@ def api(path, params=None):
 
 
 def export():
+    started_clock = time.monotonic()
     if JOURNAL.exists(): raise ValueError('interrupted operation')
     identity = ident()
     if not LIVE.is_dir() or not READY.exists() or json.loads(READY.read_text()) != identity: raise ValueError('live data not initialized')
     WORK.mkdir(exist_ok=True); staged = WORK / 'export'; remove(staged); staged.mkdir()
     payload = staged / 'payload'; payload.mkdir()
     started = now(); snapshots = []; partitions = []
+    timings = {}
     try:
         if ENGINE == 'victoriametrics':
             reply = api('/snapshot/create')
             if reply.get('status') != 'ok' or not re.fullmatch(r'[A-Za-z0-9._-]+', reply.get('snapshot', '')): raise ValueError('snapshot creation failed')
             snapshots = [reply['snapshot']]; completed = now()
             subprocess.run(['/vmbackup-prod', '-snapshotName='+snapshots[0], '-storageDataPath='+str(LIVE), '-dst=fs://'+str(payload), '-concurrency=1'], check=True)
+            files = inventory(payload)
         else:
-            snapshots = api('/internal/partition/snapshot/create'); completed = now()
-            if not isinstance(snapshots, list) or not snapshots: raise ValueError('no partition snapshots')
-            for item in snapshots:
-                path = Path(item)
-                try: rel = path.relative_to(LIVE / 'partitions')
-                except ValueError: raise ValueError('snapshot path outside live partitions')
-                if len(rel.parts) != 3 or not re.fullmatch(r'\d{8}', rel.parts[0]) or rel.parts[1] != 'snapshots' or rel.parts[0] in partitions: raise ValueError('invalid snapshot path')
-                partitions.append(rel.parts[0]); dest = payload / 'partitions' / rel.parts[0]; dest.parent.mkdir(parents=True, exist_ok=True)
-                copy_verified(path, dest)
-        files = inventory(payload)
-        if ENGINE == 'victorialogs': validate_native(payload)
+            phase_start = time.monotonic()
+            reply = api('/internal/partition/snapshot/create')
+            completed = now()
+            timings['snapshot_seconds'] = time.monotonic() - phase_start
+
+            phase_start = time.monotonic()
+            sources = vl_snapshot_sources(reply, snapshots)
+            partitions = sorted(sources)
+            partition_dir = payload / 'partitions'
+            partition_dir.mkdir()
+            files = []
+            expected = {}
+            for partition, source in sources.items():
+                entries, metadata = link_vl_snapshot(source, partition_dir / partition, payload)
+                files.extend(entries)
+                expected.update(metadata)
+            expected[Path('partitions')] = snapshot_metadata(partition_dir.lstat())
+            expected[Path('.')] = snapshot_metadata(payload.lstat())
+            files.sort(key=lambda item: item['path'])
+            timings['link_and_hash_seconds'] = time.monotonic() - phase_start
+
+            phase_start = time.monotonic()
+            verify_vl_payload(payload, expected)
+            validate_native(payload)
+            timings['staged_verify_seconds'] = time.monotonic() - phase_start
+            phase_start = time.monotonic()
+            # The engine syncs its snapshot files. Persist the new directory
+            # entries for our links, without syncing the data files again.
+            for path, stamp in expected.items():
+                if stat.S_ISDIR(stamp[0]):
+                    syncdir(payload / path)
+            timings['sync_seconds'] = time.monotonic() - phase_start
         if not files: raise ValueError('empty snapshot')
+        phase_start = time.monotonic()
         manifest = dict(identity, generation=str(uuid.uuid4()), snapshot_started_at=started, snapshot_completed_at=completed, export_completed_at=now(), partitions=sorted(partitions), files=files)
-        durable_json(staged / 'manifest.json', manifest); fsync_tree(staged)
+        if ENGINE == 'victorialogs':
+            validate_manifest(manifest, identity)
+        durable_json(staged / 'manifest.json', manifest)
+        if ENGINE == 'victoriametrics':
+            fsync_tree(staged)
         durable_json(JOURNAL, {'operation': 'publish', 'generation': manifest['generation']})
         old = WORK / 'previous-backup'; remove(old)
         if BACKUP.exists(): os.rename(BACKUP, old); syncdir(DATA); syncdir(WORK)
         os.rename(staged, BACKUP); syncdir(DATA); syncdir(WORK)
-        validate_backup(); JOURNAL.unlink(); syncdir(DATA); remove(old)
+        if ENGINE == 'victorialogs':
+            verify_vl_payload(BACKUP / 'payload', expected)
+            if json.loads((BACKUP / 'manifest.json').read_text()) != manifest:
+                raise ValueError('published snapshot manifest mismatch')
+        else:
+            validate_backup()
+        JOURNAL.unlink(); syncdir(DATA); remove(old)
+        timings['publish_and_verify_seconds'] = time.monotonic() - phase_start
     finally:
+        phase_start = time.monotonic()
         for snap in snapshots:
             try:
                 if ENGINE == 'victoriametrics': api('/snapshot/delete', {'snapshot': snap})
                 else: api('/internal/partition/snapshot/delete', {'path': snap})
             except Exception as exc: print(f'could not remove owned snapshot: {exc}', file=sys.stderr)
+    if ENGINE == 'victorialogs':
+        timings['cleanup_seconds'] = time.monotonic() - phase_start
+        timings['total_seconds'] = time.monotonic() - started_clock
+        print('native backup timing: ' + json.dumps(dict(
+            timings, files=len(files), bytes=sum(item['size'] for item in files),
+            partitions=len(partitions)), sort_keys=True))
 
 
 def main():
