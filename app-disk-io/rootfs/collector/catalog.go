@@ -41,7 +41,7 @@ func coreNames() map[string]string {
 
 func newNameCatalog(token string) *nameCatalog {
 	return &nameCatalog{
-		url:   "http://supervisor/addons",
+		url:   "http://supervisor/supervisor/info",
 		token: token,
 		names: coreNames(),
 		client: &http.Client{
