@@ -95,6 +95,9 @@ class Page:
         if documents is None or not doc_id or not documents.exists(doc_id):
             return ""
         record = documents.load(doc_id)
+        if record.status == "let_go":
+            return (". <span class='muted'>The Physical Mail tag has since been taken off, so the app has let "
+                    "the document go.</span>")
         if record.state.get("by") in {None, item.state.get("prepared_by")}:
             return ""
         if record.status == "done":
@@ -106,15 +109,16 @@ class Page:
         return ""
 
     def _other_documents(self) -> list[str]:
-        """Documents that didn't come through the scanner's folder: what the app has done about each."""
+        """Scans that were stored without this app: what the app has done about each."""
         documents = getattr(self.service, "documents", None)
         if documents is None:
             return []
         records = [record for record in documents.all() if record.state.get("source") == "paperless"]
-        parts = ["<h2>Other documents in Paperless</h2>",
-                 "<p class='muted'>Documents that came in another way than the scanner's folder, and everything "
-                 "stored before this app. Each is looked at once. A scanned one gets a searchable version from "
-                 "Google. Anything else is left as it is. Nothing here needs you.</p>"]
+        parts = ["<h2>Scans stored before this app</h2>",
+                 "<p class='muted'>Scans the app found already stored in Paperless: the ones from before this "
+                 "app. One with no text in it gets a searchable version from Google. One that already "
+                 "has text is left as it is. Documents without the tag are left alone. "
+                 "Nothing here needs you.</p>"]
         if not records:
             return parts + ["<p class='muted'>None looked at yet.</p>"]
         count = lambda *statuses: sum(1 for record in records if record.status in statuses)  # noqa: E731
@@ -123,8 +127,9 @@ class Page:
                      f"{count('not_needed')} left as they are, with nothing for Google to read. "
                      f"{count('next_release')} left for the next release of the app. "
                      f"{count('gave_up')} can't be done. "
+                     f"{count('let_go')} let go, because the tag was taken off. "
                      f"{count('later', 'working')} in progress.</div>")
-        open_ones = [record for record in records if record.status in {"next_release", "gave_up", "later"}]
+        open_ones = [record for record in records if record.status in {"next_release", "gave_up", "later", "let_go"}]
         if open_ones:
             parts.append("<div class='card'>" + "<br>".join(
                 f"Document {record.doc_id}: {html.escape(record.state.get('reason') or record.status)}"

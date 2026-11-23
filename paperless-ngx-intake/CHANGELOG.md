@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.2
+
+- **The three-scan limit is gone.** Version 1.3.1 started on three stored scans so the result could be looked at first. They were looked at in Paperless: upright, in order, a note on each, the original still version 1, and nothing else about them changed. The rest of the scans stored before the app are now re-read, one at a time, within three quarters of the day's Google page cap.
+- The code for the limit is removed, not switched off.
+- Small corrections to README, DOCS and DESIGN.
+
+## 1.3.1
+
+Version 1.3.0 was never installed. Before it went in, what the app looks at was cut back to what the app is for.
+
+- **Scanner only.** The app looks after what comes out of the scanner, and nothing else. Version 1.3.0 looked at every document it could see and judged from the file whether it had been scanned. That reached into kinds of document the app was never tested on.
+- **The `Physical Mail` tag is the boundary, and the only test.** The app takes on a stored document only if it carries the tag. The app puts the tag on every scan it stores, and a Paperless rule put it on the scans stored before the app. A document without the tag is not fetched, read or added to.
+- **A scan that is missing the tag is mended on the document:** add the tag in Paperless, and the app takes it on at its next look. This release starts on only three stored scans, so after those a newly tagged one waits for the next release, and nothing new is started while any document waits for tomorrow's Google pages. The app has no second way of recognising a scan, such as the file's name.
+- **The tag is checked every time the app is about to work on a stored document**, not only when it first meets it. If the tag has been taken off, the app does nothing to the document and lets it go. If the tag comes back, the app takes it on again.
+- **The app asks Paperless only for documents that carry the tag.** Paperless sends it nothing else, and the app still checks the tag on each document it is sent.
+- **A tagged file that isn't a PDF is set aside for good**, with the reason on the Mail intake page. In 1.3.0 it waited for "a version that can read images". The scanner saves PDFs, and giving a photo the tag must not be a way to get it read.
+- Known and accepted: with Paperless's own OCR off, a file with no text inside it that reaches Paperless another way has no search text. It can be found by the missing tag.
+- As planned for 1.3.0, this version starts on three scans stored before the app, so the result can be looked at first. The next version removes the limit.
+- The Mail intake page, the notes, README, DOCS and DESIGN say all this. README and DESIGN have a section "Where the app stops".
+- Tests: a document without the tag, in plain sight of the app, is never looked at, and is taken on once it is given the tag. Both in the unit tests and against real Paperless.
+
+Everything else listed under 1.3.0 below is in this version unchanged, except where 1.3.0 says "every document" or "however it arrived".
+
 ## 1.3.0
 
 Until now the app only saw the scanner's folder. Anything that reached Paperless another way never met it, and with Paperless's own OCR switched off such a document had no search text at all. The same went for everything stored before the app existed.
