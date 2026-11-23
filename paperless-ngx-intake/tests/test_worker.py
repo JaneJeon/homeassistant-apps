@@ -80,6 +80,16 @@ class WorkerProcessTest(unittest.TestCase):
         self.assertEqual([kind for kind, _ in self.notifier.sent if kind == "alert"], ["alert"])
         self.assertFalse(service.step())                      # and rescheduled, not retried in a tight loop
 
+    def test_a_stored_document_is_worked_in_a_child_process_too(self):
+        # Paperless can't be reached here, so the child gets as far as "try again later" and says so in the record.
+        from paperless_intake.documents import LATER, WORKING, Record
+        record = Record(self.app.documents.dir / "5", {"doc_id": 5, "source": "paperless", "added": [], "tries": {}})
+        record.set(WORKING)
+        self.assertEqual(SubprocessRunner(env=self.env).document(record), 0)
+        record = self.app.documents.load(5)
+        self.assertEqual(record.status, LATER)
+        self.assertIn("Paperless unreachable", record.state["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from pathlib import Path
 from paperless_intake.config import Settings
 from paperless_intake.docai.google_backend import GoogleBackendConfig, GoogleDocumentAIBackend
 from paperless_intake.docai.validation import inspect_source
+from paperless_intake.documents import Documents
 from paperless_intake.pipeline import Pipeline, scan_date
 from paperless_intake.service import Service
 from paperless_intake.store import (COMMITTED, COMMITTED_WARNING, DISCARDED, HELD, READY, WAITING, Store)
@@ -53,6 +54,7 @@ class Harness:
         self.google = FakeGoogle()
         self.paperless = FakePaperless()
         self.notifier = RecordingNotifier()
+        self.document_limit = None      # how many documents from outside the scanner a release may start on
         self.build()
 
     def build(self):
@@ -66,7 +68,11 @@ class Harness:
 
         self.pipeline = Pipeline(self.settings, self.store, self.paperless, self.notifier,
                                  token_provider=token_provider, backend_factory=backend, clock=self.clock)
-        self.service = Service(self.settings, self.store, self.pipeline, self.notifier, clock=self.clock)
+        self.documents = Documents(self.settings, self.store, self.paperless, self.pipeline, self.notifier,
+                                   clock=self.clock, limit=self.document_limit)
+        self.pipeline.documents = self.documents
+        self.service = Service(self.settings, self.store, self.pipeline, self.notifier, clock=self.clock,
+                               documents=self.documents)
 
     def drop(self, scan, name="20261101_093000_000400.pdf") -> Path:
         path = self.settings.capture_dir / name
@@ -161,11 +167,6 @@ class HappyPathTests(unittest.TestCase):
         # The app itself couldn't build the copy: the next version of the app tries again.
         item.state.update(copy_not_built=True)
         self.assertIn("until a newer version of the app builds the copy", h.pipeline.note_text(item, "original_only", []))
-
-    def test_a_warning_worded_by_an_earlier_version_counts_as_the_same_warning(self):
-        from paperless_intake.pipeline import COPY_RESAVED, _kinds
-        self.assertEqual(_kinds("Paperless re-ran its own OCR on the searchable copy"),
-                         _kinds(f"{COPY_RESAVED} (see Paperless's OCR mode and archive file generation settings)"))
 
     def test_the_scan_date_goes_to_paperless_as_the_document_date(self):
         h = Harness(self)

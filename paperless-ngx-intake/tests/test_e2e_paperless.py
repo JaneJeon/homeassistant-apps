@@ -24,6 +24,7 @@ import requests
 
 from paperless_intake.config import Settings, tested_paperless_version
 from paperless_intake.docai.google_backend import GoogleBackendConfig, GoogleDocumentAIBackend
+from paperless_intake.documents import DONE, NOT_NEEDED, Documents
 from paperless_intake.paperless import Paperless
 from paperless_intake.pipeline import Pipeline
 from paperless_intake.service import Service
@@ -141,6 +142,7 @@ class PaperlessE2E(unittest.TestCase):
         cls.api.headers.update({"Authorization": f"Token {cls.token}", "Accept": "application/json; version=10"})
         admin_id = cls.api.get(f"{cls.base}/api/users/", params={"username__iexact": "admin"}).json()["results"][0]["id"]
         cls.intake_token, intake_id = cls._user("intake", INTAKE_PERMISSIONS)
+        cls.intake_id = intake_id
         cls.reader_token, _ = cls._user("reader", ["view_document"])    # another user, like an MCP client
         # Jane's tags are owned by her account, so the app's user needs view permission on them.
         view = {"view": {"users": [intake_id], "groups": []}, "change": {"users": [], "groups": []}}
@@ -197,7 +199,12 @@ class PaperlessE2E(unittest.TestCase):
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def harness(self, **overrides):
+    def harness(self, *, loop=False, **overrides):
+        """The app, wired as it runs. loop: also let it look after documents that are already stored.
+
+        Every test shares one Paperless, so the loop sees the other tests' documents too. Only the
+        tests about the loop switch it on, and they assert on their own document.
+        """
         root = Path(tempfile.mkdtemp(prefix="intake-e2e-app-"))
         self.addCleanup(shutil.rmtree, root, True)
         values = dict(
@@ -220,7 +227,11 @@ class PaperlessE2E(unittest.TestCase):
                                            token_provider=token_provider, transport=google)
 
         pipeline = Pipeline(settings, store, client, notifier, token_provider=token_provider, backend_factory=backend)
-        service = Service(settings, store, pipeline, notifier)
+        self.documents = Documents(settings, store, client, pipeline, notifier, limit=None)
+        pipeline.documents = self.documents
+        self.google = google
+        self.backend = backend
+        service = Service(settings, store, pipeline, notifier, documents=self.documents if loop else None)
         return settings, store, service, client, notifier
 
     def run_until_quiet(self, service, rounds=20):
@@ -228,6 +239,29 @@ class PaperlessE2E(unittest.TestCase):
         for _ in range(rounds):
             if not service.step():
                 break
+
+    def loop_until(self, service, doc_id, rounds=80):
+        """Let the loop work until it has an outcome for this document. Other tests' documents come by too."""
+        for _ in range(rounds):
+            if self.documents.exists(doc_id) and self.documents.load(doc_id).status not in {"working", "later"}:
+                return self.documents.load(doc_id)
+            if not service.step():
+                self.documents._look_again_at = 0.0          # no need to sit out the five minutes between looks
+        self.fail(f"the loop reached no outcome for document {doc_id}")
+
+    def stored_by_other_means(self, pdf: bytes, name: str, *, owner_cleared=True) -> int:
+        """A document that reaches Paperless without the app: uploaded by Jane's own account."""
+        response = self.api.post(f"{self.base}/api/documents/post_document/",
+                                 files={"document": (name, pdf, "application/pdf")})
+        response.raise_for_status()
+        admin = Paperless(self.base, self.token)
+        doc_id = admin.task_document_id(admin.wait_for_task(str(response.json())))
+        if owner_cleared:       # as a consume-folder document is: nobody's, so every user sees it
+            self.api.patch(f"{self.base}/api/documents/{doc_id}/", json={"owner": None}).raise_for_status()
+        return doc_id
+
+    FIELDS_THAT_ARE_JANES = ("title", "created", "tags", "owner", "correspondent", "document_type", "storage_path",
+                             "archive_serial_number", "custom_fields")
 
     def search(self, word: str) -> list[int]:
         response = self.api.get(f"{self.base}/api/documents/", params={"query": word, "fields": "id"})
@@ -372,6 +406,128 @@ class PaperlessE2E(unittest.TestCase):
         client.wait_for_task(client.update_version(doc_id, "manual-drop.searchable.pdf", version.pdf, label="e2e"))
         time.sleep(5)
         self.assertEqual(self.hooks.paths()[before:], ["/consume_started", "/document_added"])
+
+    def test_a_scan_that_came_through_paperlesss_own_consume_folder_gets_its_searchable_version(self):
+        """Every document stored before the app existed is one of these: a raw scan, upside down or not,
+        that Paperless consumed itself. The loop gives it the same treatment as a scan arriving today,
+        and changes nothing else about it."""
+        settings, store, service, client, notifier = self.harness(loop=True)
+        marker = "heronbridge" + uuid.uuid4().hex[:6]
+        pages = [PageSpec([f"Synthetic old statement line {n}.{i} for testing purposes only" for i in range(1, 6)]
+                          + [f"Reference {marker}"], footer=f"Page {n} of 3") for n in (1, 2, 3)]
+        scan = make_scan(pages, flipped=True, turn=180)
+        before_hooks = len(self.hooks.received)
+        (self.tmp / "consume" / f"old-{marker}.pdf").write_bytes(scan.pdf)
+        deadline = time.time() + 300
+        doc_id = None
+        while time.time() < deadline and not doc_id:
+            time.sleep(3)
+            doc_id = client.find_by_checksum(scan.sha256)
+        self.assertIsNotNone(doc_id)
+        deadline = time.time() + 60
+        while time.time() < deadline and "/document_added" not in self.hooks.paths()[before_hooks:]:
+            time.sleep(2)
+        hooks = self.hooks.paths()[before_hooks:]
+        before = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
+        self.assertEqual((len(before["versions"]), before["owner"]), (1, None))
+        self.assertIn(self.tag, before["tags"])                                  # Jane's workflow tagged it
+        if OCR_OFF:
+            self.assertEqual(before["content"].strip(), "")                      # nobody had read it
+
+        record = self.loop_until(service, doc_id)
+        self.assertEqual((record.status, record.state["source"], record.state["kind"]), (DONE, "paperless", "scanned"),
+                         record.state.get("reason"))
+        after = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
+        self.assertEqual(len(after["versions"]), 2)
+        for name in self.FIELDS_THAT_ARE_JANES:
+            self.assertEqual(after.get(name), before.get(name), name)
+        self.assertIn(marker, after["content"])
+        self.assertLess(after["content"].index("line 1.1"), after["content"].index("line 3.1"))   # reading order
+        stored = client.download_original(doc_id, doc_id)
+        self.assertEqual(stored, scan.pdf)                                       # version 1 is still the raw scan
+        notes = self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("came into Paperless another way than the scanner's folder", notes[0]["note"])
+        self.assertIn("3 of 3 pages were turned upright", notes[0]["note"])
+        deadline = time.time() + 60
+        while time.time() < deadline and doc_id not in self.search(marker):
+            time.sleep(2)
+        self.assertIn(doc_id, self.search(marker))
+        time.sleep(5)
+        self.assertEqual(self.hooks.paths()[before_hooks:], hooks)               # no ingest webhook fired again
+        self.assertEqual([kind for kind, _ in notifier.sent], [])                # nothing said to Jane
+        # Looked at again, it is left alone.
+        self.documents._look_again_at = 0.0
+        self.assertEqual(len(client.versions(doc_id)), 2)
+        calls = self.google.calls
+        service.step()
+        self.assertEqual((len(client.versions(doc_id)), self.google.calls), (2, calls))
+
+    def test_a_pdf_that_already_has_text_is_left_exactly_as_it_is(self):
+        """What an emailed statement or a download is: there is nothing to turn, reorder or read."""
+        import types
+        settings, store, service, client, notifier = self.harness(loop=True)
+        marker = "ottercanal" + uuid.uuid4().hex[:6]
+        scan = numbered_letter(2, tag=marker)
+        source = settings.intake_dir / "born-digital-source.pdf"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(scan.pdf)
+        scratch = types.SimpleNamespace(google_dir=lambda: settings.intake_dir / "scratch-google")
+        work = settings.intake_dir / "scratch-work"
+        work.mkdir()
+        made = service.pipeline.make_copy(source, lambda: self.backend(scratch), lambda: work, "a PDF with text")
+        asked = self.google.calls
+        doc_id = self.stored_by_other_means(made.searchable, f"statement-{marker}.pdf")
+        before = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
+        record = self.loop_until(service, doc_id)
+        self.assertEqual((record.status, record.state["kind"]), (NOT_NEEDED, "has_text"), record.state.get("reason"))
+        after = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
+        self.assertEqual(len(after["versions"]), 1)
+        for name in (*self.FIELDS_THAT_ARE_JANES, "content"):
+            self.assertEqual(after.get(name), before.get(name), name)
+        self.assertEqual(self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json(), [])
+        self.assertIn(marker, after["content"])                                  # Paperless reads its text itself
+
+    def test_a_document_that_belongs_to_another_user_is_seen_only_once_it_is_shared_with_the_app(self):
+        """A file uploaded on Paperless's web page belongs to whoever uploaded it, and Paperless hides it
+        from every other user. Until it is shared with the app's user, the app cannot know it exists.
+        Shared with View and Change permission, it is picked up like any other, and stays its owner's."""
+        settings, store, service, client, notifier = self.harness(loop=True)
+        marker = "magpiequay" + uuid.uuid4().hex[:6]
+        scan = numbered_letter(2, tag=marker)
+        doc_id = self.stored_by_other_means(scan.pdf, f"janes-own-upload-{marker}.pdf", owner_cleared=False)
+        owner = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()["owner"]
+        self.assertIsNotNone(owner)
+        self.assertNotIn(doc_id, [row["id"] for row in client.documents()])
+        for _ in range(40):
+            if not service.step():
+                break
+        self.assertFalse(self.documents.exists(doc_id))
+        self.assertEqual(len(Paperless(self.base, self.token).versions(doc_id)), 1)
+        # What a Paperless workflow with an "assign permissions" action would do for every new document.
+        shared = {"view": {"users": [self.intake_id], "groups": []}, "change": {"users": [self.intake_id], "groups": []}}
+        self.api.patch(f"{self.base}/api/documents/{doc_id}/", json={"set_permissions": shared}).raise_for_status()
+        self.assertIn(doc_id, [row["id"] for row in client.documents()])
+        record = self.loop_until(service, doc_id)
+        self.assertEqual(record.status, DONE, record.state.get("reason"))
+        after = self.api.get(f"{self.base}/api/documents/{doc_id}/").json()
+        self.assertEqual((len(after["versions"]), after["owner"]), (2, owner))   # still hers
+        self.assertIn(marker, after["content"])
+        self.assertEqual(len(self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json()), 1)
+
+    def test_a_scan_the_app_stored_is_recognised_even_if_the_apps_own_records_are_lost(self):
+        settings, store, service, client, _ = self.harness()
+        scan = numbered_letter(2, tag=uuid.uuid4().hex[:8])
+        (settings.capture_dir / "20261101_110000_000700.pdf").write_bytes(scan.pdf)
+        self.run_until_quiet(service)
+        doc_id = store.all()[0].state["doc_id"]
+        self.assertEqual(self.documents.load(doc_id).status, DONE)               # the hand-over, as the app runs it
+        # A second, empty app: the Green after its app data was lost.
+        settings, store, service, client, notifier = self.harness(loop=True)
+        record = self.loop_until(service, doc_id)
+        self.assertEqual((record.status, record.state["source"]), (DONE, "paperless"))
+        self.assertEqual(len(client.versions(doc_id)), 2)                        # nothing was added
+        self.assertEqual(len(self.api.get(f"{self.base}/api/documents/{doc_id}/notes/").json()), 1)
 
     def test_api_upload_without_the_intake_tag_signals_document_added(self):
         """Why the intake tag exists. If this starts failing, Paperless now honours sources on

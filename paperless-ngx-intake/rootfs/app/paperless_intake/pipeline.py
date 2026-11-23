@@ -20,9 +20,11 @@ where it stopped:
   recorded upload task is waited for, so a restart never uploads twice.
 - Before adding version 2, the versions list is checked for its checksum.
 
-The app never deletes or edits anything in Paperless except the document it
+This file never deletes or edits anything in Paperless except the document it
 just created. Its tags are set at upload; after that it clears the owner Paperless
-gives an API upload, and adds a version and a note.
+gives an API upload, and adds a version and a note. When a scan has finished going
+in, its document is handed over to documents.py, which is what looks after every
+document once it is stored.
 """
 
 from __future__ import annotations
@@ -48,7 +50,9 @@ from .docai.pdf_renderer import ReviewRequired, describe_source
 from .docai.renderer_adapter import StackRenderer
 from .docai.validation import assert_unchanged, document_for_renderer, inspect_source, ordered_text, validate_result
 from .notify import Notifier
+from . import searchable
 from .paperless import Paperless, PaperlessError, PaperlessTaskFailed
+from .searchable import COPY_RESAVED, sha256  # noqa: F401  (used here and by callers of this module)
 from .store import (COMMITTED, COMMITTED_WARNING, COMMITTING, CAPTURED, DISCARDED, FAILED, HELD, READY, WAITING,
                     Item, Store,
                     iso, now, write_atomic)
@@ -94,17 +98,6 @@ ORDER_WORDS = {
 
 # Reasons version 1.0 held a scan for that no longer hold one. Scans still held for
 # them are put back through the checks once, when this version starts.
-COPY_RESAVED = "Paperless made its own archive file of the searchable copy and shows that in its place"
-# The same warning as versions before 1.2.0 worded it, so a document that already carries it isn't alerted again.
-_EARLIER_WORDING = {"Paperless re-ran its own OCR on the searchable copy": COPY_RESAVED}
-
-
-def _kinds(reason: str | None) -> set[str]:
-    """The warnings in a reason, without the figures in brackets: what they are about, not how much."""
-    kinds = {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
-    return {_EARLIER_WORDING.get(kind, kind) for kind in kinds}
-
-
 @dataclass
 class Made:
     """What one try at a searchable copy came to: the copy, or the reason there is none."""
@@ -119,11 +112,6 @@ class Made:
     fields: dict = field(default_factory=dict)      # what was decided: order, turns, remarks
 
 
-COPY_RETRIES = 3            # tries per app version to add a copy an earlier version couldn't build
-# What the app records about the copy that is stored in Paperless. Put back if a later try at a better copy fails.
-RESTORED = ("reason", "reason_kind", "no_google_copy_reason", "mode", "copy_not_built", "copy_reads_badly",
-            "searchable_sha256", "page_order", "rotations", "order_status", "order_verified", "quality_notes",
-            "short_text")
 OBSOLETE_HOLD_KINDS = {"render_check", "google_rejected", "google_mismatch"}
 
 # Google backend failure codes worth retrying later rather than asking Jane.
@@ -146,10 +134,6 @@ THIS_SCAN_GOOGLE = {
     "response_document_validation_failed",
 }
 THIS_SCAN_HTTP = {400, 413, 422}
-
-
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 @dataclass
@@ -180,6 +164,8 @@ class Pipeline:
         self.backend_factory = backend_factory or self._google_backend
         self.renderer = StackRenderer()
         self.clock = clock
+        # Set by wiring: where a scan's document is handed over once the scan has finished going in.
+        self.documents = None
 
     # Dispatch -------------------------------------------------------------------
 
@@ -231,7 +217,7 @@ class Pipeline:
         return int(usage.get(time.strftime("%Y-%m-%d", time.gmtime(self.clock())), 0))
 
     def pages_today(self) -> int:
-        """Pages sent to Google so far today, by scans and by copy jobs together."""
+        """Pages sent to Google so far today, for scans and for stored documents together."""
         return self._pages_today()
 
     def _count_pages(self, pages: int) -> None:
@@ -275,7 +261,7 @@ class Pipeline:
         """One try at the searchable copy of one file. It writes nothing about any document.
 
         Used for a scan on its way in (prepare) and for a document that is already in
-        Paperless (jobs.py). Raises Hold when the file isn't a PDF the app can read, and
+        Paperless (documents.py). Raises Hold when the file isn't a PDF the app can read, and
         Wait when something outside the file is in the way (disk, the Google key, the
         day's page cap, Google not answering). Otherwise returns what it made: the copy,
         or the reason there is none.
@@ -427,14 +413,9 @@ class Pipeline:
         """No searchable copy can be made. The original still goes in, and Jane is told once it has.
 
         ours: the failure was in this app's own handling, not in Google refusing the scan.
-        A later version of the app may do better, so it tries again (see retry_copies).
+        A later release of the app may do better, so the documents loop tries again then.
         """
         self._write_checks(item, {**(checks_record or {}), "mode": ORIGINAL_ONLY, "no_google_copy_reason": why})
-        if item.state.get("copy_added_later"):
-            # The document is already in Paperless, with or without an earlier copy. This try
-            # made nothing to add, so nothing about the document or its record changes.
-            self._back_to_committed(item, why)
-            return
         fields = dict(mode=ORIGINAL_ONLY, no_google_copy_reason=why, copy_not_built=ours, prepared_by=__version__,
                       quality_notes=[], short_text=False, waiting_since_unix=None, alerted_reason_kind=None)
         if gap and not self._settled(item):
@@ -447,9 +428,9 @@ class Pipeline:
     def _settled(item: Item) -> bool:
         """Whether the question of a missing page is already closed for this scan.
 
-        It is closed once Jane has chosen to keep the scan, or once the scan is in Paperless.
-        Only a scan being prepared again (see retry_copies) can get here in that state, and
-        holding it a second time would ask Jane what she has already answered.
+        It is closed once Jane has chosen to keep the scan, or once its original is in Paperless.
+        Only a scan being prepared again (see reprepare_unfinished) can get here in that state,
+        and holding it a second time would ask Jane what she has already answered.
         """
         state = item.state
         return bool(state.get("doc_id") or state.get("upload_task")
@@ -480,6 +461,10 @@ class Pipeline:
             return True
         return live in accepted
 
+    def version_accepted(self, live: str) -> bool:
+        """Whether Paperless is at a version the app may write to. The same rule for scans and for stored documents."""
+        return self._version_accepted(live)
+
     def version_label(self) -> str:
         processor = self.settings.processor_version.rsplit("/", 1)[-1]
         return f"Google OCR {processor}, intake {__version__}"[:64]
@@ -503,31 +488,23 @@ class Pipeline:
         if item.status != COMMITTING:
             item.set(COMMITTING)
         mode = item.state.get("mode", WITH_GOOGLE)
-        # A document that has been in Paperless for a while and is only getting its copy now.
-        # Jane may have changed it since. The app adds the version and a note, and judges
-        # and changes nothing else about it.
-        later = bool(item.state.get("copy_added_later"))
         original = item.source_path.read_bytes()
         if sha256(original) != item.sha:
-            if later:
-                self._back_to_committed(item, "the local copy of the scan changed on disk")
-                return
             item.set(FAILED, reason="the local copy of the scan changed on disk", reason_kind="local_integrity")
             self._finish(item, alert_kind="failed")
             return
 
         try:
             doc_id = self._ensure_original(item, original, tag_ids)
-            if not later:
-                self._ensure_unowned(item, doc_id)
+            self._ensure_unowned(item, doc_id)
             if mode == WITH_GOOGLE and not self._ensure_version(item, doc_id):
                 # The original is already safely in Paperless. A damaged local copy of the
                 # searchable version is a reason to say so, not a reason to hold the scan.
                 mode = ORIGINAL_ONLY
-                item.state.update(mode=ORIGINAL_ONLY,
+                item.state.update(mode=ORIGINAL_ONLY, copy_not_built=True,
                                   no_google_copy_reason="the local searchable copy changed on disk before upload")
                 item.save()
-            problems, warnings = self._read_back(item, doc_id, tag_ids, mode, later=later)
+            problems, warnings = self._read_back(item, doc_id, tag_ids, mode)
             if item.state.get("no_google_copy_reason"):
                 # Not a per-scan nuisance: if this happens, Google's part of the pipeline isn't
                 # working, and silence would let every later scan go in without it.
@@ -542,22 +519,20 @@ class Pipeline:
             raise Wait(str(error), "paperless", "commit")
 
         if problems:
-            if later:
-                self._back_to_committed(item, "; ".join(problems))
-                return
             item.set(FAILED, reason="; ".join(problems), reason_kind="read_back", doc_id=doc_id)
             self._finish(item, alert_kind="failed")
             return
         status = COMMITTED_WARNING if warnings else COMMITTED
-        reason = "; ".join(warnings) or None
-        # A warning Jane already has about this document isn't sent again because a number in it changed.
-        said_before = bool(warnings) and _kinds(reason) <= _kinds(item.state.get("copy_retry_previous_reason"))
-        item.set(status, reason=reason, reason_kind="read_back" if warnings else None,
+        item.set(status, reason="; ".join(warnings) or None, reason_kind="read_back" if warnings else None,
                  doc_id=doc_id, committed_at=iso(self.clock()), committed_at_unix=self.clock(),
-                 waiting_since_unix=None, alerted_reason_kind=None, copy_retry_previous_reason=None,
-                 copy_retry_restore=None, copy_added_later=False, copy_note_needed=False)
+                 waiting_since_unix=None, alerted_reason_kind=None)
         self._tidy_after_commit(item)
-        self._finish(item, alert_kind="warning" if warnings and not said_before else None)
+        self._finish(item, alert_kind="warning" if warnings else None)
+        # The hand-over. The scan has finished going in. From here its document belongs to the
+        # documents loop, which is also what gives it a better searchable version later, if
+        # this one reads back badly or couldn't be built.
+        if self.documents is not None:
+            self.documents.record_scan(item)
 
     def _ensure_original(self, item: Item, original: bytes, tag_ids: list[int]) -> int:
         doc_id = item.state.get("doc_id")
@@ -609,40 +584,20 @@ class Pipeline:
         item.event("owner_cleared", doc_id=doc_id)
 
     def _ensure_version(self, item: Item, doc_id: int) -> bool:
-        """Make sure version 2 is in Paperless. False when the local copy can no longer be trusted."""
-        wanted = item.state["searchable_sha256"]
-        if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
-            return True
-        task_id = item.state.get("version_task")
-        if task_id:
-            try:
-                self.paperless.wait_for_task(task_id)
-            except PaperlessTaskFailed:
-                item.state["version_task"] = None
-                item.save()
-            if any(v.checksum == wanted for v in self.paperless.versions(doc_id)):
-                return True
-        try:
-            data = item.searchable_path.read_bytes()
-        except OSError:
-            return False
-        if sha256(data) != wanted:
-            return False
+        """Make sure the searchable version is in Paperless. False when the local copy can no longer be trusted."""
+        def remember(task):
+            if task:
+                item.event("uploaded_version", task=task)
+            item.state["version_task"] = task
+            item.save()
+
         stem = Path(item.state["original_name"]).stem
-        task_id = self.paperless.update_version(doc_id, f"{stem}.searchable.pdf", data, label=self.version_label())
-        item.event("uploaded_version", task=task_id)
-        item.state["version_task"] = task_id
-        item.save()
-        self.paperless.wait_for_task(task_id)
-        return True
+        return searchable.ensure_added(self.paperless, doc_id, item.state["searchable_sha256"],
+                                       item.searchable_path.read_bytes, f"{stem}.searchable.pdf", self.version_label(),
+                                       task=item.state.get("version_task"), remember=remember)
 
-    def _read_back(self, item: Item, doc_id: int, tag_ids: list[int], mode: str, *,
-                   later: bool = False) -> tuple[list[str], list[str]]:
-        """Problems mean the original isn't safely in Paperless. Warnings concern version 2 only.
-
-        later: the copy is being added to a document that was stored some time ago. Its owner
-        and tags are Jane's to have changed since, so they aren't checked.
-        """
+    def _read_back(self, item: Item, doc_id: int, tag_ids: list[int], mode: str) -> tuple[list[str], list[str]]:
+        """Problems mean the original isn't safely in Paperless. Warnings concern the searchable version only."""
         problems, warnings, record = [], [], {}
         versions = self.paperless.versions(doc_id)
         root = next((v for v in versions if v.is_root), None)
@@ -654,39 +609,21 @@ class Pipeline:
             if stored != item.sha:
                 problems.append("the original downloaded from Paperless doesn't match the scan byte for byte")
         document = self.paperless.document(doc_id)
-        if document.get("owner") is not None and not later:
+        if document.get("owner") is not None:
             warnings.append("the document still has an owner, so other Paperless users may not see it")
         present = set(document.get("tags") or [])
         for name, tag_id in zip((self.settings.physical_mail_tag, self.settings.intake_tag), tag_ids):
-            if tag_id not in present and not later:
+            if tag_id not in present:
                 warnings.append(f"the {name} tag is missing")
         if mode == WITH_GOOGLE and not problems:
-            wanted = item.state["searchable_sha256"]
-            version = next((v for v in versions if v.checksum == wanted and not v.is_root), None)
-            if version is None:
-                warnings.append("the searchable copy isn't among the document's versions")
-            else:
-                if versions[0].id != version.id:
-                    warnings.append("the searchable copy isn't the newest version, so search may not use Google's text")
-                stored = sha256(self.paperless.download_original(doc_id, version.id))
-                record["version_download_sha256"] = stored
-                if stored != wanted:
-                    warnings.append("the searchable copy in Paperless doesn't match byte for byte")
-                metadata = self.paperless.metadata(doc_id, version.id)
-                record["version_has_archive"] = metadata.get("has_archive_version")
-                if metadata.get("has_archive_version"):
-                    # Paperless leaves a PDF that has text alone only while its OCR mode is auto or
-                    # off and its archive file generation is auto or never. This is how the app
-                    # notices that one of them changed: by what Paperless did, not by what it is set to.
-                    warnings.append(f"{COPY_RESAVED} (see Paperless's OCR mode and archive file generation settings)")
-                google_text = (item.root / "text.txt").read_text(encoding="utf-8")
-                match = checks.text_matches(google_text, document.get("content") or "")
-                record["text_match"] = match
-                item.state["copy_reads_badly"] = not match["ok"]
-                if not match["ok"]:
-                    warnings.append(f"Paperless's search text differs from Google's "
-                                    f"({match['missing_words']} of {match['google_words']} words missing)")
-                record["version_id"] = version.id
+            google_text = (item.root / "text.txt").read_text(encoding="utf-8")
+            found, measured = searchable.read_back(self.paperless, doc_id, item.state["searchable_sha256"], google_text,
+                                                   versions=versions, document=document)
+            warnings.extend(found)
+            record.update(measured)
+            item.state["copy_in_paperless"] = "version_id" in measured
+            if "text_match" in measured:
+                item.state["copy_reads_badly"] = not measured["text_match"]["ok"]
         if mode == ORIGINAL_ONLY:
             # With Paperless's own OCR switched off, a scan that goes in without its copy has no text at all.
             item.state["paperless_read_it"] = bool((document.get("content") or "").strip())
@@ -695,13 +632,10 @@ class Pipeline:
         return problems, warnings
 
     def _ensure_note(self, item: Item, doc_id: int, mode: str, warnings: list[str]) -> None:
-        # A copy added to a document that already has its first note gets one more note, once.
-        later = bool(item.state.get("copy_note_needed")) and mode == WITH_GOOGLE
-        key = "copy_note_added" if later else "note_added"
-        if item.state.get(key):
+        if item.state.get("note_added"):
             return
         self.paperless.add_note(doc_id, self.note_text(item, mode, warnings))
-        item.state[key] = True
+        item.state["note_added"] = True
         item.save()
 
     def note_text(self, item: Item, mode: str, warnings: list[str]) -> str:
@@ -738,13 +672,6 @@ class Pipeline:
             lines.append(f"Google found almost no text, so only the original was stored{own}.")
         else:
             lines.append("Only the original was stored.")
-        if state.get("copy_note_needed") and mode == WITH_GOOGLE:
-            if state.get("copy_note_kind") == "rebuilt":
-                lines.append("The searchable copy was built again by a newer version of the app. An earlier note here "
-                             "describes the copy it replaced, which is still in the version history.")
-            else:
-                lines.append("The searchable copy was added after the document was first stored. An earlier note here "
-                             "says only the original was stored; that was true then.")
         if state.get("jane_decision") in {"keep", "keep_original"}:      # "keep_original" was 1.0's name for it
             lines.append(f"Kept as it is, by Jane's choice. Unresolved: {state.get('held_reason')}.")
         if warnings:
@@ -811,45 +738,10 @@ class Pipeline:
         return item.state.get("captured_at") or ""
 
     def _hold(self, item: Item, reason: str, kind: str) -> None:
-        if item.state.get("copy_added_later"):
-            self._back_to_committed(item, reason)       # it is in Paperless; there is no paper to keep
-            return
         item.set(HELD, reason=reason, reason_kind=kind, held_reason=reason, held_at=iso(self.clock()))
         self._finish(item, alert_kind="held")
 
-    def _back_to_committed(self, item: Item, why: str, *, again: bool = False) -> None:
-        """A document already in Paperless couldn't be given its copy this time. Leave it as it was.
-
-        Adding the copy later is a favour to a document that is already safe. Whatever
-        goes wrong while trying must not turn that document into a held or waiting scan,
-        and must not tell Jane anything: she was told when it first went in without a copy.
-
-        again: the cause was outside the scan (Google or Paperless unreachable, disk low), so
-        the next start of this same version may try once more, up to COPY_RETRIES times.
-        """
-        was = item.state.get("copy_retry_restore") or {}
-        item.event("copy_retry_stopped", reason=why, again=again)
-        log.warning("%s: its searchable copy couldn't be added this time (%s); the document stays as it was",
-                    item.sha[:12], why)
-        kept = {key: was[key] for key in RESTORED if key in was}        # what described the copy that is stored
-        kept.setdefault("mode", ORIGINAL_ONLY)
-        kept.setdefault("copy_not_built", True)
-        item.set(was.get("status") or COMMITTED_WARNING, **kept,
-                 copy_added_later=False, copy_note_needed=False, copy_retry_previous_reason=None,
-                 copy_retry_restore=None,
-                 copy_retry_by=None if again else __version__,
-                 prepared_by=None if again else item.state.get("prepared_by"),
-                 # A new Google run for the next try, as a waiting scan gets: this run's retry budget is spent.
-                 google_run=int(item.state.get("google_run", 1)) + (1 if again else 0),
-                 waiting_since_unix=None, alerted_reason_kind=None)
-
     def _wait(self, item: Item, wait: Wait) -> None:
-        if item.state.get("copy_added_later"):
-            # Nothing is waiting to get into Paperless here, at either stage. See _back_to_committed.
-            # An unexpected error while committing may have come after the new copy was uploaded.
-            # Trying again at the next start finishes the job: the same copy is found, not uploaded twice.
-            self._back_to_committed(item, wait.reason, again=wait.kind != "unexpected" or wait.stage == "commit")
-            return
         since = float(item.state.get("waiting_since_unix") or self.clock())
         if self.clock() - since > self.settings.retry_hours * 3600:
             item.state["waiting_since_unix"] = None
@@ -915,83 +807,57 @@ class Pipeline:
                          item.state.get("held_reason"))
         return requeued
 
-    def retry_copies(self) -> list[str]:
-        """Prepare again what an earlier version of the app prepared, where that can help.
+    def reprepare_unfinished(self) -> list[str]:
+        """When a new release starts, put scans that haven't reached Paperless yet back through the checks.
 
-        Two cases. A scan that hasn't finished going into Paperless is prepared again by
-        every new version. A scan already in Paperless is prepared again only if the
-        earlier version couldn't build its searchable copy.
-
-        The original scan is the evidence and the copy is made from it, so the copy can be
-        made again for as long as the local scan is kept. A scan still on its way into
-        Paperless goes back one step and carries on from there. A scan already in Paperless
-        gets the copy added as a new version of the same document, with a note.
-
-        Each version of the app tries once. When the try is cut short by something outside
-        the scan (Google or Paperless unreachable), the next start tries again, COPY_RETRIES
-        times at most. Only failures in the app's own handling are retried, not scans Google
-        itself refused.
+        They get the newer handling, and Google's saved answer is reused. A scan whose
+        original has already been handed to Paperless is not prepared again: it finishes
+        going in with the searchable copy it has, and the documents loop improves that
+        later if it needs it.
         """
-        retried = []
+        again = []
         for item in self.store.all():
             state = item.state
-            if __version__ in {state.get("prepared_by"), state.get("copy_retry_by")}:
+            if state.get("prepared_by") in {None, __version__}:
                 continue
             in_flight = item.status in {READY, COMMITTING} or (item.status == WAITING
                                                                 and state.get("retry_stage") == "commit")
-            ours = state.get("copy_not_built") or str(state.get("no_google_copy_reason") or "").startswith(
-                "the searchable copy couldn't be built")            # 1.1.0 recorded only the sentence
-            # 1.1.2 recorded a copy that read back badly only as the sentence in its warning.
-            reads_badly = bool(state.get("copy_reads_badly")) or "search text differs" in str(state.get("reason") or "")
-            # A scan that hasn't finished going in is always prepared again by a new version, so it
-            # gets the newer handling. Google's saved answer is reused when there is one. A scan that
-            # is already in Paperless is touched only when the fault was the app's: it has no copy,
-            # or it has one that Paperless couldn't read all the words of.
-            if not in_flight and not reads_badly and (state.get("mode") != ORIGINAL_ONLY or not ours):
+            if not in_flight or state.get("doc_id") or state.get("upload_task"):
                 continue
-            tries = state.get("copy_retries") or {}
-            count = int(tries.get("count", 0)) if tries.get("version") == __version__ else 0
-            if count >= COPY_RETRIES:
-                continue
-            committed = item.status in {COMMITTED, COMMITTED_WARNING} and bool(state.get("doc_id"))
-            if not (in_flight or committed) or not item.source_path.exists():
-                continue
-            item.event("copy_retry", by=__version__, was=state.get("no_google_copy_reason"))
-            restore = {key: state.get(key) for key in RESTORED}
-            # Keep what the earlier try recorded: the new try writes these files again.
-            earlier = str(state.get("prepared_by") or "earlier-version")
-            for name in ("checks.json", "google-summary.json.gz"):
+            earlier = str(state.get("prepared_by"))
+            for name in ("checks.json", "google-summary.json.gz"):      # keep what the earlier try recorded
                 path = item.root / name
                 kept = item.root / f"{name.split('.')[0]}.by-{earlier}.{name.split('.', 1)[1]}"
                 if path.exists() and not kept.exists():
                     shutil.copy2(path, kept)
-            # An unfinished try to add a copy to a document that is already in Paperless (the app
-            # was restarted part way) is still that: it keeps what was recorded when it began.
-            resumed = not committed and bool(state.get("copy_added_later"))
-            item.set(CAPTURED, copy_retry_by=__version__, copy_added_later=committed or resumed,
-                     copy_retries={"version": __version__, "count": count + 1},
-                     # A first note already says only the original was stored, so the copy needs its own.
-                     copy_note_needed=bool(state.get("copy_note_needed")) or (bool(state.get("note_added")) and (
-                         state.get("mode") == ORIGINAL_ONLY or (committed and reads_badly))),
-                     copy_note_kind=state.get("copy_note_kind") if resumed else (
-                         "added" if state.get("mode") == ORIGINAL_ONLY else "rebuilt"),
-                     copy_note_added=bool(state.get("copy_note_added")) if resumed else False,
-                     copy_retry_previous_reason=state.get("reason") if committed else (
-                         state.get("copy_retry_previous_reason") if resumed else None),
-                     copy_retry_restore={"status": item.status, **restore} if committed else (
-                         state.get("copy_retry_restore") if resumed else None),
-                     waiting_since_unix=None, alerted_reason_kind=None)
-            retried.append(item.sha)
-            if state.get("no_google_copy_reason"):
-                log.info("%s has no searchable copy from an earlier version (%s); building it again", item.sha[:12],
-                         state.get("no_google_copy_reason"))
-            elif committed:
-                log.info("%s has a searchable copy that Paperless couldn't read all of (%s); building it again",
-                         item.sha[:12], state.get("reason"))
-            else:
-                log.info("%s was prepared by an earlier version and hasn't finished going in; preparing it again",
-                         item.sha[:12])
-        return retried
+            item.event("prepared_again", by=__version__, was_by=earlier)
+            item.set(CAPTURED, waiting_since_unix=None, alerted_reason_kind=None)
+            again.append(item.sha)
+            log.info("%s was prepared by release %s and hasn't reached Paperless; preparing it again",
+                     item.sha[:12], earlier)
+        return again
+
+    def settle_old_states(self) -> list[str]:
+        """Scan records an earlier release left part-way through re-doing a stored document's copy.
+
+        Releases before 1.3.0 re-did a stored document's searchable copy by moving its scan
+        record back to "captured" with a snapshot to restore. That is the documents loop's job
+        now. Any record still in that state is put back as it was when it was committed.
+        """
+        settled = []
+        for item in self.store.all():
+            state = item.state
+            if not (state.get("copy_added_later") or state.get("copy_retry_restore")) or not state.get("doc_id"):
+                continue
+            was = dict(state.get("copy_retry_restore") or {})
+            status = was.pop("status", None) or COMMITTED_WARNING
+            was.setdefault("mode", ORIGINAL_ONLY)
+            was.setdefault("copy_not_built", True)
+            item.event("old_state_settled", by=__version__, status=status)
+            item.set(status, **was, copy_added_later=False, copy_note_needed=False, copy_retry_restore=None,
+                     copy_retry_previous_reason=None, waiting_since_unix=None, alerted_reason_kind=None)
+            settled.append(item.sha)
+        return settled
 
     def can_retry(self, item: Item) -> bool:
         return item.status == WAITING or (item.status == HELD and item.state.get("reason_kind") == "gave_up")

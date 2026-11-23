@@ -35,6 +35,44 @@ class FakePaperless:
         self.calls: list[str] = []
         self.own_ocr = True          # False: Paperless's OCR mode is off, so a raw scan gets no text
         self.archive_everything = False    # True: archive file generation is "always", even for a PDF with text
+        self.me = 7                  # the app's own Paperless user; it sees its own documents and unowned ones
+
+    def add_foreign(self, data: bytes, *, name="upload.pdf", owner=None, tags=(), pages=None) -> int:
+        """A document that reached Paperless some other way than through the app."""
+        doc_id = next(self.ids)
+        if pages is None:
+            try:
+                pages = len(PdfReader(io.BytesIO(data)).pages)
+            except Exception:
+                pages = None
+        own_text = self._text(data) if data.startswith(b"%PDF-") else ""
+        has_text = len(" ".join(own_text.split())) > 50
+        self.docs[doc_id] = {"tags": list(tags), "notes": [], "owner": owner, "created": None, "name": name,
+                             "pages": pages, "versions": [
+            {"id": doc_id, "checksum": hashlib.sha256(data).hexdigest(), "label": None, "data": data,
+             "archive": self.own_ocr and not has_text,
+             "content": own_text if has_text else ("TESSERACT TEXT" if self.own_ocr else "")}]}
+        return doc_id
+
+    def _visible(self, doc_id) -> bool:
+        return doc_id in self.docs and self.docs[doc_id]["owner"] in {None, self.me}
+
+    def _missing(self, doc_id):
+        return PaperlessError(f"Paperless GET /api/documents/{doc_id}/ returned HTTP 404")
+
+    def documents(self):
+        self._check("documents")
+        return [{"id": doc_id, "tags": doc["tags"], "page_count": doc.get("pages"),
+                 "original_file_name": doc.get("name"),
+                 "versions": [{"id": v["id"], "checksum": v["checksum"], "version_label": v["label"],
+                               "is_root": v["id"] == doc_id} for v in doc["versions"]]}
+                for doc_id, doc in sorted(self.docs.items()) if self._visible(doc_id)]
+
+    def notes(self, doc_id):
+        self._check("notes")
+        if not self._visible(doc_id):
+            raise self._missing(doc_id)
+        return [{"note": text} for text in self.docs[doc_id]["notes"]]
 
     def _check(self, name):
         self.calls.append(name)
@@ -82,7 +120,8 @@ class FakePaperless:
             self.tasks[task] = {"status": "failure", "result": "Not consuming: It is a duplicate"}
         else:
             doc_id = next(self.ids)
-            self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "owner": 7, "created": created, "versions": [
+            self.docs[doc_id] = {"tags": list(tag_ids), "notes": [], "owner": self.me, "created": created,
+                                 "name": filename, "pages": None, "versions": [
                 {"id": doc_id, "checksum": sha, "label": None, "data": data, "archive": self.own_ocr,
                  "content": "TESSERACT TEXT" if self.own_ocr else ""}]}
             self.tasks[task] = {"status": "success", "related_document": doc_id}
@@ -93,6 +132,8 @@ class FakePaperless:
 
     def update_version(self, doc_id, filename, data, *, label):
         self._check("update_version")
+        if not self._visible(doc_id):
+            raise self._missing(doc_id)
         text = self._text(data)
         short = len(" ".join(text.split())) <= 50
         version_id = next(self.ids)
@@ -119,15 +160,15 @@ class FakePaperless:
 
     def versions(self, doc_id):
         self._check("versions")
-        if doc_id not in self.docs:
-            raise PaperlessError(f"Paperless GET /api/documents/{doc_id}/ returned HTTP 404")
+        if not self._visible(doc_id):
+            raise self._missing(doc_id)
         root_id = doc_id
         return [Version(v["id"], v["checksum"], v["label"], v["id"] == root_id) for v in self.docs[doc_id]["versions"]]
 
     def document(self, doc_id):
         self._check("document")
-        if doc_id not in self.docs:
-            raise PaperlessError(f"Paperless GET /api/documents/{doc_id}/ returned HTTP 404")
+        if not self._visible(doc_id):
+            raise self._missing(doc_id)
         doc = self.docs[doc_id]
         return {"id": doc_id, "tags": doc["tags"], "owner": doc["owner"], "content": doc["versions"][0]["content"],
                 "versions": [{"id": v["id"], "checksum": v["checksum"]} for v in doc["versions"]]}
@@ -147,7 +188,12 @@ class FakePaperless:
 
     def add_note(self, doc_id, text):
         self._check("add_note")
+        if not self._visible(doc_id):
+            raise self._missing(doc_id)
         self.docs[doc_id]["notes"].append(text)
+        if "add_note" in self.crash_after:
+            self.crash_after.discard("add_note")
+            raise Crash("after add_note")
 
 
 class RecordingNotifier:

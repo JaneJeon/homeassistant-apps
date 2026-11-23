@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 
 from .config import Settings
+from .documents import Documents
 from .google_auth import ServiceAccountTokenProvider
 from .notify import Notifier
 from .paperless import Paperless
@@ -21,6 +22,7 @@ class App:
     store: Store
     notifier: Notifier
     pipeline: Pipeline
+    documents: Documents
 
 
 def build(settings: Settings, *, announce: bool = False) -> App:
@@ -36,4 +38,6 @@ def build(settings: Settings, *, announce: bool = False) -> App:
     notifier = Notifier(settings.ha_url, started=settings.webhook_started, finished=settings.webhook_finished,
                         alert=settings.webhook_alert)
     pipeline = Pipeline(settings, store, paperless, notifier, token_provider=token_provider)
-    return App(settings, store, notifier, pipeline)
+    documents = Documents(settings, store, paperless, pipeline, notifier)
+    pipeline.documents = documents
+    return App(settings, store, notifier, pipeline, documents)
