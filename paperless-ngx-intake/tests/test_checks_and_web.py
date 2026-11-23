@@ -175,6 +175,10 @@ class WebTests(unittest.TestCase):
         item.save()
         h.settle()
         self.assertIn("has since given it a searchable version that reads back right", page.render())
+        record = h.documents.load(item.state["doc_id"])
+        record.set("let_go", reason="it doesn't carry the Physical Mail tag")
+        self.assertIn("The Physical Mail tag has since been taken off, so the app has let the document go",
+                      page.render())
 
     def test_only_the_ingress_proxy_may_connect(self):
         h = Harness(self)

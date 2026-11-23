@@ -606,7 +606,7 @@ class OnlyWhatCameFromTheScannerTests(Base):
         self.assertEqual((len(doc["versions"]), doc["notes"], h.notifier.sent), (1, [], []))
         self.assertEqual(self.record(h, doc_id).status, LET_GO)
 
-    def test_a_scan_that_was_let_go_doesnt_use_up_the_limit_of_three(self):
+    def test_a_scan_that_was_let_go_still_counts_toward_the_limit_of_three(self):
         h = Harness(self)
         h.document_limit = 3
         h.build()
@@ -617,10 +617,52 @@ class OnlyWhatCameFromTheScannerTests(Base):
         others = [h.paperless.add_old_scan(make_scan(letter(1, f"old {n}")).pdf) for n in range(3)]
         for _ in range(4):
             look(h)
-        self.assertEqual([self.record(h, doc_id).status for doc_id in others], [DONE] * 3)
+        self.assertEqual([self.record(h, doc_id).status for doc_id in others[:2]], [DONE] * 2)
+        self.assertFalse(h.documents.exists(others[2]))                     # the one let go was counted
         h.paperless.docs[first]["tags"].append(h.paperless.tags["Physical Mail"])
-        look(h)                                                             # taken on once already, so the limit doesn't apply
+        for _ in range(2):
+            look(h)                                                         # counted already, so the limit doesn't stop it
         self.assertEqual(self.record(h, first).status, DONE)
+        self.assertFalse(h.documents.exists(others[2]))
+
+    def test_a_scan_let_go_after_its_version_went_in_is_finished_with_its_note_when_the_tag_comes_back(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(2)).pdf)
+        doc = h.paperless.docs[doc_id]
+        h.paperless.crash_after.add("update_version")
+        record = h.documents.step()
+        with self.assertRaises(Crash):                                      # the app dies just after Paperless took it
+            h.documents._work(record)
+        self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (WORKING, 2, 0))
+        self.take_the_tag_off(h, doc_id)
+        h.build()                                                           # the next start
+        h.settle()
+        self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (LET_GO, 2, 0))
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        look(h)
+        self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (DONE, 2, 1))
+
+    def test_a_tag_taken_off_while_google_reads_the_scan_is_honoured_before_anything_is_added(self):
+        h = Harness(self)
+        doc_id = h.paperless.add_old_scan(make_scan(letter(2)).pdf)
+        doc = h.paperless.docs[doc_id]
+        real = h.pipeline.make_copy
+
+        def copy_while_the_tag_is_taken_off(*args, **kwargs):
+            made = real(*args, **kwargs)
+            self.take_the_tag_off(h, doc_id)
+            h.pipeline.make_copy = real
+            return made
+
+        h.pipeline.make_copy = copy_while_the_tag_is_taken_off
+        h.settle()
+        self.assertEqual((len(doc["versions"]), doc["notes"], h.notifier.sent), (1, [], []))
+        self.assertEqual(self.record(h, doc_id).status, LET_GO)
+        asked = h.google.calls
+        h.paperless.docs[doc_id]["tags"].append(h.paperless.tags["Physical Mail"])
+        look(h)
+        self.assertEqual((self.record(h, doc_id).status, len(doc["versions"]), len(doc["notes"])), (DONE, 2, 1))
+        self.assertEqual(h.google.calls, asked)                             # the copy it built was kept
 
     def test_the_app_asks_paperless_only_for_documents_with_the_physical_mail_tag(self):
         h = Harness(self)

@@ -358,7 +358,7 @@ class Documents:
         let_go = {record.doc_id: record for record in records if record.status == LET_GO}
         known = {record.doc_id for record in records if record.status != LET_GO}
         started = sum(1 for record in records if record.state.get("source") == "paperless"
-                      and record.status not in {NOT_NEEDED, LET_GO} and record.state.get("kind") != "not_pdf")
+                      and record.status != NOT_NEEDED and record.state.get("kind") != "not_pdf")
         for row in sorted(rows, key=lambda row: int(row["id"])):
             doc_id = int(row["id"])
             if doc_id in known:
@@ -369,9 +369,9 @@ class Documents:
                 continue                                  # no Physical Mail tag: not this app's, and nothing else decides
             if doc_id in let_go:
                 # Let go when its tag was taken off, and the tag is back. What the record knows is kept.
-                # It was taken on once already, so the limit on new documents doesn't apply to it again.
+                # It was counted once already, so the limit on new documents doesn't apply to it again.
+                # The wait before the next look is kept, so this can happen at most once every five minutes.
                 log.info("document %s carries the Physical Mail tag again; taking it on again", doc_id)
-                self._look_again_at = 0.0
                 return let_go[doc_id]
             versions = row.get("versions") or []
             root = next((version for version in versions if version.get("is_root")), None)
@@ -426,7 +426,10 @@ class Documents:
             self._finish(record, GAVE_UP, str(outcome))
         except NotOurs as outcome:
             # Not an outcome of the work: the tag is gone. No alert, and nothing is written to Paperless.
-            self._finish(record, LET_GO, str(outcome))
+            # The working files and what the record knows are kept, not tidied. If the tag comes back,
+            # the work goes on from where it stopped, so a version that is already in still gets its note.
+            record.set(LET_GO, reason=str(outcome))
+            log.info("%s %s: %s", record.label, WORDS[LET_GO], outcome)
         except NextRelease as outcome:
             self._finish(record, NEXT_RELEASE, str(outcome))
         except NotToday as outcome:
@@ -483,17 +486,9 @@ class Documents:
         if not self.pipeline.version_accepted(live):
             raise Later(f"Paperless is {live}, but the app was tested on {self.settings.tested_paperless_version}")
 
-        # 1. The document as Paperless has it now. Fetched once, and checked for the tag before anything
-        #    is downloaded: the tag may have been taken off since the app last worked on it.
-        try:
-            document = self.paperless.document(doc_id)
-        except PaperlessError as error:
-            if "HTTP 404" in str(error):
-                raise GiveUp("the document is no longer in Paperless, or the app may no longer see it")
-            raise Later(str(error))
-        from_the_scanner = self._ask(lambda: self.paperless.tag_id(self.settings.physical_mail_tag))
-        if from_the_scanner not in (document.get("tags") or []):
-            raise NotOurs("it doesn't carry the Physical Mail tag")
+        # 1. The document as Paperless has it now, checked for the tag before anything is downloaded:
+        #    the tag may have been taken off since the app last worked on it.
+        document = self._still_ours(doc_id)
         versions = Paperless.versions_in(document)
         root = next((version for version in versions if version.is_root), None)
         if root is None:
@@ -591,6 +586,7 @@ class Documents:
             record.save()
 
         stem = Path(record.state.get("original_name") or f"document-{doc_id}").stem
+        self._still_ours(doc_id)            # again, because Google's reading can take minutes
         try:
             added = searchable.ensure_added(self.paperless, doc_id, pending, record.copy_path.read_bytes,
                                             f"{stem}.searchable.pdf", self.pipeline.version_label(),
@@ -624,6 +620,19 @@ class Documents:
                 self._close_alert(record)
             except Exception:       # the work is done and recorded; a message that didn't go out can't undo it
                 log.exception("couldn't close the earlier alert about %s", record.label)
+
+    def _still_ours(self, doc_id: int) -> dict:
+        """The document as Paperless has it now. NotOurs if it no longer carries the Physical Mail tag."""
+        try:
+            document = self.paperless.document(doc_id)
+        except PaperlessError as error:
+            if "HTTP 404" in str(error):
+                raise GiveUp("the document is no longer in Paperless, or the app may no longer see it")
+            raise Later(str(error))
+        from_the_scanner = self._ask(lambda: self.paperless.tag_id(self.settings.physical_mail_tag))
+        if from_the_scanner not in (document.get("tags") or []):
+            raise NotOurs("it doesn't carry the Physical Mail tag")
+        return document
 
     def _ask(self, call):
         """A call to Paperless whose failing only means: try this document again later."""

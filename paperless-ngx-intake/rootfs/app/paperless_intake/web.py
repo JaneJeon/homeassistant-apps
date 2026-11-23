@@ -95,6 +95,9 @@ class Page:
         if documents is None or not doc_id or not documents.exists(doc_id):
             return ""
         record = documents.load(doc_id)
+        if record.status == "let_go":
+            return (". <span class='muted'>The Physical Mail tag has since been taken off, so the app has let "
+                    "the document go.</span>")
         if record.state.get("by") in {None, item.state.get("prepared_by")}:
             return ""
         if record.status == "done":
@@ -114,7 +117,7 @@ class Page:
         parts = ["<h2>Scans stored before this app</h2>",
                  "<p class='muted'>Scans the app found already stored in Paperless: the ones from before this "
                  "app. One with no text in it gets a searchable version from Google. One that already "
-                 "has text is left as it is. Documents without the tag are never looked at. "
+                 "has text is left as it is. Documents without the tag are left alone. "
                  "Nothing here needs you.</p>"]
         if not records:
             return parts + ["<p class='muted'>None looked at yet.</p>"]
