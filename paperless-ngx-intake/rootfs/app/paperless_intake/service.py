@@ -44,8 +44,14 @@ class SubprocessRunner:
     env: dict | None = None
 
     def __call__(self, item) -> int:
+        return self._run(item.sha)
+
+    def document(self, record) -> int:
+        return self._run("document", str(record.doc_id))
+
+    def _run(self, *arguments: str) -> int:
         try:
-            return subprocess.run([*self.command, item.sha], timeout=self.timeout_seconds, env=self.env,
+            return subprocess.run([*self.command, *arguments], timeout=self.timeout_seconds, env=self.env,
                                   check=False).returncode
         except subprocess.TimeoutExpired:
             return TIMED_OUT
@@ -62,6 +68,7 @@ class Service:
     notifier: Notifier
     clock: callable = now
     runner: callable = None        # None: work in this process (the tests); SubprocessRunner in the app
+    documents: object = None       # the documents loop (documents.py); None switches it off
     lock: threading.RLock = field(default_factory=threading.RLock)
     _seen: dict = field(default_factory=dict)
     _last_tidy: float = 0.0
@@ -137,7 +144,7 @@ class Service:
             self.claim_captures()
             item = self.next_item()
             if item is None:
-                return False
+                return self._step_documents()      # stored documents get a turn only when no scan is waiting
             log.info("working on %s (%s)", item.sha[:12], item.status)
             if self.runner is None:
                 self.pipeline.run(item)
@@ -149,6 +156,26 @@ class Service:
             log.info("%s is now %s%s", item.sha[:12], item.status,
                      f": {item.state.get('reason')}" if item.state.get("reason") else "")
             return True
+
+    def _step_documents(self) -> bool:
+        """Work on one document that is already in Paperless, if one needs it. True if one was worked on."""
+        if self.documents is None:
+            return False
+        record = self.documents.step()
+        if record is None:
+            return False
+        log.info("working on %s", record.label)
+        if self.runner is None:
+            self.documents.run(record)
+        else:
+            code = self.runner.document(record)
+            record = self.documents.load(record.doc_id)
+            if code != 0:
+                self.documents.worker_stopped(record, code)
+        record = self.documents.load(record.doc_id)
+        log.info("%s is now %s%s", record.label, record.status,
+                 f": {record.state.get('reason')}" if record.state.get("reason") else "")
+        return True
 
     # Tidy -------------------------------------------------------------------------
 

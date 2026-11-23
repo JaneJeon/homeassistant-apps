@@ -29,11 +29,18 @@ def main() -> int:
     requeued = app.pipeline.requeue_obsolete_holds()
     if requeued:
         log.info("checking %d scan(s) again that an earlier version held", len(requeued))
-    retried = app.pipeline.retry_copies()
-    if retried:
-        log.info("building the searchable copy again for %d scan(s)", len(retried))
+    settled = app.pipeline.settle_old_states()
+    if settled:
+        log.info("put %d scan record(s) back as they were before an earlier release began re-doing them", len(settled))
+    adopted = app.documents.adopt_scans()
+    if adopted:
+        log.info("wrote document records for %d scan(s) stored by earlier releases", adopted)
+    again = app.pipeline.reprepare_unfinished()
+    if again:
+        log.info("preparing %d scan(s) again that hadn't reached Paperless", len(again))
     # Each scan's work runs in a child process, so its memory goes back when it's done.
-    service = Service(settings, app.store, app.pipeline, app.notifier, runner=SubprocessRunner())
+    service = Service(settings, app.store, app.pipeline, app.notifier, runner=SubprocessRunner(),
+                      documents=app.documents)
     server = serve(Page(service, app.pipeline, settings), settings.web_port, settings.web_allowed_clients)
     log.info("paperless-intake %s watching %s; tested Paperless version %s", __version__, settings.capture_dir,
              settings.tested_paperless_version)

@@ -79,13 +79,57 @@ class Page:
                 f"{html.escape(i.state.get('original_name', ''))}: {i.state.get('page_count')} pages, "
                 f"<span class='{'ok' if i.status == COMMITTED else 'gap'}'>"
                 f"{'committed' if i.status == COMMITTED else 'committed with a warning: ' + html.escape(i.state.get('reason') or '')}"
-                f"</span>, document {i.state.get('doc_id')}" for i in done[:15]) + "</div>")
+                f"</span>, document {i.state.get('doc_id')}{self._since(i)}" for i in done[:15]) + "</div>")
         else:
             parts.append("<p class='muted'>Nothing yet.</p>")
+        parts += self._other_documents()
         parts.append("</main>")
         return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,"
                 f"initial-scale=1'><title>Mail intake</title><style>{STYLE}</style></head><body>{''.join(parts)}"
                 f"</body></html>")
+
+    def _since(self, item) -> str:
+        """What has happened to a scan's document since the scan went in, if anything has."""
+        documents = getattr(self.service, "documents", None)
+        doc_id = item.state.get("doc_id")
+        if documents is None or not doc_id or not documents.exists(doc_id):
+            return ""
+        record = documents.load(doc_id)
+        if record.state.get("by") in {None, item.state.get("prepared_by")}:
+            return ""
+        if record.status == "done":
+            return (f". <span class='ok'>Release {html.escape(str(record.state['by']))} has since given it "
+                    f"a searchable version that reads back right.</span>")
+        if record.status in {"next_release", "gave_up"}:
+            return (f". <span class='muted'>Release {html.escape(str(record.state['by']))} tried again for its "
+                    f"searchable version: {html.escape(record.state.get('reason') or 'no reason recorded')}.</span>")
+        return ""
+
+    def _other_documents(self) -> list[str]:
+        """Documents that didn't come through the scanner's folder: what the app has done about each."""
+        documents = getattr(self.service, "documents", None)
+        if documents is None:
+            return []
+        records = [record for record in documents.all() if record.state.get("source") == "paperless"]
+        parts = ["<h2>Other documents in Paperless</h2>",
+                 "<p class='muted'>Documents that came in another way than the scanner's folder, and everything "
+                 "stored before this app. Each is looked at once. A scanned one gets a searchable version from "
+                 "Google. Anything else is left as it is. Nothing here needs you.</p>"]
+        if not records:
+            return parts + ["<p class='muted'>None looked at yet.</p>"]
+        count = lambda *statuses: sum(1 for record in records if record.status in statuses)  # noqa: E731
+        parts.append(f"<div class='card'>{len(records)} looked at. "
+                     f"{count('done')} given a searchable version. "
+                     f"{count('not_needed')} left as they are, with nothing for Google to read. "
+                     f"{count('next_release')} left for the next release of the app. "
+                     f"{count('gave_up')} can't be done. "
+                     f"{count('later', 'working')} in progress.</div>")
+        open_ones = [record for record in records if record.status in {"next_release", "gave_up", "later"}]
+        if open_ones:
+            parts.append("<div class='card'>" + "<br>".join(
+                f"Document {record.doc_id}: {html.escape(record.state.get('reason') or record.status)}"
+                for record in open_ones[:25]) + "</div>")
+        return parts
 
     def _card(self, item, css: str) -> str:
         sha = item.sha

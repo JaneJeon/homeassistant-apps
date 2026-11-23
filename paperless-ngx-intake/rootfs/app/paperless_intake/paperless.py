@@ -75,13 +75,28 @@ class Paperless:
             raise PaperlessError(f"Expected exactly one tag named {name!r}, found {len(results)}")
         return int(results[0]["id"])
 
-    def find_by_checksum(self, sha256: str) -> int | None:
-        response = self._request("GET", "/api/documents/", params={"checksum__iexact": sha256, "fields": "id"})
-        results = response.json().get("results", [])
-        return int(results[0]["id"]) if results else None
+    def find_by_checksum(self, sha256: str, *, with_tag: int | None = None) -> int | None:
+        """A document whose first file is this one. with_tag: only one that also carries this tag."""
+        response = self._request("GET", "/api/documents/", params={"checksum__iexact": sha256, "fields": "id,tags"})
+        for row in response.json().get("results", []):
+            if with_tag is None or with_tag in (row.get("tags") or []):
+                return int(row["id"])
+        return None
 
     def document(self, doc_id: int) -> dict:
         return self._request("GET", f"/api/documents/{doc_id}/").json()
+
+    def documents(self) -> list[dict]:
+        """Every document this user can see, without its text: id, tags, versions, page count and file name."""
+        rows, page = [], 1
+        while True:
+            body = self._request("GET", "/api/documents/", params={
+                "page": page, "page_size": 100, "ordering": "id",
+                "fields": "id,tags,versions,page_count,original_file_name"}).json()
+            rows.extend(body.get("results") or [])
+            if not body.get("next"):
+                return rows
+            page += 1
 
     def versions(self, doc_id: int) -> list[Version]:
         return [Version(int(v["id"]), v.get("checksum"), v.get("version_label"), bool(v.get("is_root")))

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0
+
+Until now the app only saw the scanner's folder. Anything that reached Paperless another way never met it, and with Paperless's own OCR switched off such a document had no search text at all. The same went for everything stored before the app existed.
+
+- **Every document in Paperless is looked after, however it arrived.** Every five minutes the app asks Paperless what it holds. A scanned PDF it hasn't met gets a searchable version made the same way as for a scan, added as the newest version with a note. A PDF that already has text is left exactly as it is. A file that isn't a PDF waits for a version that can read images. Version 1 of a document is never changed, nor its owner, tags, date or title.
+- **One record per document** says what was done, by which version of the app, or why nothing was. Every document ends as done, not needed, gave up, or left for the next version of the app. The Mail intake page lists them.
+- **A stored document is never held and never alerts.** A page that looks missing goes into its note.
+- **Re-doing a searchable copy is the same loop.** A copy Paperless couldn't read all the words of, or one the app failed to build, is tried once by each new version of the app, working from version 1 as Paperless holds it. It no longer depends on the local scan still being kept. The old way of doing this (moving the scan's own record backwards with a snapshot to restore) is gone, and scan records left in that state are put back as they were.
+- **One owner at a time.** A scan's document belongs to the scan until the scan has finished going in, and to the loop from then on. The loop leaves alone any document that an unfinished scan is still putting in, and any document with a file version somebody else added.
+- **A scan takes for its own only a document the app stored.** Before, a scan whose file was already in Paperless by another route adopted that document, cleared its owner and added to it. Now the scan becomes a document of its own, and Paperless flags the two as duplicates.
+- **A scan cut short just after its note was written no longer gets a second note.** The app looks for the note before writing it.
+- **Scans go first, and keep room.** Stored documents are worked on one at a time, only when no scan is waiting, and use at most three quarters of the day's Google page cap. One that doesn't fit today waits for tomorrow.
+- **This version starts on three documents only** from outside the scanner's folder, so the result can be looked at in Paperless before the rest follow. The next version removes the limit.
+- A document the app's Paperless user can't see (one that has an owner, such as a web upload) is not covered. DOCS.md says how to share such documents with the app.
+- New end-to-end tests: a raw scan from Paperless's own consume folder gets its searchable version with nothing else about it changed and no ingest webhook fired; a PDF with text is left alone; an owned document is invisible until shared; a scan that is half way in is left to the scan; the same file by two routes is two documents.
+
 ## 1.2.0
 
 Google is meant to be the only reader. Paperless still read every raw scan itself with Tesseract, and that second reading showed in two places: the document's date, and what Paperless displays as version 1 (its own turned and cleaned rendition, not the scan). This version makes the app ready for Paperless with its own OCR switched off.
