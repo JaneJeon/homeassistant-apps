@@ -185,46 +185,59 @@ def snapshot_tree(root):
     return entries
 
 
-def copy_vl_snapshot(source, dest, payload):
+def link_vl_snapshot(source, dest, payload):
+    """Stage a frozen native snapshot and hash each payload inode once."""
     before = snapshot_tree(source)
-    pending = {path: info for path, info in before.items() if stat.S_ISREG(info.st_mode)}
-    if not pending:
-        raise ValueError(f'empty snapshot source: {source}')
     files = []
-
-    def copy_file(src, dst):
-        src, dst = Path(src), Path(dst)
-        expected = pending.pop(src.relative_to(source), None)
-        if expected is None:
-            raise ValueError(f'snapshot source changed: {src}')
-        digest = hashlib.sha256()
-        size = 0
-        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'rb') as reader, dst.open('xb') as writer:
-            if snapshot_metadata(os.fstat(fd)) != snapshot_metadata(expected):
-                raise ValueError(f'snapshot source changed: {src}')
-            for chunk in iter(lambda: reader.read(1024 * 1024), b''):
-                written = writer.write(chunk)
-                if written != len(chunk):
-                    raise OSError(f'short snapshot write: {dst}')
-                digest.update(chunk)
-                size += written
-        if size != expected.st_size:
-            raise ValueError(f'snapshot source changed: {src}')
-        shutil.copystat(src, dst, follow_symlinks=False)
+    expected = {}
+    directories = []
+    for relative, info in before.items():
+        src, dst = source / relative, dest / relative
+        key = dst.relative_to(payload)
+        if stat.S_ISDIR(info.st_mode):
+            dst.mkdir()
+            directories.append((src, dst))
+            continue
+        stamp = snapshot_metadata(info)
+        os.link(src, dst, follow_symlinks=False)
+        fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as reader:
+            if snapshot_metadata(os.fstat(fd)) != stamp:
+                raise ValueError(f'snapshot source changed while linking: {src}')
+            digest = hashlib.file_digest(reader, 'sha256').hexdigest()
+            if snapshot_metadata(os.fstat(fd)) != stamp:
+                raise ValueError(f'snapshot source changed while hashing: {src}')
+        expected[key] = stamp
         files.append({
-            'path': 'payload/' + dst.relative_to(payload).as_posix(),
-            'size': size,
-            'sha256': digest.hexdigest(),
+            'path': 'payload/' + key.as_posix(),
+            'size': info.st_size,
+            'sha256': digest,
         })
 
-    shutil.copytree(source, dest, symlinks=True, copy_function=copy_file)
+    if not files:
+        raise ValueError(f'empty snapshot source: {source}')
     after = snapshot_tree(source)
-    if (pending or before.keys() != after.keys()
+    if (before.keys() != after.keys()
             or any(snapshot_metadata(info) != snapshot_metadata(after[path])
                    for path, info in before.items())):
-        raise ValueError(f'snapshot source changed or copy incomplete: {source}')
-    return files
+        raise ValueError(f'snapshot source changed: {source}')
+    for src, dst in reversed(directories):
+        shutil.copystat(src, dst, follow_symlinks=False)
+        expected[dst.relative_to(payload)] = snapshot_metadata(dst.lstat())
+    return files, expected
+
+
+def verify_vl_payload(payload, expected):
+    entries = snapshot_tree(payload)
+    if {path: snapshot_metadata(info) for path, info in entries.items()} != expected:
+        raise ValueError('snapshot payload paths or file identity changed')
+    # Supervisor archives these inodes as regular files because other links to
+    # them are outside the included tree. A second included name would become
+    # a tar hardlink, which the B2 validator rejects.
+    inodes = [(info.st_dev, info.st_ino) for info in entries.values()
+              if stat.S_ISREG(info.st_mode)]
+    if len(inodes) != len(set(inodes)):
+        raise ValueError('multiple snapshot payload paths refer to the same file')
 
 
 def vl_snapshot_sources(reply, owned):
@@ -341,23 +354,30 @@ def export():
             phase_start = time.monotonic()
             sources = vl_snapshot_sources(reply, snapshots)
             partitions = sorted(sources)
-            (payload / 'partitions').mkdir()
+            partition_dir = payload / 'partitions'
+            partition_dir.mkdir()
             files = []
+            expected = {}
             for partition, source in sources.items():
-                dest = payload / 'partitions' / partition
-                files.extend(copy_vl_snapshot(source, dest, payload))
+                entries, metadata = link_vl_snapshot(source, partition_dir / partition, payload)
+                files.extend(entries)
+                expected.update(metadata)
+            expected[Path('partitions')] = snapshot_metadata(partition_dir.lstat())
+            expected[Path('.')] = snapshot_metadata(payload.lstat())
             files.sort(key=lambda item: item['path'])
-            timings['copy_and_hash_seconds'] = time.monotonic() - phase_start
+            timings['link_and_hash_seconds'] = time.monotonic() - phase_start
 
             phase_start = time.monotonic()
-            fsync_tree(staged)
-            timings['sync_seconds'] = time.monotonic() - phase_start
-
-            phase_start = time.monotonic()
-            if inventory(payload, onerror=raise_walk_error) != files:
-                raise ValueError('staged snapshot checksum mismatch')
+            verify_vl_payload(payload, expected)
             validate_native(payload)
             timings['staged_verify_seconds'] = time.monotonic() - phase_start
+            phase_start = time.monotonic()
+            # The engine syncs its snapshot files. Persist the new directory
+            # entries for our links, without syncing the data files again.
+            for path, stamp in expected.items():
+                if stat.S_ISDIR(stamp[0]):
+                    syncdir(payload / path)
+            timings['sync_seconds'] = time.monotonic() - phase_start
         if not files: raise ValueError('empty snapshot')
         phase_start = time.monotonic()
         manifest = dict(identity, generation=str(uuid.uuid4()), snapshot_started_at=started, snapshot_completed_at=completed, export_completed_at=now(), partitions=sorted(partitions), files=files)
@@ -368,9 +388,12 @@ def export():
         old = WORK / 'previous-backup'; remove(old)
         if BACKUP.exists(): os.rename(BACKUP, old); syncdir(DATA); syncdir(WORK)
         os.rename(staged, BACKUP); syncdir(DATA); syncdir(WORK)
-        published = validate_backup(onerror=raise_walk_error if ENGINE == 'victorialogs' else None)
-        if ENGINE == 'victorialogs' and published != manifest:
-            raise ValueError('published snapshot manifest mismatch')
+        if ENGINE == 'victorialogs':
+            verify_vl_payload(BACKUP / 'payload', expected)
+            if json.loads((BACKUP / 'manifest.json').read_text()) != manifest:
+                raise ValueError('published snapshot manifest mismatch')
+        else:
+            validate_backup()
         JOURNAL.unlink(); syncdir(DATA); remove(old)
         timings['publish_and_verify_seconds'] = time.monotonic() - phase_start
     finally:

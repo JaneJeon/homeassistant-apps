@@ -2,7 +2,7 @@
 
 ## 0.1.1
 
-Hash snapshots during the copy and verify the staged and published exports against the source checksums. Record elapsed time for each backup preparation phase.
+Stage immutable native snapshot files with hardlinks and hash each file once. Check the staged and published file layout and identity, and record elapsed time for each preparation phase. Home Assistant still archives the complete snapshot.
 
 ## 0.1.0
 
