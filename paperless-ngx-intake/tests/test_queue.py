@@ -518,6 +518,82 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(alert_kinds(h), ["held"])
 
 
+class Killed(BaseException):
+    """The whole app dies here."""
+
+
+class RestartBoundTests(unittest.TestCase):
+    """A job that keeps taking the app down is set aside, however the restarts are spaced."""
+
+    def test_a_wait_doesnt_read_as_a_step_forward(self):
+        from paperless_intake.jobs import Job, Queue
+        h = Harness(self)
+        h.drop(make_scan(letter(1)))
+        h.settle()
+        item = h.only_item()
+        state = dict(item.state, searchable_sha256="s", doc_id=None, upload_task=None, version_task=None)
+        marks = {Queue.progress(Job("scan", type(item)(item.root, dict(state, status=status, retry_stage=stage))))
+                 for status, stage in (("ready", None), ("committing", None), ("waiting", "commit"))}
+        self.assertEqual(len(marks), 1)
+        marks = {Queue.progress(Job("scan", type(item)(item.root, dict(state, status=status, retry_stage=stage))))
+                 for status, stage in (("captured", None), ("waiting", "ocr"))}
+        self.assertEqual(len(marks), 1)
+
+    def test_restarts_with_a_gate_hold_between_some_of_them_still_reach_the_bound(self):
+        h = Harness(self)
+
+        def dies(*args, **kwargs):
+            raise Killed("the app goes down as the scan goes into Paperless")
+        h.paperless.server_version = dies
+        h.drop(make_scan(letter(1)))
+        with self.assertRaises(Killed):
+            h.settle()
+        for n in range(3 * RESTART_BOUND):
+            if h.only_item().status == HELD:
+                break
+            h.restart()
+            if n % 2:                                                       # every other time the gate holds it first
+                h.green(available_mib=300)
+                h.service.step()
+                h.green(available_mib=2048)
+                h.clock.advance(RECHECK_SECONDS)
+            try:
+                h.service.step()                                            # dies, or the bound sets it aside
+            except Killed:
+                pass
+        item = h.only_item()
+        self.assertEqual((item.status, item.state["reason_kind"]), (HELD, "gave_up"))
+        self.assertIn(f"the app stopped {RESTART_BOUND} times", item.state["reason"])
+        self.assertEqual(alert_kinds(h), ["held"])
+
+    def test_a_scan_whose_upload_takes_the_app_down_is_set_aside_through_the_intent_hold(self):
+        h = Harness(self)
+        restarts = []
+
+        def dies(*args, **kwargs):
+            restarts.append(h.only_item().state["lease"]["restarts"])
+            raise Killed("the app goes down as the file goes out")
+        h.paperless.post_document = dies
+        h.drop(make_scan(letter(1)))
+        with self.assertRaises(Killed):
+            h.settle()
+        for _ in range(3 * RESTART_BOUND):
+            if h.only_item().status == HELD:
+                break
+            h.restart()
+            try:
+                for _ in range(10):                                         # the intent hold, then the scan again
+                    h.clock.advance(6 * 60)
+                    h.service.step()
+            except Killed:
+                pass
+        item = h.only_item()
+        self.assertEqual(item.status, HELD)
+        self.assertIn("Paperless never finished taking this file in (3 times)", item.state["reason"])
+        self.assertEqual(restarts, [0, 0, 1])                               # counted across the holds, not reset
+        self.assertEqual(alert_kinds(h), ["held"])
+
+
 class WebhookTests(unittest.TestCase):
     """started and finished stay paired across kills; alerts are owed until Home Assistant takes them."""
 

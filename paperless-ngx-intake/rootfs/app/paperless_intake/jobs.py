@@ -369,9 +369,12 @@ class Queue:
         """How far the job has got, from what its record says is done. Any change is a step forward."""
         state = job.record.state
         if job.kind == "scan":
-            marks = [job.record.status if job.record.status != WAITING else state.get("retry_stage"),
-                     state.get("searchable_sha256") or state.get("no_google_copy_reason"), state.get("upload_task"),
-                     state.get("doc_id"), state.get("version_task"), state.get("note_added")]
+            # One name for the stage whether the scan is waiting or not, so a wait in between (the gate
+            # holding it back) doesn't read as a step forward.
+            status = job.record.status
+            stage = state.get("retry_stage") if status == WAITING else "ocr" if status == CAPTURED else "commit"
+            marks = [stage, state.get("searchable_sha256") or state.get("no_google_copy_reason"),
+                     state.get("upload_task"), state.get("doc_id"), state.get("version_task"), state.get("note_added")]
         else:
             marks = [state.get("original_sha256"), state.get("kind"), state.get("pending_sha256"),
                      state.get("version_task"), len(state.get("added") or [])]
