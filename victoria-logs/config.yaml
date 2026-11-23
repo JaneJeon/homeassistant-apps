@@ -1,5 +1,5 @@
 name: VictoriaLogs
-version: "0.1.0"
+version: "0.1.1"
 slug: victoria-logs
 description: The simple, resource-efficient and fast logs database that scales
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/victoria-logs
