@@ -83,6 +83,18 @@ class Paperless:
     def document(self, doc_id: int) -> dict:
         return self._request("GET", f"/api/documents/{doc_id}/").json()
 
+    def documents(self) -> list[dict]:
+        """Every document this user can see, without its text: id, tags, versions, page count and file name."""
+        rows, page = [], 1
+        while True:
+            body = self._request("GET", "/api/documents/", params={
+                "page": page, "page_size": 100, "ordering": "id",
+                "fields": "id,tags,versions,page_count,original_file_name"}).json()
+            rows.extend(body.get("results") or [])
+            if not body.get("next"):
+                return rows
+            page += 1
+
     def versions(self, doc_id: int) -> list[Version]:
         return [Version(int(v["id"]), v.get("checksum"), v.get("version_label"), bool(v.get("is_root")))
                 for v in self.document(doc_id).get("versions") or []]

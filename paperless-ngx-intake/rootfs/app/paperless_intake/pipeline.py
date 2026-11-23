@@ -34,7 +34,7 @@ import re
 import logging
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -103,6 +103,20 @@ def _kinds(reason: str | None) -> set[str]:
     """The warnings in a reason, without the figures in brackets: what they are about, not how much."""
     kinds = {re.sub(r"\s*\(.*?\)", "", part).strip() for part in (reason or "").split("; ") if part.strip()}
     return {_EARLIER_WORDING.get(kind, kind) for kind in kinds}
+
+
+@dataclass
+class Made:
+    """What one try at a searchable copy came to: the copy, or the reason there is none."""
+
+    page_count: int
+    record: dict = field(default_factory=dict)      # what was measured, for checks.json
+    gap: str | None = None                          # a page the printed numbers say is missing
+    why_not: str | None = None                      # no copy: why, in plain words
+    ours: bool = False                              # ...and the fault was in this app's own handling
+    searchable: bytes | None = None
+    text: str | None = None
+    fields: dict = field(default_factory=dict)      # what was decided: order, turns, remarks
 
 
 COPY_RETRIES = 3            # tries per app version to add a copy an earlier version couldn't build
@@ -216,6 +230,10 @@ class Pipeline:
             return 0
         return int(usage.get(time.strftime("%Y-%m-%d", time.gmtime(self.clock())), 0))
 
+    def pages_today(self) -> int:
+        """Pages sent to Google so far today, by scans and by copy jobs together."""
+        return self._pages_today()
+
     def _count_pages(self, pages: int) -> None:
         day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
         try:
@@ -226,27 +244,61 @@ class Pipeline:
         write_atomic(self._usage_path(), json.dumps(usage).encode())
 
     def prepare(self, item: Item) -> None:
+        def seen(pages: int) -> None:
+            if item.state.get("page_count") != pages:
+                item.state["page_count"] = pages
+                item.save()
+
+        def started() -> Path:
+            item.event("ocr_started", google_run=item.state.get("google_run", 1))
+            return item.new_work_dir()
+
+        made = self.make_copy(item.source_path, lambda: self.backend_factory(item), started, item.sha[:12], seen)
+        if made.why_not:
+            self._ready_without_google(item, made.why_not, checks_record=made.record or None, gap=made.gap,
+                                       ours=made.ours)
+            return
+        write_atomic(item.searchable_path, made.searchable)
+        write_atomic(item.root / "text.txt", made.text.encode("utf-8"))
+        self._write_checks(item, made.record)
+        fields = dict(made.fields, no_google_copy_reason=None, copy_not_built=False, prepared_by=__version__,
+                      waiting_since_unix=None, alerted_reason_kind=None)
+        if made.gap and not self._settled(item):
+            # The searchable copy is ready, so "keep as it is" can commit both versions.
+            item.state.update(fields)
+            item.save()
+            raise Hold(made.gap, "missing_page")
+        item.set(READY, **fields)
+
+    def make_copy(self, source_path: Path, backend_for: Callable[[], object], work_dir_for: Callable[[], Path],
+                  label: str, on_pages: Callable[[int], None] | None = None) -> "Made":
+        """One try at the searchable copy of one file. It writes nothing about any document.
+
+        Used for a scan on its way in (prepare) and for a document that is already in
+        Paperless (jobs.py). Raises Hold when the file isn't a PDF the app can read, and
+        Wait when something outside the file is in the way (disk, the Google key, the
+        day's page cap, Google not answering). Otherwise returns what it made: the copy,
+        or the reason there is none.
+        """
         free_mib = shutil.disk_usage(self.settings.intake_dir).free // (1024 * 1024)
         if free_mib < self.settings.min_free_mib:
             raise Wait(f"only {free_mib} MiB free on the Green", "disk_low", "ocr")
         try:
-            source = inspect_source(item.source_path)
+            source = inspect_source(source_path)
         except ParserError as error:
             raise Hold(f"this isn't a PDF the app can read ({error})", "unsupported_file")
-        if item.state.get("page_count") != source.page_count:
-            item.state["page_count"] = source.page_count
-            item.save()
+        if on_pages:
+            on_pages(source.page_count)
         if self.token_provider is None and self.backend_factory == self._google_backend:
             raise Wait("the Google key isn't set in the app options", "config", "ocr", alert=True)
         if self._pages_today() + source.page_count > self.settings.daily_page_cap:
             raise Wait(f"today's Google page cap ({self.settings.daily_page_cap}) is reached", "page_cap", "ocr")
 
-        item.event("ocr_started", google_run=item.state.get("google_run", 1))
-        work_dir = item.new_work_dir()
+        work_dir = work_dir_for()
         try:
             # Building the backend checks the app's Google settings, and a bad setting
             # must be reported the same way as Google refusing a request.
-            result = self.backend_factory(item).process(source, work_dir)
+            result = backend_for().process(source, work_dir)
         except GoogleBackendError as error:
             if error.code in TRANSIENT_GOOGLE:
                 raise Wait(f"Google OCR didn't answer ({error.code})", "google", "ocr")
@@ -255,8 +307,7 @@ class Pipeline:
             status = getattr(error, "http_status", None)
             if error.code in THIS_SCAN_GOOGLE or (error.code == "post_http_error_fatal" and status in THIS_SCAN_HTTP):
                 detail = f"{error.code}, HTTP {status}" if status else error.code
-                self._ready_without_google(item, f"Google couldn't read this scan ({detail})")
-                return
+                return Made(source.page_count, why_not=f"Google couldn't read this scan ({detail})")
             detail = f"{error.code}, HTTP {status}" if status else error.code
             raise Wait(f"Google OCR isn't working ({detail})", "google", "ocr", alert=True)
         cache_hits = int(result.provenance.get("cache_hits", 0))
@@ -267,10 +318,9 @@ class Pipeline:
             validate_result(result, source)
             document = document_for_renderer(result, source)
         except ParserError as error:
-            self._ready_without_google(item, f"Google's answer didn't match the scan's pages ({error})", ours=True)
-            return
+            return Made(source.page_count, why_not=f"Google's answer didn't match the scan's pages ({error})", ours=True)
 
-        plan = self._plan(item, document)
+        plan = self._plan(label, document)
         gap = checks.missing_pages(plan, source.page_count)
         record = {"plan": plan.to_dict(), "missing_pages": gap, "coverage": checks.coverage(document),
                   "google": {"processor_version": self.settings.processor_version,
@@ -282,31 +332,27 @@ class Pipeline:
             # Whatever went wrong, it went wrong in making the copy. The scan itself is fine and
             # still goes in. A defect here must never leave a scan stranded outside Paperless.
             expected = isinstance(error, (ReviewRequired, ParserError, ValueError))
-            log.warning("%s: no searchable copy: %s", item.sha[:12], error, exc_info=not expected)
+            log.warning("%s: no searchable copy: %s", label, error, exc_info=not expected)
             try:
                 shape = describe_source(source.path)
             except Exception as failure:
                 shape = f"couldn't be read ({type(failure).__name__})"
             record["source_shape"] = shape
-            log.warning("%s: the scan's pages as the scanner wrote them: %s", item.sha[:12], shape)
+            log.warning("%s: the scan's pages as the scanner wrote them: %s", label, shape)
             why = str(error) if expected else f"an unexpected {type(error).__name__} in the app"
-            self._ready_without_google(item, f"the searchable copy couldn't be built ({why})",
-                                       checks_record={**record, "render_error": f"{type(error).__name__}: {error}"},
-                                       gap=gap, ours=True)
-            return
+            return Made(source.page_count, why_not=f"the searchable copy couldn't be built ({why})", ours=True, gap=gap,
+                        record={**record, "render_error": f"{type(error).__name__}: {error}"})
         assert_unchanged(source)
         order = tuple(rendered.page_order)
         text = ordered_text(result, source, order)
         searchable = rendered.archive_path.read_bytes()
-        write_atomic(item.searchable_path, searchable)
-        write_atomic(item.root / "text.txt", text.encode("utf-8"))
 
         mode = ORIGINAL_ONLY if checks.short_text(text) else WITH_GOOGLE
         provenance = rendered.provenance
         decision = provenance.get("page_order_decision", {})
         rotations = provenance.get("orientation_decisions") or []
         notes = list(provenance.get("quality_notes") or [])
-        self._write_checks(item, {
+        record = {
             **record,
             "render_checks": provenance.get("checks"),
             "render_pages": provenance.get("pages"),
@@ -316,32 +362,24 @@ class Pipeline:
             "text_sha256": sha256(text.encode("utf-8")),
             "searchable_sha256": sha256(searchable),
             "mode": mode,
-        })
-        log.info("%s: order %s (forward votes %s, reverse votes %s); %s", item.sha[:12],
+        }
+        log.info("%s: order %s (forward votes %s, reverse votes %s); %s", label,
                  decision.get("status"), decision.get("forwardVotes"), decision.get("reverseVotes"),
                  "; ".join(notes) or "text layer placed without remarks")
-        log.info("%s: pages as scanned: %s", item.sha[:12], self._page_summary(provenance))
+        log.info("%s: pages as scanned: %s", label, self._page_summary(provenance))
         fields = dict(mode=mode, page_order=list(order), order_status=decision.get("status"),
                       rotations=[r.get("appliedCardinalClockwiseDegrees", 0) for r in rotations],
                       rotations_from_stack=sum(1 for r in rotations if r.get("followedStack")),
-                      quality_notes=notes, no_google_copy_reason=None, copy_not_built=False,
-                      prepared_by=__version__,
-                      searchable_sha256=sha256(searchable), short_text=mode == ORIGINAL_ONLY,
-                      waiting_since_unix=None, alerted_reason_kind=None)
-        if gap and not self._settled(item):
-            # The searchable copy is ready, so "keep as it is" can commit both versions.
-            item.state.update(fields)
-            item.save()
-            raise Hold(gap, "missing_page")
-        item.set(READY, **fields)
+                      quality_notes=notes, searchable_sha256=sha256(searchable), short_text=mode == ORIGINAL_ONLY)
+        return Made(source.page_count, record=record, gap=gap, searchable=searchable, text=text, fields=fields)
 
     @staticmethod
-    def _plan(item: Item, document: dict):
+    def _plan(label: str, document: dict):
         """The printed page numbers, read as evidence. A failure to read them is no evidence, not a stop."""
         try:
             return plan_page_order(document)
         except Exception as error:
-            log.warning("%s: page numbers couldn't be read as evidence", item.sha[:12], exc_info=True)
+            log.warning("%s: page numbers couldn't be read as evidence", label, exc_info=True)
             from .docai.page_order import OrderPlan
             pages = len(document.get("pages") or [])
             return OrderPlan(tuple(range(1, pages + 1)), "needs_review", (),
