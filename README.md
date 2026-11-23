@@ -8,6 +8,7 @@ Home Assistant app repository for services running on HA Green. Add `https://git
 | Grafana Image Renderer | Rendering service for Grafana        | —                                |
 | VictoriaMetrics        | Metrics with native snapshot backups | `http://homeassistant:8428`      |
 | VictoriaLogs           | Logs with native snapshot backups    | `http://homeassistant:9428`      |
+| App Disk I/O           | Per-container storage I/O history    | Sends to VictoriaMetrics         |
 | XB3 Telemetry          | Probes, speed tests, gateway metrics | `/metrics` on app port 19090     |
 | Home Assistant MCP     | Home Assistant tools                 | `http://homeassistant:9583/mcp`  |
 | Grafana MCP            | Grafana tools                        | `http://homeassistant:18080/mcp` |
