@@ -1,0 +1,16 @@
+name: App Disk I/O
+version: 0.1.0
+slug: app-disk-io
+description: Collect host app disk I/O metrics
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/app-disk-io
+arch:
+  - aarch64
+  - amd64
+init: false
+host_dbus: true
+journald: true
+options:
+  metrics_url: http://894a6dc5-victoria-metrics:8428/api/v1/import/prometheus
+schema:
+  metrics_url: str
+image: ghcr.io/janejeon/app-disk-io
