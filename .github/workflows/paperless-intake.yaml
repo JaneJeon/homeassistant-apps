@@ -32,7 +32,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.15"
 
       # The font draws the synthetic test scans. pdftotext is how Paperless pulls text out of a
       # PDF, so the in-memory Paperless used by the unit tests pulls it out the same way.
