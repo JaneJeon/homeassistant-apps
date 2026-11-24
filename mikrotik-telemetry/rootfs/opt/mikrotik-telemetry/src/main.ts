@@ -19,7 +19,12 @@ async function main(): Promise<void> {
     }
     pingsInFlight++;
     try {
-      state.ping[await pingOnce(options.routerHost)]++;
+      const result = await pingOnce(options.routerHost);
+      state.ping[result.outcome]++;
+      if (result.seconds !== undefined) {
+        state.pingReplySeconds += result.seconds;
+        state.timedReplies++;
+      }
     } finally {
       pingsInFlight--;
     }
