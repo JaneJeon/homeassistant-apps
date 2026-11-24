@@ -1,3 +1,5 @@
+import type { WifiTotals } from "./wifi.js";
+
 export type PingOutcome = "reply" | "no_reply_by_deadline" | "local_error";
 
 export interface SnmpSample {
@@ -19,6 +21,7 @@ export interface State {
   snmpLastDurationSeconds: number;
   snmpPollInProgress: boolean;
   sample: SnmpSample | null;
+  wifiTotals: WifiTotals[];
   routerosLogs: {
     accepted: number;
     forwarded: number;
@@ -29,7 +32,7 @@ export interface State {
 
 export function emptyState(): State {
   return { ping: { reply: 0, no_reply_by_deadline: 0, local_error: 0 }, pingReplySeconds: 0, timedReplies: 0, snmpUp: false,
-    snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null,
+    snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null, wifiTotals: [],
     routerosLogs: { accepted: 0, forwarded: 0, dropped: { invalid_syslog: 0, queue_full: 0, unauthorized_source: 0, forward_failed: 0 }, queued: 0 } };
 }
 
@@ -61,6 +64,11 @@ export function renderMetrics(state: State): string {
   for (const [reason, count] of Object.entries(state.routerosLogs.dropped))
     out.add("mikrotik_routeros_logs_dropped_total", "RouterOS syslog records discarded since startup.", "counter", count, { reason });
   out.add("mikrotik_routeros_logs_queue_length", "RouterOS log records waiting in the bounded forwarding queue.", "gauge", state.routerosLogs.queued);
+  for (const { client, ifIndex, receive, transmit } of state.wifiTotals) {
+    const labels = { client, if_index: ifIndex };
+    out.add("mikrotik_wifi_client_receive_bytes_total", "Observed Wi-Fi bytes from station to AP.", "counter", receive.toString(), labels);
+    out.add("mikrotik_wifi_client_transmit_bytes_total", "Observed Wi-Fi bytes from AP to station.", "counter", transmit.toString(), labels);
+  }
   if (!state.snmpUp || !state.sample) return out.text();
   const sample = state.sample;
   if (sample.wanReceiveOctets) out.add("mikrotik_wan_receive_octets_total", "WAN interface received octets from ifHCInOctets.", "counter", sample.wanReceiveOctets);

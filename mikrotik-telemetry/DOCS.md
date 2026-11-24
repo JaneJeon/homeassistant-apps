@@ -15,6 +15,27 @@ The app serves Prometheus metrics on port `19100`. Add a scrape job for `894a6dc
 
 To send measurements to an existing VictoriaMetrics app, set `victoriametrics_url` to its internal base URL, for example `http://894a6dc5-victoria-metrics:8428`. Each poll then writes freshly sampled metrics to the Prometheus import endpoint with the job name `mikrotik-telemetry`. Select one collection path per app instance to avoid duplicate series.
 
+## Wi-Fi client traffic
+
+Leave `wifi_clients` empty to skip client polling. To measure a client, enter a stable name and the MAC address the client uses on this SSID. The address may be a device's private Wi-Fi address. Use a unique name and MAC for each of up to 16 clients. Names use letters, digits, underscores, or hyphens and start with a letter or digit.
+
+```yaml
+wifi_clients:
+  - name: example-client
+    mac: "02:00:00:00:00:01"
+```
+
+The collector reads the RouterOS `/interface wifi registration-table` SNMP MIB with the configured read-only SNMPv3 credentials. It looks up configured stations only. Metric labels contain the configured `client` name and the radio interface's IF-MIB `if_index`. The address is used for lookup and does not appear in metrics or logs. The app omits missing association rows and leaves WAN and resource polling independent of this table.
+
+| Signal | Query |
+| --- | --- |
+| Station → AP bits per second by client | `8 * sum by (client) (rate(mikrotik_wifi_client_receive_bytes_total[5m]))` |
+| AP → station bits per second by client | `8 * sum by (client) (rate(mikrotik_wifi_client_transmit_bytes_total[5m]))` |
+| Station → AP bytes observed in 24 hours | `sum by (client) (increase(mikrotik_wifi_client_receive_bytes_total[24h]))` |
+| AP → station bytes observed in 24 hours | `sum by (client) (increase(mikrotik_wifi_client_transmit_bytes_total[24h]))` |
+
+These are radio-side counts for each association, including traffic to other LAN devices. Each series starts at zero and accumulates deltas between observed polls. The first poll after a missing row, failed Wi-Fi poll, lower association uptime, or decreased counter establishes a new baseline. The collector retains the prior total when a row reappears and resets its totals on restart. A reconnect between two otherwise increasing samples can go undetected. A changed interface index produces a new series. Apply `rate` or `increase` before summing across indices. The query engine can smooth or extrapolate samples around gaps. An unavailable row does not establish zero traffic, and the measured totals can omit traffic during gaps and resets.
+
 ## RouterOS logs to VictoriaLogs
 
 Set `victorialogs_url` to the internal base URL of a VictoriaLogs app, for example `http://894a6dc5-victoria-logs:9428`, to enable UDP syslog input on port `5514`. The listener accepts datagrams only from `router_host`; configure that router to send BSD syslog to the Home Assistant host on UDP port 5514. Leave the option empty to keep the UDP listener disabled.
