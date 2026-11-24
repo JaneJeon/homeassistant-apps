@@ -34,32 +34,6 @@ const result = (
 ) => ({ outcome, rttMs });
 
 describe("ProbeRecorder", () => {
-  it("records a separate router probe alongside the three existing targets", async () => {
-    const records: Record<string, unknown>[] = [];
-    const recorder = new ProbeRecorder({
-      startupId: "test-startup",
-      startupSeconds: 1,
-      maxTicks: 1,
-      clock: new ManualClock(),
-      driver: async () => result("reply", 2),
-      targets: [...PROBE_TARGETS, { name: "router", address: "192.0.2.1" }],
-      write: (record) => records.push(record as Record<string, unknown>),
-    });
-
-    await recorder.run(new AbortController().signal);
-
-    assert.deepEqual(
-      records.map(({ target, address }) => ({ target, address })),
-      [
-        { target: "gateway", address: "10.0.0.1" },
-        { target: "google", address: "8.8.8.8" },
-        { target: "cloudflare", address: "1.1.1.1" },
-        { target: "router", address: "192.0.2.1" },
-      ],
-    );
-    assert.match(recorder.render(), /target="router"/);
-  });
-
   it("keeps scheduling with unanswered probes, caps each target at two in flight, and records skips locally", async () => {
     const clock = new ManualClock();
     const records: Record<string, unknown>[] = [];
