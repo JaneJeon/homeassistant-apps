@@ -12,6 +12,8 @@ export interface SnmpSample {
 
 export interface State {
   ping: Record<PingOutcome, number>;
+  pingReplySeconds: number;
+  timedReplies: number;
   snmpUp: boolean;
   snmpLastSuccessSeconds: number;
   snmpLastDurationSeconds: number;
@@ -26,7 +28,7 @@ export interface State {
 }
 
 export function emptyState(): State {
-  return { ping: { reply: 0, no_reply_by_deadline: 0, local_error: 0 }, snmpUp: false,
+  return { ping: { reply: 0, no_reply_by_deadline: 0, local_error: 0 }, pingReplySeconds: 0, timedReplies: 0, snmpUp: false,
     snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null,
     routerosLogs: { accepted: 0, forwarded: 0, dropped: { invalid_syslog: 0, queue_full: 0, unauthorized_source: 0, forward_failed: 0 }, queued: 0 } };
 }
@@ -48,6 +50,8 @@ export function renderMetrics(state: State): string {
   const out = new TextMetrics();
   for (const outcome of ["reply", "no_reply_by_deadline", "local_error"] as const)
     out.add("mikrotik_ping_outcomes_total", "Completed one-second ping process outcomes since startup.", "counter", state.ping[outcome], { outcome });
+  out.add("mikrotik_ping_reply_seconds_total", "Sum of measured ICMP reply round-trip times in seconds.", "counter", state.pingReplySeconds);
+  out.add("mikrotik_ping_timed_replies_total", "ICMP replies with a measured round-trip time.", "counter", state.timedReplies);
   out.add("mikrotik_snmp_up", "1 when the most recent SNMP poll completed its interface lookup; stale samples are omitted after failures.", "gauge", Number(state.snmpUp));
   out.add("mikrotik_snmp_last_success_timestamp_seconds", "Unix time of the latest successful SNMP interface lookup, or 0.", "gauge", state.snmpLastSuccessSeconds);
   out.add("mikrotik_snmp_poll_duration_seconds", "Duration of the latest completed SNMP poll.", "gauge", state.snmpLastDurationSeconds);
