@@ -1,11 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { isIPv4 } from "node:net";
 
 export interface Options {
   gatewayUrl: string;
   username: string;
   password: string;
-  routerProbeAddress: string;
   host: string;
   port: number;
   logMode: "off" | "firewall" | "all";
@@ -63,13 +61,6 @@ export async function loadOptions(): Promise<Options> {
     throw new Error(
       "Set gateway_password in app Options or XB3_PASSWORD locally",
     );
-  const routerProbeAddress = string(
-    "router_probe_address",
-    process.env.XB3_ROUTER_PROBE_ADDRESS ?? data.router_probe_address,
-    "",
-  ).trim();
-  if (routerProbeAddress && !isIPv4(routerProbeAddress))
-    throw new Error("Invalid option: router_probe_address");
   const networkIntervalSeconds = integer(
     "network_interval_seconds",
     process.env.XB3_NETWORK_INTERVAL_SECONDS ?? data.network_interval_seconds,
@@ -103,7 +94,6 @@ export async function loadOptions(): Promise<Options> {
       "admin",
     ),
     password,
-    routerProbeAddress,
     host: process.env.XB3_LISTEN_HOST ?? "0.0.0.0",
     port: integer("port", process.env.XB3_PORT, 19090, 1024, 65535),
     logMode: logMode as Options["logMode"],

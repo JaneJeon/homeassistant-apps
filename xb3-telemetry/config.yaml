@@ -1,5 +1,5 @@
 name: XB3 Telemetry
-version: 0.4.2
+version: 0.4.3
 slug: xb3-telemetry
 description: Read-only XB3 modem metrics, internet probes and speed tests for Prometheus
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/xb3-telemetry
@@ -17,7 +17,6 @@ options:
   gateway_url: http://10.0.0.1
   gateway_username: admin
   gateway_password: ""
-  router_probe_address: ""
   log_mode: firewall
   log_interval_seconds: 900
   network_interval_seconds: "20"
@@ -26,7 +25,6 @@ schema:
   gateway_url: str
   gateway_username: str
   gateway_password: password
-  router_probe_address: str?
   log_mode: list(off|firewall|all)
   log_interval_seconds: int(60,86400)
   network_interval_seconds: list(20|60)
