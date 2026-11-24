@@ -1,5 +1,5 @@
 name: MikroTik Telemetry
-version: 0.1.0
+version: 0.2.0
 slug: mikrotik-telemetry
 description: Read-only MikroTik availability, WAN traffic, and resource metrics
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/mikrotik-telemetry
@@ -10,8 +10,10 @@ startup: services
 init: false
 ports:
   19100/tcp: null
+  5514/udp: null
 ports_description:
   19100/tcp: Optional LAN access to Prometheus metrics
+  5514/udp: RouterOS syslog input; only enabled when VictoriaLogs is configured
 options:
   router_host: ""
   wan_interface: ether1
@@ -20,6 +22,7 @@ options:
   snmp_privacy_key: ""
   poll_interval_seconds: 15
   victoriametrics_url: ""
+  victorialogs_url: ""
 schema:
   router_host: str
   wan_interface: str
@@ -28,4 +31,5 @@ schema:
   snmp_privacy_key: password
   poll_interval_seconds: int(5,300)
   victoriametrics_url: str?
+  victorialogs_url: str?
 image: ghcr.io/janejeon/mikrotik-telemetry

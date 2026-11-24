@@ -17,11 +17,18 @@ export interface State {
   snmpLastDurationSeconds: number;
   snmpPollInProgress: boolean;
   sample: SnmpSample | null;
+  routerosLogs: {
+    accepted: number;
+    forwarded: number;
+    dropped: Record<"invalid_syslog" | "queue_full" | "unauthorized_source" | "forward_failed", number>;
+    queued: number;
+  };
 }
 
 export function emptyState(): State {
   return { ping: { reply: 0, no_reply_by_deadline: 0, local_error: 0 }, snmpUp: false,
-    snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null };
+    snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null,
+    routerosLogs: { accepted: 0, forwarded: 0, dropped: { invalid_syslog: 0, queue_full: 0, unauthorized_source: 0, forward_failed: 0 }, queued: 0 } };
 }
 
 class TextMetrics {
@@ -45,6 +52,11 @@ export function renderMetrics(state: State): string {
   out.add("mikrotik_snmp_last_success_timestamp_seconds", "Unix time of the latest successful SNMP interface lookup, or 0.", "gauge", state.snmpLastSuccessSeconds);
   out.add("mikrotik_snmp_poll_duration_seconds", "Duration of the latest completed SNMP poll.", "gauge", state.snmpLastDurationSeconds);
   out.add("mikrotik_snmp_poll_in_progress", "1 while an independent SNMP poll is active.", "gauge", Number(state.snmpPollInProgress));
+  out.add("mikrotik_routeros_logs_accepted_total", "Valid RouterOS syslog datagrams accepted from the configured router since startup.", "counter", state.routerosLogs.accepted);
+  out.add("mikrotik_routeros_logs_forwarded_total", "RouterOS log records accepted by VictoriaLogs since startup.", "counter", state.routerosLogs.forwarded);
+  for (const [reason, count] of Object.entries(state.routerosLogs.dropped))
+    out.add("mikrotik_routeros_logs_dropped_total", "RouterOS syslog records discarded since startup.", "counter", count, { reason });
+  out.add("mikrotik_routeros_logs_queue_length", "RouterOS log records waiting in the bounded forwarding queue.", "gauge", state.routerosLogs.queued);
   if (!state.snmpUp || !state.sample) return out.text();
   const sample = state.sample;
   if (sample.wanReceiveOctets) out.add("mikrotik_wan_receive_octets_total", "WAN interface received octets from ifHCInOctets.", "counter", sample.wanReceiveOctets);
