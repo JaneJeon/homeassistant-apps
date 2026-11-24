@@ -6,6 +6,7 @@ export const PROBE_TARGETS = [
   { name: "google", address: "8.8.8.8" },
   { name: "cloudflare", address: "1.1.1.1" },
 ] as const;
+type ProbeTarget = Readonly<{ name: string; address: string }>;
 export type ProbeOutcome =
   | "reply"
   | "no_reply_by_deadline"
@@ -48,6 +49,7 @@ export interface ProbeOptions {
   intervalMs?: number;
   maxTicks?: number;
   driver?: ProbeDriver;
+  targets?: readonly ProbeTarget[];
   clock?: ProbeClock;
   write?: (record: object) => void;
 }
@@ -58,6 +60,7 @@ export class ProbeRecorder {
   readonly states = new Map<string, ProbeState>();
   private readonly clock: ProbeClock;
   private readonly driver: ProbeDriver;
+  private readonly targets: readonly ProbeTarget[];
   private readonly interval: number;
   private readonly pending = new Set<Promise<void>>();
   private readonly previousLaunch = new Map<string, number>();
@@ -74,7 +77,8 @@ export class ProbeRecorder {
       throw new Error("Invalid probe interval");
     this.clock = options.clock ?? realClock;
     this.driver = options.driver ?? pingProbe;
-    for (const target of PROBE_TARGETS)
+    this.targets = options.targets ?? PROBE_TARGETS;
+    for (const target of this.targets)
       this.states.set(target.name, {
         scheduled: 0,
         launched: 0,
@@ -108,7 +112,7 @@ export class ProbeRecorder {
     });
   }
   private base(
-    target: (typeof PROBE_TARGETS)[number],
+    target: ProbeTarget,
     sequence: number,
     due: number,
   ): Record<string, unknown> {
@@ -125,7 +129,7 @@ export class ProbeRecorder {
     };
   }
   private skipped(
-    target: (typeof PROBE_TARGETS)[number],
+    target: ProbeTarget,
     sequence: number,
     due: number,
     reason: string,
@@ -144,7 +148,7 @@ export class ProbeRecorder {
     });
   }
   private launch(
-    target: (typeof PROBE_TARGETS)[number],
+    target: ProbeTarget,
     sequence: number,
     due: number,
     stop: AbortSignal,
@@ -238,7 +242,7 @@ export class ProbeRecorder {
               ? missed
               : Math.min(missed, this.options.maxTicks - tick);
           if (remaining > 120) {
-            for (const target of PROBE_TARGETS) {
+            for (const target of this.targets) {
               const state = this.states.get(target.name)!;
               state.scheduled += remaining;
               state.completed.skipped_local += remaining;
@@ -253,7 +257,7 @@ export class ProbeRecorder {
             });
           } else
             for (let n = 0; n < remaining; n++)
-              for (const target of PROBE_TARGETS)
+              for (const target of this.targets)
                 this.skipped(
                   target,
                   tick + n + 1,
@@ -268,7 +272,7 @@ export class ProbeRecorder {
           tick >= this.options.maxTicks
         )
           break;
-        for (const target of PROBE_TARGETS)
+        for (const target of this.targets)
           this.launch(target, tick + 1, due, stop);
         tick++;
       }

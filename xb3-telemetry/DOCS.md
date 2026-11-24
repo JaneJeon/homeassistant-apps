@@ -14,6 +14,10 @@ Each of the existing targets—gateway `10.0.0.1`, Google `8.8.8.8` and Cloudfla
 the next slot. At most two subprocesses per target can be outstanding. Missed
 local slots are recorded rather than filled with catch-up traffic.
 
+Set `router_probe_address` to the separate router's LAN IPv4 address to add
+one probe per second with `target="router"`. The default is empty. The
+`gateway` target continues to measure the XB3 at `10.0.0.1`.
+
 Every outcome retains a target, sequence, scheduled UTC and completion UTC.
 Attempted probes also retain their recorded launch attempt, monotonic bounds,
 scheduler lag, clock-offset evidence and utility-reported RTT where available.

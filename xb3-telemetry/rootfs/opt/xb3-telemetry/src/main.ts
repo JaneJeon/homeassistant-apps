@@ -19,7 +19,7 @@ import {
 } from "./probes.js";
 import { SpeedRunner } from "./speed-runner.js";
 
-const VERSION = "0.4.1";
+const VERSION = "0.4.2";
 
 function emptyCollection(): Collection {
   const page = <T>(): PageResult<T> => ({
@@ -99,7 +99,15 @@ async function main(): Promise<void> {
     return;
   }
   const stop = new AbortController();
-  const probes = new ProbeRecorder({ startupId, startupSeconds, write });
+  const probeTargets = options.routerProbeAddress
+    ? [...PROBE_TARGETS, { name: "router", address: options.routerProbeAddress }]
+    : PROBE_TARGETS;
+  const probes = new ProbeRecorder({
+    startupId,
+    startupSeconds,
+    targets: probeTargets,
+    write,
+  });
   const workerParsers = new WorkerParsers();
   let validation: ProbeRecorder | undefined;
   let validationRequested = false;
@@ -253,7 +261,7 @@ async function main(): Promise<void> {
     probe_tool: "busybox_ping",
     timestamp_basis:
       "subprocess launch/completion; utility RTT; kernel send/receive times unavailable",
-    targets: PROBE_TARGETS,
+    targets: probeTargets,
     interfaces: Object.entries(networkInterfaces()).flatMap(
       ([name, addresses]) =>
         (addresses ?? [])
