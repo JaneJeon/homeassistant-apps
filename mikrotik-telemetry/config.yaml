@@ -1,5 +1,5 @@
 name: MikroTik Telemetry
-version: 0.2.1
+version: 0.3.0
 slug: mikrotik-telemetry
 description: Read-only MikroTik availability, WAN traffic, and resource metrics
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/mikrotik-telemetry
@@ -21,6 +21,7 @@ options:
   snmp_auth_key: ""
   snmp_privacy_key: ""
   poll_interval_seconds: 15
+  wifi_clients: []
   victoriametrics_url: ""
   victorialogs_url: ""
 schema:
@@ -30,6 +31,9 @@ schema:
   snmp_auth_key: password
   snmp_privacy_key: password
   poll_interval_seconds: int(5,300)
+  wifi_clients:
+    - name: str
+      mac: password
   victoriametrics_url: str?
   victorialogs_url: str?
 image: ghcr.io/janejeon/mikrotik-telemetry

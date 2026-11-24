@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { isIPv4 } from "node:net";
 
+export interface WifiClient {
+  name: string;
+  macIndex: string;
+}
+
 export interface Options {
   routerHost: string;
   wanInterface: string;
@@ -8,8 +13,28 @@ export interface Options {
   snmpAuthKey: string;
   snmpPrivacyKey: string;
   pollIntervalSeconds: number;
+  wifiClients: WifiClient[];
   victoriametricsUrl?: URL;
   victorialogsUrl?: URL;
+}
+
+export function parseWifiClients(value: unknown): WifiClient[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) throw new Error("Invalid option: wifi_clients");
+  const names = new Set<string>();
+  const addresses = new Set<string>();
+  return value.map((client: unknown) => {
+    if (!client || typeof client !== "object") throw new Error("Invalid option: wifi_clients");
+    const { name, mac } = client as Record<string, unknown>;
+    if (typeof name !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/.test(name)
+        || typeof mac !== "string" || !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(mac))
+      throw new Error("Invalid option: wifi_clients");
+    const macIndex = mac.split(":").map((octet) => Number.parseInt(octet, 16)).join(".");
+    if (names.has(name) || addresses.has(macIndex)) throw new Error("Duplicate wifi_clients entry");
+    names.add(name);
+    addresses.add(macIndex);
+    return { name, macIndex };
+  });
 }
 
 export async function loadOptions(): Promise<Options> {
@@ -77,6 +102,7 @@ export async function loadOptions(): Promise<Options> {
     snmpAuthKey: required("snmp_auth_key"),
     snmpPrivacyKey: required("snmp_privacy_key"),
     pollIntervalSeconds: Number(interval),
+    wifiClients: parseWifiClients(values.wifi_clients),
     victoriametricsUrl,
     victorialogsUrl,
   };
