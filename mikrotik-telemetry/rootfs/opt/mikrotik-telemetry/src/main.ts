@@ -3,10 +3,14 @@ import { loadOptions } from "./config.js";
 import { emptyState, renderMetrics, type State } from "./metrics.js";
 import { pingOnce } from "./ping.js";
 import { collectSnmp } from "./snmp.js";
+import { RouterosLogIngest } from "./routeros-logs.js";
 
 async function main(): Promise<void> {
   const options = await loadOptions();
   const state: State = emptyState();
+  const routerosLogs = options.victorialogsUrl
+    ? new RouterosLogIngest(options.routerHost, options.victorialogsUrl, state)
+    : undefined;
   let pingsInFlight = 0;
   const probe = async () => {
     if (pingsInFlight >= 2) {
@@ -75,6 +79,7 @@ async function main(): Promise<void> {
     response.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8", "Cache-Control": "no-store" }).end(renderMetrics(state));
   });
   server.listen(19100, "0.0.0.0");
+  routerosLogs?.start();
   void probe();
   void collectAndPublish();
   const probeTimer = setInterval(probe, 1_000);
@@ -82,6 +87,7 @@ async function main(): Promise<void> {
   const stop = () => {
     clearInterval(probeTimer);
     clearInterval(pollTimer);
+    routerosLogs?.stop();
     server.close();
   };
   process.once("SIGTERM", stop);

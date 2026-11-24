@@ -9,6 +9,7 @@ export interface Options {
   snmpPrivacyKey: string;
   pollIntervalSeconds: number;
   victoriametricsUrl?: URL;
+  victorialogsUrl?: URL;
 }
 
 export async function loadOptions(): Promise<Options> {
@@ -22,6 +23,24 @@ export async function loadOptions(): Promise<Options> {
   if (!data || typeof data !== "object" || Array.isArray(data))
     throw new Error("Invalid MikroTik app options");
   const values = data as Record<string, unknown>;
+  const logsEndpoint = values.victorialogs_url;
+  let victorialogsUrl: URL | undefined;
+  if (logsEndpoint !== undefined && logsEndpoint !== "") {
+    try {
+      if (typeof logsEndpoint !== "string") throw new Error();
+      victorialogsUrl = new URL(logsEndpoint);
+      if (!["http:", "https:"].includes(victorialogsUrl.protocol)
+          || victorialogsUrl.username || victorialogsUrl.password)
+        throw new Error();
+      victorialogsUrl.pathname = "/insert/jsonline";
+      victorialogsUrl.search = "";
+      victorialogsUrl.searchParams.set("_msg_field", "message");
+      victorialogsUrl.searchParams.set("_time_field", "timestamp");
+      victorialogsUrl.searchParams.set("_stream_fields", "source,router");
+    } catch {
+      throw new Error("Invalid option: victorialogs_url");
+    }
+  }
   const required = (key: string, fallback = ""): string => {
     const value = values[key];
     if (value === undefined && fallback) return fallback;
@@ -59,5 +78,6 @@ export async function loadOptions(): Promise<Options> {
     snmpPrivacyKey: required("snmp_privacy_key"),
     pollIntervalSeconds: Number(interval),
     victoriametricsUrl,
+    victorialogsUrl,
   };
 }
