@@ -1,0 +1,31 @@
+name: MikroTik Telemetry
+version: 0.1.0
+slug: mikrotik-telemetry
+description: Read-only MikroTik availability, WAN traffic, and resource metrics
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/mikrotik-telemetry
+arch:
+  - aarch64
+  - amd64
+startup: services
+init: false
+ports:
+  19100/tcp: null
+ports_description:
+  19100/tcp: Optional LAN access to Prometheus metrics
+options:
+  router_host: ""
+  wan_interface: ether1
+  snmp_username: ha-observability
+  snmp_auth_key: ""
+  snmp_privacy_key: ""
+  poll_interval_seconds: 15
+  victoriametrics_url: ""
+schema:
+  router_host: str
+  wan_interface: str
+  snmp_username: str
+  snmp_auth_key: password
+  snmp_privacy_key: password
+  poll_interval_seconds: int(5,300)
+  victoriametrics_url: str?
+image: ghcr.io/janejeon/mikrotik-telemetry
