@@ -1,0 +1,18 @@
+name: iperf3 server
+version: 0.1.0
+slug: iperf3-server
+description: iperf3 server for measuring LAN and Wi-Fi throughput to HA Green
+url: https://github.com/JaneJeon/homeassistant-apps/tree/main/iperf3-server
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: manual
+ports:
+  5201/tcp: 5201
+  5201/udp: 5201
+ports_description:
+  5201/tcp: iperf3 control and TCP test traffic
+  5201/udp: iperf3 UDP test traffic
+image: ghcr.io/janejeon/iperf3-server
