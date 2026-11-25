@@ -1,4 +1,4 @@
-FROM alpine:3.22
+FROM alpine:3.24
 ARG TARGETARCH
 RUN apk add --no-cache python3 ca-certificates curl
 RUN case "$TARGETARCH" in amd64) sha=1b495bde563825cf83dc7c0425a9d8fa03e7214858e0949f9177efc6bb1f8bfc ;; arm64) sha=3d5f965b7a75f713742a7f37195c1d845f47d9dc9d096a2cce29e693f08fd641 ;; *) exit 1 ;; esac && \
