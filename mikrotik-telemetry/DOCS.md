@@ -13,7 +13,7 @@ The app serves Prometheus metrics on port `19100`. Add a scrape job for `894a6dc
     - targets: [894a6dc5-mikrotik-telemetry:19100]
 ```
 
-To send measurements to an existing VictoriaMetrics app, set `victoriametrics_url` to its internal base URL, for example `http://894a6dc5-victoria-metrics:8428`. Each poll then writes freshly sampled metrics to the Prometheus import endpoint with the job name `mikrotik-telemetry`. Select one collection path per app instance to avoid duplicate series.
+To send measurements to an existing VictoriaMetrics app, set `victoriametrics_url` to its internal base URL, for example `http://894a6dc5-victoria-metrics:8428`. Each poll then writes freshly sampled metrics to the Prometheus import endpoint with the job name `mikrotik-telemetry`. Every reading in one write carries the same timestamp, so readings from one poll can be matched exactly. Select one collection path per app instance to avoid duplicate series.
 
 ## Wi-Fi client traffic
 
