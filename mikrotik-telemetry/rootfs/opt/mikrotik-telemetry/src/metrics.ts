@@ -78,9 +78,11 @@ export function renderMetrics(state: State): string {
     out.add("mikrotik_wifi_client_receive_bytes_total", "Observed Wi-Fi bytes from station to AP.", "counter", receive.toString(), labels);
     out.add("mikrotik_wifi_client_transmit_bytes_total", "Observed Wi-Fi bytes from AP to station.", "counter", transmit.toString(), labels);
   }
+  // RouterOS types the association uptime as TimeTicks but counts whole seconds in it: on the live hAP ax3
+  // (RouterOS 7.24.7) the value rose by 2430 over 2424 seconds, and matched the uptime the RouterOS API reports.
   for (const { client, ifIndex, uptimeTicks, signal, band, txRate, rxRate } of state.wifiStations) {
     const labels = { client, if_index: ifIndex };
-    out.add("mikrotik_wifi_client_uptime_seconds", "Time the station has been associated, from mtxrWifiRegistrationUptime.", "gauge", uptimeTicks / 100, labels);
+    out.add("mikrotik_wifi_client_uptime_seconds", "Time the station has been associated, from mtxrWifiRegistrationUptime.", "gauge", uptimeTicks, labels);
     if (signal !== undefined) out.add("mikrotik_wifi_client_signal_dbm", "Station signal strength from mtxrWifiRegistrationSignal.", "gauge", signal, labels);
     if (txRate !== undefined) out.add("mikrotik_wifi_client_tx_rate_bits_per_second", "AP to station link rate from mtxrWifiRegistrationTxRate, as reported (unit not stated by the MIB).", "gauge", txRate, labels);
     if (rxRate !== undefined) out.add("mikrotik_wifi_client_rx_rate_bits_per_second", "Station to AP link rate from mtxrWifiRegistrationRxRate, as reported (unit not stated by the MIB).", "gauge", rxRate, labels);
