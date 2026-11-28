@@ -2,8 +2,8 @@ import { createServer } from "node:http";
 import { loadOptions } from "./config.js";
 import { emptyState, renderMetrics, type State } from "./metrics.js";
 import { pingOnce } from "./ping.js";
-import { collectSnmp, collectWifiSnmp } from "./snmp.js";
-import { WifiCounters } from "./wifi.js";
+import { collectSnmp, collectWifiInterfaces, collectWifiSnmp } from "./snmp.js";
+import { recordWifiPoll, WifiCounters } from "./wifi.js";
 import { RouterosLogIngest } from "./routeros-logs.js";
 
 async function main(): Promise<void> {
@@ -48,13 +48,42 @@ async function main(): Promise<void> {
   };
   const wifiCounters = new WifiCounters();
   let wifiPolling = false;
+  let wifiInterfacesFailed = false;
+  let nextWifiDiagnostics = 0;
   const pollWifi = async () => {
-    if (wifiPolling || options.wifiClients.length === 0) return;
+    if (wifiPolling) return;
     wifiPolling = true;
     try {
-      state.wifiTotals = wifiCounters.observe(await collectWifiSnmp(options));
-    } catch {
-      state.wifiTotals = wifiCounters.observe([]);
+      let clientsRead = true;
+      if (options.wifiClients.length > 0) {
+        try {
+          recordWifiPoll(state, wifiCounters, await collectWifiSnmp(options));
+        } catch {
+          recordWifiPoll(state, wifiCounters, undefined); // A failed poll must never expose stale link gauges.
+          clientsRead = false;
+        }
+      }
+      let interfacesRead = true;
+      try {
+        state.wifiInterfaces = await collectWifiInterfaces(options);
+        if (wifiInterfacesFailed) console.info("Wi-Fi interface table readable again");
+        wifiInterfacesFailed = false;
+      } catch {
+        state.wifiInterfaces = [];
+        interfacesRead = false;
+        if (!wifiInterfacesFailed) console.warn("Wi-Fi interface table could not be read; continuing without it");
+        wifiInterfacesFailed = true;
+      }
+      // Raw column values confirm the MIB mapping against the live router: at startup, then at most hourly.
+      if (clientsRead && Date.now() >= nextWifiDiagnostics) {
+        nextWifiDiagnostics = Date.now() + 3_600_000;
+        for (const { client, ifIndex, raw } of state.wifiStations)
+          console.info(`Wi-Fi diagnostics: client=${client} if_index=${ifIndex} ${raw ?? ""}`);
+        if (options.wifiClients.length > 0 && state.wifiStations.length === 0)
+          console.info("Wi-Fi diagnostics: no allowlisted client is associated");
+        console.info(`Wi-Fi diagnostics: interface rows ${interfacesRead
+          ? JSON.stringify(state.wifiInterfaces.map(({ index, raw }) => ({ index, ...raw }))) : "unavailable"}`);
+      }
     } finally {
       wifiPolling = false;
     }

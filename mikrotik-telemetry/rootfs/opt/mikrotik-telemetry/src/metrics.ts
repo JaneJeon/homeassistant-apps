@@ -1,4 +1,4 @@
-import type { WifiTotals } from "./wifi.js";
+import type { WifiAssociation, WifiInterface, WifiTotals } from "./wifi.js";
 
 export type PingOutcome = "reply" | "no_reply_by_deadline" | "local_error";
 
@@ -22,6 +22,10 @@ export interface State {
   snmpPollInProgress: boolean;
   sample: SnmpSample | null;
   wifiTotals: WifiTotals[];
+  /** Associations read by the latest Wi-Fi poll; empty after a failure, so link gauges disappear. */
+  wifiStations: WifiAssociation[];
+  /** Rows of the latest successful interface walk; empty after a failure. */
+  wifiInterfaces: WifiInterface[];
   routerosLogs: {
     accepted: number;
     forwarded: number;
@@ -32,15 +36,20 @@ export interface State {
 
 export function emptyState(): State {
   return { ping: { reply: 0, no_reply_by_deadline: 0, local_error: 0 }, pingReplySeconds: 0, timedReplies: 0, snmpUp: false,
-    snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null, wifiTotals: [],
+    snmpLastSuccessSeconds: 0, snmpLastDurationSeconds: 0, snmpPollInProgress: false, sample: null, wifiTotals: [], wifiStations: [], wifiInterfaces: [],
     routerosLogs: { accepted: 0, forwarded: 0, dropped: { invalid_syslog: 0, queue_full: 0, unauthorized_source: 0, forward_failed: 0 }, queued: 0 } };
+}
+
+/** Prometheus text exposition escaping: backslash, double quote and line feed only. */
+export function escapeLabel(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 }
 
 class TextMetrics {
   private families = new Map<string, { help: string; type: "counter" | "gauge"; samples: string[] }>();
   add(name: string, help: string, type: "counter" | "gauge", value: number | string, labels: Record<string, string> = {}): void {
     if (typeof value === "number" && !Number.isFinite(value)) return;
-    const tags = Object.entries(labels).map(([key, label]) => `${key}=${JSON.stringify(label)}`).join(",");
+    const tags = Object.entries(labels).map(([key, label]) => `${key}="${escapeLabel(label)}"`).join(",");
     let family = this.families.get(name);
     if (!family) { family = { help, type, samples: [] }; this.families.set(name, family); }
     if (family.help !== help || family.type !== type) throw new Error("Inconsistent metric definition");
@@ -68,6 +77,18 @@ export function renderMetrics(state: State): string {
     const labels = { client, if_index: ifIndex };
     out.add("mikrotik_wifi_client_receive_bytes_total", "Observed Wi-Fi bytes from station to AP.", "counter", receive.toString(), labels);
     out.add("mikrotik_wifi_client_transmit_bytes_total", "Observed Wi-Fi bytes from AP to station.", "counter", transmit.toString(), labels);
+  }
+  for (const { client, ifIndex, uptimeTicks, signal, band, txRate, rxRate } of state.wifiStations) {
+    const labels = { client, if_index: ifIndex };
+    out.add("mikrotik_wifi_client_uptime_seconds", "Time the station has been associated, from mtxrWifiRegistrationUptime.", "gauge", uptimeTicks / 100, labels);
+    if (signal !== undefined) out.add("mikrotik_wifi_client_signal_dbm", "Station signal strength from mtxrWifiRegistrationSignal.", "gauge", signal, labels);
+    if (txRate !== undefined) out.add("mikrotik_wifi_client_tx_rate_bits_per_second", "AP to station link rate from mtxrWifiRegistrationTxRate, as reported (unit not stated by the MIB).", "gauge", txRate, labels);
+    if (rxRate !== undefined) out.add("mikrotik_wifi_client_rx_rate_bits_per_second", "Station to AP link rate from mtxrWifiRegistrationRxRate, as reported (unit not stated by the MIB).", "gauge", rxRate, labels);
+    if (band !== undefined) out.add("mikrotik_wifi_client_band_info", "Wireless band of the association from mtxrWifiRegistrationBand.", "gauge", 1, { ...labels, band });
+  }
+  for (const { index, name, ssid, channel, frequencyMhz } of state.wifiInterfaces) {
+    out.add("mikrotik_wifi_interface_info", "Router Wi-Fi interface from mtxrWifiInterfaces.", "gauge", 1, { interface: name, ssid, channel, index });
+    if (frequencyMhz !== undefined) out.add("mikrotik_wifi_interface_frequency_mhz", "Router Wi-Fi interface frequency from mtxrWifiInterfacesFreq.", "gauge", frequencyMhz, { interface: name });
   }
   if (!state.snmpUp || !state.sample) return out.text();
   const sample = state.sample;
