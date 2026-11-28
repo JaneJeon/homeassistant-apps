@@ -71,7 +71,7 @@ test("publish link gauges for an associated client with the counter labels", () 
   assert.match(metrics, /mikrotik_wifi_client_tx_rate_bits_per_second\{client="test-client",if_index="17"\} 864\n/);
   assert.match(metrics, /mikrotik_wifi_client_rx_rate_bits_per_second\{client="test-client",if_index="17"\} 720\n/);
   assert.match(metrics, /mikrotik_wifi_client_band_info\{client="test-client",if_index="17",band="5ghz-ax"\} 1\n/);
-  assert.match(metrics, /mikrotik_wifi_client_uptime_seconds\{client="test-client",if_index="17"\} 1234.56\n/);
+  assert.match(metrics, /mikrotik_wifi_client_uptime_seconds\{client="test-client",if_index="17"\} 123456\n/);
   assert.match(metrics, /mikrotik_wifi_client_receive_bytes_total\{client="test-client",if_index="17"\} 0\n/);
 });
 
@@ -82,7 +82,7 @@ test("omit link gauges for a client that is not associated, and for fields the r
   recordWifiPoll(state, counters, [{ ...row(1n, 2n, 50), client: "other" }]);
   const metrics = renderMetrics(state);
   for (const name of gaugeNames) assert.doesNotMatch(metrics, new RegExp(`mikrotik_wifi_client_${name}\\{client="test-client"`));
-  assert.match(metrics, /mikrotik_wifi_client_uptime_seconds\{client="other",if_index="17"\} 0.5\n/);
+  assert.match(metrics, /mikrotik_wifi_client_uptime_seconds\{client="other",if_index="17"\} 50\n/);
   for (const name of gaugeNames.slice(0, 4)) assert.doesNotMatch(metrics, new RegExp(`mikrotik_wifi_client_${name}`));
 });
 
