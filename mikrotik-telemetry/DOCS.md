@@ -17,7 +17,7 @@ To send measurements to an existing VictoriaMetrics app, set `victoriametrics_ur
 
 ## Wi-Fi client traffic
 
-Leave `wifi_clients` empty to skip client polling. To measure a client, enter a stable name and the MAC address the client uses on this SSID. The address may be a device's private Wi-Fi address. Use a unique name and MAC for each of up to 16 clients. Names use letters, digits, underscores, or hyphens and start with a letter or digit.
+Leave `wifi_clients` empty to skip client polling. The router's own Wi-Fi interfaces are read either way. To measure a client, enter a stable name and the MAC address the client uses on this SSID. The address may be a device's private Wi-Fi address. Use a unique name and MAC for each of up to 16 clients. Names use letters, digits, underscores, or hyphens and start with a letter or digit.
 
 ```yaml
 wifi_clients:
@@ -33,8 +33,21 @@ The collector reads the RouterOS `/interface wifi registration-table` SNMP MIB w
 | AP → station bits per second by client | `8 * sum by (client) (rate(mikrotik_wifi_client_transmit_bytes_total[5m]))` |
 | Station → AP bytes observed in 24 hours | `sum by (client) (increase(mikrotik_wifi_client_receive_bytes_total[24h]))` |
 | AP → station bytes observed in 24 hours | `sum by (client) (increase(mikrotik_wifi_client_transmit_bytes_total[24h]))` |
+| Signal strength by client | `mikrotik_wifi_client_signal_dbm` |
+| AP → station link rate by client | `mikrotik_wifi_client_tx_rate_bits_per_second` |
+| Station → AP link rate by client | `mikrotik_wifi_client_rx_rate_bits_per_second` |
+| Band by client | `mikrotik_wifi_client_band_info` (the `band` label, value 1) |
+| Time associated by client | `mikrotik_wifi_client_uptime_seconds` |
+| Router Wi-Fi interfaces | `mikrotik_wifi_interface_info` (labels `interface`, `ssid`, `channel`, `index`) |
+| Router Wi-Fi interface frequency | `mikrotik_wifi_interface_frequency_mhz` |
 
-These are radio-side counts for each association, including traffic to other LAN devices. Each series starts at zero and accumulates deltas between observed polls. The first poll after a missing row, failed Wi-Fi poll, lower association uptime, or decreased counter establishes a new baseline. The collector retains the prior total when a row reappears and resets its totals on restart. A reconnect between two otherwise increasing samples can go undetected. A changed interface index produces a new series. Apply `rate` or `increase` before summing across indices. The query engine can smooth or extrapolate samples around gaps. An unavailable row does not establish zero traffic, and the measured totals can omit traffic during gaps and resets.
+The byte counters are radio-side counts for each association, including traffic to other LAN devices. Each series starts at zero and accumulates deltas between observed polls. The first poll after a missing row, failed Wi-Fi poll, lower association uptime, or decreased counter establishes a new baseline. The collector retains the prior total when a row reappears and resets its totals on restart. A reconnect between two otherwise increasing samples can go undetected. A changed interface index produces a new series. Apply `rate` or `increase` before summing across indices. The query engine can smooth or extrapolate samples around gaps. An unavailable row does not establish zero traffic, and the measured totals can omit traffic during gaps and resets.
+
+The signal, link-rate, band and time-associated gauges come from the same per-client read as the byte counters. They exist only while the client is associated: a client missing from the registration table, or a failed Wi-Fi poll, leaves no sample. An absent series means no current reading (not associated, or the poll failed), never a stale value. Signal and link rates are exported as RouterOS reports them; the MIB does not state their units. Uptime is converted from TimeTicks (hundredths of a second).
+
+The interface gauges come from a walk of the router's own interface table (`mtxrWifiInterfaces`), which lists radios, not stations. `channel` is empty on RouterOS versions whose MIB lacks the current-channel column, and when the interface is not running. The frequency gauge appears only when the router reports a plain number. If the walk fails, the app logs one warning, omits the interface series, and keeps polling clients and the WAN.
+
+At startup and then at most once an hour, the app logs the raw values read for each associated client (registration-table columns 4, 6, 8, 9 and 10, by client name) and the raw interface-table rows. These lines confirm the column mapping against the live router.
 
 ## RouterOS logs to VictoriaLogs
 
@@ -53,6 +66,7 @@ Logs are sent directly to VictoriaLogs in bounded batches. Each record has the a
 | Router ping outcomes | `mikrotik_ping_outcomes_total{outcome="reply"}` and `{outcome="no_reply_by_deadline"}` |
 | Router resource usage | `mikrotik_cpu_load_percent` and `mikrotik_memory_bytes` |
 | IPv4 DHCP lease count | `mikrotik_dhcp_leases` |
+| Router uptime | `mikrotik_uptime_seconds` |
 | SNMP poll status | `mikrotik_snmp_up` and `mikrotik_snmp_last_success_timestamp_seconds` |
 | RouterOS log ingestion | `mikrotik_routeros_logs_accepted_total`, `mikrotik_routeros_logs_forwarded_total`, and `mikrotik_routeros_logs_dropped_total` |
 

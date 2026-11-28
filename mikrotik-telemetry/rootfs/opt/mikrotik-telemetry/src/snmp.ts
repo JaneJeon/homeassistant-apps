@@ -1,7 +1,7 @@
 import * as snmp from "net-snmp";
 import type { Options } from "./config.js";
 import type { SnmpSample } from "./metrics.js";
-import type { WifiAssociation } from "./wifi.js";
+import type { WifiAssociation, WifiInterface } from "./wifi.js";
 
 const IF_DESCR = "1.3.6.1.2.1.2.2.1.2";
 const HR_STORAGE_ALLOCATION_UNITS = "1.3.6.1.2.1.25.2.3.1.4.65536";
@@ -122,25 +122,97 @@ function wifiInterfaceIndices(session: snmp.Session, prefix: string): Promise<Se
   });
 }
 
-/** Discover only configured MACs and read each association's counters in a single request. */
+/** Router-supplied DisplayString text without control characters, or undefined for other types. */
+export function displayString(varbind: Pick<snmp.Varbind, "type" | "value"> | undefined): string | undefined {
+  if (varbind?.type !== snmp.ObjectType.OctetString) return undefined;
+  const text = Buffer.isBuffer(varbind.value) ? varbind.value.toString("utf8") : typeof varbind.value === "string" ? varbind.value : undefined;
+  return text?.replace(/[\u0000-\u001f\u007f]/g, "");
+}
+
+/** Type and value as received, for diagnostic logs. */
+export function rawVarbind(varbind: Pick<snmp.Varbind, "type" | "value"> | undefined): string {
+  if (!varbind) return "missing";
+  const type = varbind.type === undefined ? "Unknown" : snmp.ObjectType[varbind.type] ?? String(varbind.type);
+  if (varbind.type === snmp.ObjectType.OctetString) return `${type}:${JSON.stringify(displayString(varbind))}`;
+  if (varbind.type === snmp.ObjectType.Counter64) return `${type}:${decodeCounter64(varbind.value) ?? "?"}`;
+  if (typeof varbind.value === "number" || typeof varbind.value === "bigint") return `${type}:${varbind.value}`;
+  return type;
+}
+
+const WIFI_COLUMNS = { uptime: 4, signal: 6, band: 8, txRate: 9, rxRate: 10, txBytes: 13, rxBytes: 14 } as const;
+
+/** Discover only configured MACs and read each association's counters and link state in a single request. */
 export async function collectWifiSnmp(options: Options): Promise<WifiAssociation[]> {
   const session = sessionFor(options, { timeout: 2_000, retries: 0 });
   const result: WifiAssociation[] = [];
   try {
     for (const { name, macIndex } of options.wifiClients) {
-      const indices = await wifiInterfaceIndices(session, `${WIFI_TABLE}.4.${macIndex}`);
+      const indices = await wifiInterfaceIndices(session, `${WIFI_TABLE}.${WIFI_COLUMNS.uptime}.${macIndex}`);
       for (const ifIndex of indices) {
         const suffix = `${macIndex}.${ifIndex}`;
-        const [uptime, tx, rx] = await get(session, [`${WIFI_TABLE}.4.${suffix}`, `${WIFI_TABLE}.13.${suffix}`, `${WIFI_TABLE}.14.${suffix}`]);
+        const [uptime, signal, band, txRate, rxRate, tx, rx] = await get(session, [
+          WIFI_COLUMNS.uptime, WIFI_COLUMNS.signal, WIFI_COLUMNS.band, WIFI_COLUMNS.txRate, WIFI_COLUMNS.rxRate,
+          WIFI_COLUMNS.txBytes, WIFI_COLUMNS.rxBytes,
+        ].map((column) => `${WIFI_TABLE}.${column}.${suffix}`));
         if (uptime?.type !== snmp.ObjectType.TimeTicks
             || tx?.type !== snmp.ObjectType.Counter64 || rx?.type !== snmp.ObjectType.Counter64) continue;
         const uptimeTicks = numeric(uptime.value);
         const transmit = decodeCounter64(tx.value);
         const receive = decodeCounter64(rx.value);
-        if (uptimeTicks !== undefined && receive !== undefined && transmit !== undefined)
-          result.push({ client: name, ifIndex, receive: BigInt(receive), transmit: BigInt(transmit), uptimeTicks });
+        if (uptimeTicks === undefined || receive === undefined || transmit === undefined) continue;
+        const gauge = (varbind: snmp.Varbind | undefined) =>
+          varbind?.type === snmp.ObjectType.Gauge ? numeric(varbind.value) : undefined;
+        const bandText = displayString(band);
+        result.push({
+          client: name, ifIndex, receive: BigInt(receive), transmit: BigInt(transmit), uptimeTicks,
+          signal: signal?.type === snmp.ObjectType.Integer ? numeric(signal.value) : undefined,
+          band: bandText ? bandText : undefined,
+          txRate: gauge(txRate), rxRate: gauge(rxRate),
+          raw: [[4, uptime], [6, signal], [8, band], [9, txRate], [10, rxRate]]
+            .map(([column, varbind]) => `col${column}=${rawVarbind(varbind as snmp.Varbind | undefined)}`).join(" "),
+        });
       }
     }
     return result;
+  } finally { session.close(); }
+}
+
+const WIFI_INTERFACES = "1.3.6.1.4.1.14988.1.1.21.5.1";
+
+/** Group a walk of mtxrWifiInterfaces (columns 2 Name, 3 Ssid, 4 Freq, 5 CurrentChannel) into rows by table index. */
+export function wifiInterfacesFromWalk(varbinds: Pick<snmp.Varbind, "oid" | "type" | "value">[]): WifiInterface[] {
+  const rows = new Map<string, Map<number, Pick<snmp.Varbind, "type" | "value">>>();
+  for (const varbind of varbinds) {
+    const match = varbind.oid.startsWith(WIFI_INTERFACES + ".") ? /^([2-5])\.([0-9]+)$/.exec(varbind.oid.slice(WIFI_INTERFACES.length + 1)) : null;
+    if (!match) continue;
+    const [, column, index] = match as unknown as [string, string, string];
+    if (!rows.has(index)) rows.set(index, new Map());
+    rows.get(index)!.set(Number(column), varbind);
+  }
+  const result: WifiInterface[] = [];
+  for (const [index, columns] of rows) {
+    const name = displayString(columns.get(2));
+    if (!name) continue;
+    const frequency = displayString(columns.get(4))?.trim();
+    const frequencyMhz = frequency && /^[0-9]+(?:\.[0-9]+)?$/.test(frequency) ? Number(frequency) : undefined;
+    result.push({
+      index, name, ssid: displayString(columns.get(3)) ?? "", channel: displayString(columns.get(5)) ?? "", frequencyMhz,
+      raw: Object.fromEntries([2, 3, 4, 5].map((column) => [`col${column}`, rawVarbind(columns.get(column))])),
+    });
+  }
+  return result.sort((a, b) => Number(a.index) - Number(b.index));
+}
+
+/** Walk the router's own Wi-Fi interfaces. A missing table yields an empty list. */
+export async function collectWifiInterfaces(options: Options): Promise<WifiInterface[]> {
+  const session = sessionFor(options, { timeout: 2_000, retries: 0 });
+  try {
+    const varbinds: snmp.Varbind[] = [];
+    await new Promise<void>((resolve, reject) => {
+      session.subtree(WIFI_INTERFACES, 20, (batch) => {
+        for (const varbind of batch) if (!snmp.isVarbindError(varbind)) varbinds.push(varbind);
+      }, (error) => { if (error) reject(error); else resolve(); });
+    });
+    return wifiInterfacesFromWalk(varbinds);
   } finally { session.close(); }
 }
