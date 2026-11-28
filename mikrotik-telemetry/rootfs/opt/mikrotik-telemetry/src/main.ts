@@ -96,7 +96,12 @@ async function main(): Promise<void> {
     try {
       await poll();
       if (!options.victoriametricsUrl) return;
-      const response = await fetch(options.victoriametricsUrl, {
+      // One timestamp for the whole publication. Without it VictoriaMetrics stamps rows as it parses them, and
+      // rows of one publication can differ by a few milliseconds. Readers that require readings "from the same
+      // poll" compare timestamps exactly, so those few milliseconds made them drop about one reading in ten.
+      const target = new URL(options.victoriametricsUrl);
+      target.searchParams.set("timestamp", String(Date.now()));
+      const response = await fetch(target, {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
         body: renderMetrics(state),

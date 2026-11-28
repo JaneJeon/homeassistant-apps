@@ -1,5 +1,5 @@
 name: MikroTik Telemetry
-version: 0.4.0
+version: 0.4.1
 slug: mikrotik-telemetry
 description: Read-only MikroTik availability, WAN traffic, and resource metrics
 url: https://github.com/JaneJeon/homeassistant-apps/tree/main/mikrotik-telemetry
