@@ -10,7 +10,7 @@ RUN git init . \
 RUN cd web && npm ci && npm run build
 RUN go mod download && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mcp-victorialogs ./cmd/mcp-victorialogs
 
-FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
 ARG BASHIO_VERSION=0.17.5
 RUN apk add --no-cache bash ca-certificates tini curl jq \
     && mkdir -p /usr/lib/bashio \
